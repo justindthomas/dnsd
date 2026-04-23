@@ -121,7 +121,7 @@ MAC="$(echo -n "$TAP" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\).*$/52:54:\1:\2
 # shellcheck disable=SC2086
 $QEMU $QEMU_ACCEL \
     -name dnsd-test-run \
-    -m 2048 -smp 2 \
+    -m 4096 -smp 2 \
     -drive "file=$TEST_DISK,format=qcow2,if=virtio" \
     -netdev "user,id=user0,hostfwd=tcp::${SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=user0,mac=52:54:00:dd:00:02 \
