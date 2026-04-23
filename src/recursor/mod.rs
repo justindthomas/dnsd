@@ -21,10 +21,12 @@
 //! and is documented in `dnssec.rs`.
 
 pub mod cache;
+pub mod cookies;
 pub mod forwarder;
 pub mod dns64;
 pub mod dnssec;
 pub mod rrl;
+pub mod zeroxtwenty;
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;

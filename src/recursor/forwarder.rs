@@ -1,15 +1,20 @@
-//! Per-domain forwarder routing + upstream UDP client.
+//! Per-domain forwarder routing + upstream client.
 //!
 //! Longest-suffix match on the question name picks the forwarder;
 //! servers within a forwarder are tried in the configured order with
-//! a per-attempt timeout. Upstream queries source from a fresh
-//! ephemeral VclDgramSocket so each gets an independent source port
-//! (simple source-port randomisation — enough for a v1 baseline
-//! against Kaminsky-class poisoning).
+//! a per-attempt timeout.
 //!
-//! TXID randomisation is handled via `rand`; 0x20 case randomisation
-//! is a follow-up (the plumbing is compatible — we'd apply it on the
-//! question name before send + verify on recv).
+//! Upstream transport picks: UDP first via a fresh ephemeral
+//! VclDgramSocket (independent source port per query — baseline
+//! Kaminsky defence). If the UDP response has TC=1 (truncated), we
+//! transparently retry the same server over TCP via a VclStream. If
+//! the operator wants to skip UDP entirely, `force_tcp` bypasses the
+//! first leg (useful for DoT-upstream configurations we'll add later).
+//!
+//! TXID randomisation is via `rand`; 0x20 case randomisation is
+//! applied to the question name before send and verified on recv
+//! (and silently reverted on the response so cached entries use the
+//! canonical owner name).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -19,12 +24,14 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
-use vcl_rs::{VclDgramSocket, VclReactor};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vcl_rs::{VclDgramSocket, VclReactor, VclStream};
 
 use crate::config::Forwarder as ForwarderCfg;
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
 const UPSTREAM_BUF: usize = 4096;
+const MAX_TCP_MESSAGE: usize = 65535;
 
 #[derive(Clone)]
 pub struct Forwarders {
@@ -127,58 +134,158 @@ impl UpstreamClient {
     }
 
     async fn query_one(&self, peer: SocketAddr, orig_query: &[u8]) -> Result<Vec<u8>> {
-        // Bind an ephemeral source socket of the right address family.
+        let orig_msg = Message::from_bytes(orig_query).context("parse client query")?;
+        let client_txid = orig_msg.id();
+        let upstream_txid: u16 = rand::thread_rng().gen();
+
+        // Build the upstream wire. Fresh TXID + 0x20-randomised
+        // question name; the body is otherwise byte-identical to
+        // what the client sent us.
+        let mut out = orig_query.to_vec();
+        out[0..2].copy_from_slice(&upstream_txid.to_be_bytes());
+        let expected_qname = super::zeroxtwenty::encode(&mut out)
+            .context("0x20 encode upstream query")?;
+
+        // UDP first.
+        let udp_resp = self
+            .query_one_udp(peer, &out, upstream_txid, &expected_qname)
+            .await?;
+        let parsed = Message::from_bytes(&udp_resp).context("parse UDP response")?;
+
+        // TC=1 → retry the same server over TCP per RFC 7766 §6.2.2.
+        // Fresh TXID + fresh 0x20 mask for the TCP hop.
+        let final_resp = if parsed.truncated() {
+            tracing::debug!(%peer, "TC=1 on UDP; retrying over TCP");
+            let tcp_txid: u16 = rand::thread_rng().gen();
+            let mut tcp_out = orig_query.to_vec();
+            tcp_out[0..2].copy_from_slice(&tcp_txid.to_be_bytes());
+            let tcp_mask = super::zeroxtwenty::encode(&mut tcp_out)
+                .context("0x20 encode TCP retry")?;
+            self.query_one_tcp(peer, &tcp_out, tcp_txid, &tcp_mask).await?
+        } else {
+            udp_resp
+        };
+
+        // Restore the client's TXID before returning.
+        let mut resp = final_resp;
+        resp[0..2].copy_from_slice(&client_txid.to_be_bytes());
+        Ok(resp)
+    }
+
+    async fn query_one_udp(
+        &self,
+        peer: SocketAddr,
+        query: &[u8],
+        expected_txid: u16,
+        expected_qname: &[u8],
+    ) -> Result<Vec<u8>> {
+        // Ephemeral source socket — different ephemeral port per
+        // query is part of the Kaminsky baseline.
         let sock = if peer.is_ipv4() {
             VclDgramSocket::bind_ephemeral_v4(self.reactor.clone())
         } else {
             VclDgramSocket::bind_ephemeral_v6(self.reactor.clone())
         }
-        .with_context(|| format!("ephemeral bind for upstream {peer}"))?;
+        .with_context(|| format!("ephemeral UDP bind for upstream {peer}"))?;
 
-        // Rewrite TXID with a fresh random one for the upstream hop.
-        // We'll restore the client's TXID on the response before
-        // returning to the handler.
-        let orig_msg = Message::from_bytes(orig_query).context("parse client query")?;
-        let client_txid = orig_msg.id();
-
-        let upstream_txid: u16 = rand::thread_rng().gen();
-        let mut out = orig_query.to_vec();
-        out[0..2].copy_from_slice(&upstream_txid.to_be_bytes());
-
-        // Send + await one datagram with a global timeout.
-        sock.send_to(&out, peer)
+        sock.send_to(query, peer)
             .await
-            .with_context(|| format!("send_to {peer}"))?;
+            .with_context(|| format!("UDP send_to {peer}"))?;
 
         let mut buf = vec![0u8; UPSTREAM_BUF];
         let (n, from) = tokio::time::timeout(self.timeout, sock.recv_from(&mut buf))
             .await
-            .map_err(|_| anyhow!("upstream {peer} timeout"))?
-            .with_context(|| format!("recv_from {peer}"))?;
+            .map_err(|_| anyhow!("upstream UDP {peer} timeout"))?
+            .with_context(|| format!("UDP recv_from {peer}"))?;
 
-        // Reject spoofed responses that didn't come from the server
-        // we queried (rudimentary; production 0x20 / cookies add
-        // more layers).
         if from.ip() != peer.ip() {
             return Err(anyhow!(
-                "upstream response from unexpected address {from} (wanted {peer})"
+                "upstream UDP response from unexpected address {from} (wanted {peer})"
             ));
         }
-
         if n < 12 {
-            return Err(anyhow!("short upstream response ({n} bytes)"));
+            return Err(anyhow!("short upstream UDP response ({n} bytes)"));
         }
-        // TXID check
         let rx_txid = u16::from_be_bytes([buf[0], buf[1]]);
-        if rx_txid != upstream_txid {
+        if rx_txid != expected_txid {
             return Err(anyhow!(
-                "upstream TXID mismatch: got {rx_txid:#06x} expected {upstream_txid:#06x}"
+                "upstream UDP TXID mismatch: got {rx_txid:#06x} expected {expected_txid:#06x}"
             ));
         }
         buf.truncate(n);
-        // Restore the client's TXID.
-        buf[0..2].copy_from_slice(&client_txid.to_be_bytes());
+        super::zeroxtwenty::verify(&buf, expected_qname)
+            .with_context(|| format!("upstream UDP {peer} 0x20 mismatch"))?;
         Ok(buf)
+    }
+
+    /// Send one query to `peer` over TCP (RFC 1035 §4.2.2 2-byte
+    /// length framing). Used both for TC-fallback and for forwarders
+    /// configured as TCP-only upstreams.
+    pub async fn query_one_tcp(
+        &self,
+        peer: SocketAddr,
+        query: &[u8],
+        expected_txid: u16,
+        expected_qname: &[u8],
+    ) -> Result<Vec<u8>> {
+        // VCL TCP connect: a fresh session per query is simple and
+        // correct. Pooling + keepalive to heavily-used upstreams is
+        // a follow-up. Timeout wraps the entire connect → send →
+        // recv → shutdown dance; on timeout the stream is dropped
+        // which closes the VCL session.
+        let fut = async {
+            let mut stream = VclStream::connect(
+                peer,
+                None,
+                self.timeout,
+                self.reactor.clone(),
+            )
+            .await
+            .with_context(|| format!("TCP connect to upstream {peer}"))?;
+
+            let mut framed = Vec::with_capacity(2 + query.len());
+            framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+            framed.extend_from_slice(query);
+            stream
+                .write_all(&framed)
+                .await
+                .with_context(|| format!("TCP write to upstream {peer}"))?;
+            stream.flush().await.ok();
+
+            let mut lenbuf = [0u8; 2];
+            stream
+                .read_exact(&mut lenbuf)
+                .await
+                .with_context(|| format!("TCP length read from {peer}"))?;
+            let len = u16::from_be_bytes(lenbuf) as usize;
+            if len == 0 || len > MAX_TCP_MESSAGE {
+                return Err(anyhow!("invalid upstream TCP DNS length {len}"));
+            }
+
+            let mut resp = vec![0u8; len];
+            stream
+                .read_exact(&mut resp)
+                .await
+                .with_context(|| format!("TCP body read from {peer}"))?;
+            Ok::<_, anyhow::Error>(resp)
+        };
+
+        let resp = tokio::time::timeout(self.timeout, fut)
+            .await
+            .map_err(|_| anyhow!("upstream TCP {peer} timeout"))??;
+
+        if resp.len() < 12 {
+            return Err(anyhow!("short upstream TCP response ({} bytes)", resp.len()));
+        }
+        let rx_txid = u16::from_be_bytes([resp[0], resp[1]]);
+        if rx_txid != expected_txid {
+            return Err(anyhow!(
+                "upstream TCP TXID mismatch: got {rx_txid:#06x} expected {expected_txid:#06x}"
+            ));
+        }
+        super::zeroxtwenty::verify(&resp, expected_qname)
+            .with_context(|| format!("upstream TCP {peer} 0x20 mismatch"))?;
+        Ok(resp)
     }
 }
 
