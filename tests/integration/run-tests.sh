@@ -24,6 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DNSD_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+ASSETS="$SCRIPT_DIR/vm-assets"
 WORK="${DNSD_TEST_WORK:-$SCRIPT_DIR/.work}"
 GOLDEN="${DNSD_TEST_GOLDEN:-$WORK/dnsd-test-golden.qcow2}"
 SSH_KEY="$WORK/ssh-key"
