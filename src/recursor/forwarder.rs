@@ -24,7 +24,11 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// VclStream has its own `async fn read_exact` / `async fn write_all`
+// on `&self` that Rust picks before any trait impl; AsyncWriteExt is
+// pulled in only so we can call `.flush()` (no inherent flush on
+// VclStream since VCL has no userspace buffer).
+use tokio::io::AsyncWriteExt;
 use vcl_rs::{VclDgramSocket, VclReactor, VclStream};
 
 use crate::config::Forwarder as ForwarderCfg;

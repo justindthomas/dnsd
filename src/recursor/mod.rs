@@ -25,6 +25,7 @@ pub mod cookies;
 pub mod forwarder;
 pub mod dns64;
 pub mod dnssec;
+pub mod iterative;
 pub mod rrl;
 pub mod zeroxtwenty;
 
@@ -46,6 +47,7 @@ pub use cache::{CacheKey, DnsCache};
 pub use dns64::Dns64Policy;
 pub use dnssec::DnssecPolicy;
 pub use forwarder::{Forwarders, UpstreamClient};
+pub use iterative::IterativeResolver;
 pub use rrl::Rrl;
 
 pub struct RecursorHandler {
@@ -56,6 +58,7 @@ pub struct RecursorHandler {
     dns64: Option<Arc<Dns64Policy>>,
     dnssec: DnssecPolicy,
     rrl: Option<Arc<Rrl>>,
+    iterative: Option<Arc<IterativeResolver>>,
 }
 
 impl RecursorHandler {
@@ -135,6 +138,30 @@ impl RecursorHandler {
 
         let rrl = Rrl::from_config(cfg.rate_limit.as_ref()).map(Arc::new);
 
+        // Iterative recursion is enabled by default when no explicit
+        // recursion block is present (matches operator intent: "just
+        // resolve DNS"); suppressed when recursion.enabled == false.
+        let iterative_enabled = cfg
+            .recursion
+            .as_ref()
+            .map(|r| r.enabled)
+            .unwrap_or(true);
+        let max_cname = cfg
+            .recursion
+            .as_ref()
+            .and_then(|r| r.max_cname_depth)
+            .unwrap_or(iterative::DEFAULT_MAX_CNAME);
+        let iterative = if iterative_enabled {
+            Some(Arc::new(IterativeResolver::new(
+                upstream.clone(),
+                cache.clone(),
+                metrics.clone(),
+                max_cname,
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             cache,
             forwarders,
@@ -143,6 +170,7 @@ impl RecursorHandler {
             dns64,
             dnssec,
             rrl,
+            iterative,
         })
     }
 }
@@ -211,13 +239,38 @@ impl DnsHandler for RecursorHandler {
         }
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        let Some(servers) = self.forwarders.lookup(q.name()) else {
-            // No forwarder — SERVFAIL for now (iterative recursion
-            // is the follow-up).
-            return Some(servfail(&msg));
+        let servers = match self.forwarders.lookup(q.name()) {
+            Some(s) => {
+                self.metrics
+                    .forwarder_matched
+                    .fetch_add(1, Ordering::Relaxed);
+                s.to_vec()
+            }
+            None => {
+                // No forwarder match — fall through to iterative
+                // recursion if enabled, otherwise SERVFAIL.
+                return match self.iterative.as_ref() {
+                    Some(iter) => match iter.resolve(&msg).await {
+                        Ok(mut bytes) => {
+                            // apply_to_response needs to mutate a
+                            // typed Message — parse, fix AD, re-emit.
+                            if let Ok(mut parsed) = Message::from_bytes(&bytes) {
+                                self.dnssec.apply_to_response(&mut parsed);
+                                if let Ok(re) = parsed.to_vec() {
+                                    bytes = re;
+                                }
+                            }
+                            Some(bytes)
+                        }
+                        Err(e) => {
+                            tracing::warn!(qname = %q.name(), "iterative resolve failed: {e}");
+                            Some(servfail(&msg))
+                        }
+                    },
+                    None => Some(servfail(&msg)),
+                };
+            }
         };
-        self.metrics.forwarder_matched.fetch_add(1, Ordering::Relaxed);
-        let servers = servers.to_vec();
 
         let resp_bytes = match self.upstream.query(&servers, query).await {
             Ok(r) => r,
