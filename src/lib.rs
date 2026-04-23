@@ -8,6 +8,7 @@
 //! and are wired together by `main.rs`.
 
 pub mod acl;
+pub mod acme;
 pub mod config;
 pub mod control;
 pub mod handler;

@@ -19,10 +19,11 @@ use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::{fmt, EnvFilter};
 
+use dnsd::acme;
 use dnsd::config::DnsConfig;
 use dnsd::control::{ControlServer, DEFAULT_SOCKET};
 use dnsd::handler::SharedHandler;
-use dnsd::io::{tcp::TcpListener, udp::UdpListener};
+use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
 use dnsd::recursor::RecursorHandler;
 use vcl_rs::{VclApp, VclReactor};
@@ -90,6 +91,10 @@ async fn main() -> Result<()> {
             .context("RecursorHandler init")?,
     );
 
+    // TLS config is shared between DoT and DoH. None means
+    // cert_source is 'acme' (not yet wired) or no TLS listeners.
+    let tls_config = acme::server_config_from_dns(&cfg).context("loading TLS config")?;
+
     let mut listener_tasks = Vec::new();
     for listener_cfg in &cfg.listeners {
         let name = listener_cfg.name.clone();
@@ -119,13 +124,39 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::error!(listener = %name, "TCP bind failed: {e}"),
             }
         }
-        // DoT / DoH listeners land with task #10; noted-but-not-bound
-        // so operator config doesn't silently get ignored.
         if listener_cfg.has_protocol("dot") {
-            tracing::warn!(listener = %name, "DoT requested but not yet implemented");
+            match tls_config.as_ref() {
+                Some(tls) => match DotListener::spawn(
+                    listener_cfg.clone(),
+                    reactor.clone(),
+                    handler.clone(),
+                    metrics.clone(),
+                    tls.clone(),
+                )
+                .await
+                {
+                    Ok(h) => listener_tasks.push(h),
+                    Err(e) => tracing::error!(listener = %name, "DoT bind failed: {e}"),
+                },
+                None => tracing::warn!(listener = %name, "DoT requested but no TLS config available"),
+            }
         }
         if listener_cfg.has_protocol("doh") {
-            tracing::warn!(listener = %name, "DoH requested but not yet implemented");
+            match tls_config.as_ref() {
+                Some(tls) => match DohListener::spawn(
+                    listener_cfg.clone(),
+                    reactor.clone(),
+                    handler.clone(),
+                    metrics.clone(),
+                    tls.clone(),
+                )
+                .await
+                {
+                    Ok(h) => listener_tasks.push(h),
+                    Err(e) => tracing::error!(listener = %name, "DoH bind failed: {e}"),
+                },
+                None => tracing::warn!(listener = %name, "DoH requested but no TLS config available"),
+            }
         }
     }
 
