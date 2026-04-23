@@ -32,7 +32,8 @@ hyper-util = { version = "0.1", features = ["server", "tokio"] }
 tower = "0.5"
 
 # ACME
-rustls-acme = "0.11"
+rustls-acme = { version = "0.11", features = ["ring"] }
+futures = "0.3"
 instant-acme = { version = "0.7", optional = true }  # only for dns-01 path
 async-trait = "0.1"
 
