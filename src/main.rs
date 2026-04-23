@@ -21,7 +21,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use dnsd::acme;
 use dnsd::config::DnsConfig;
-use dnsd::control::{ControlServer, DEFAULT_SOCKET};
+use dnsd::control::{ControlServer, ControlState, DEFAULT_SOCKET};
 use dnsd::handler::SharedHandler;
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
@@ -61,11 +61,24 @@ async fn main() -> Result<()> {
 
     let metrics = Arc::new(Metrics::default());
 
+    // Build cache + forwarders up front. Neither needs VCL/VPP, and
+    // sharing them with both the RecursorHandler and the control
+    // socket means `imp-dnsd-query cache dump` sees live state from
+    // the same instance the handler is populating.
+    let cache = RecursorHandler::build_cache_from_config(&cfg);
+    let forwarders =
+        RecursorHandler::build_forwarders_from_config(&cfg).context("forwarder config")?;
+
     // Control socket first so the impd supervisor's Ready::Socket gate
     // unblocks; we don't want the whole startup to stall behind VCL
     // init if something is wrong with VPP.
     let control_path = args.control_socket.clone();
-    let control = ControlServer::new(control_path.clone(), metrics.clone());
+    let state = ControlState {
+        metrics: metrics.clone(),
+        cache: cache.clone(),
+        forwarders: forwarders.clone(),
+    };
+    let control = ControlServer::new(control_path.clone(), state);
     tokio::spawn(async move {
         if let Err(e) = control.serve().await {
             tracing::error!("control server exited: {e}");
@@ -87,8 +100,14 @@ async fn main() -> Result<()> {
     // follow-up; until then queries with no matching forwarder
     // return SERVFAIL.
     let handler: SharedHandler = Arc::new(
-        RecursorHandler::from_config(&cfg, reactor.clone(), metrics.clone())
-            .context("RecursorHandler init")?,
+        RecursorHandler::from_parts(
+            &cfg,
+            reactor.clone(),
+            metrics.clone(),
+            cache.clone(),
+            forwarders.clone(),
+        )
+        .context("RecursorHandler init")?,
     );
 
     // TLS config is shared between DoT and DoH. None means

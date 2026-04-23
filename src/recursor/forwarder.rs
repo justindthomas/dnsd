@@ -41,6 +41,16 @@ struct ForwarderEntry {
 }
 
 impl Forwarders {
+    /// Snapshot of the current forwarder table for control-socket
+    /// inspection. Returns (domain, server list) in longest-suffix-
+    /// first order — the same order `lookup()` walks.
+    pub fn snapshot(&self) -> Vec<(String, Vec<std::net::IpAddr>)> {
+        self.entries
+            .iter()
+            .map(|e| (e.domain.to_string(), e.servers.clone()))
+            .collect()
+    }
+
     pub fn new(configs: &[ForwarderCfg]) -> Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for c in configs {

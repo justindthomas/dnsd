@@ -57,21 +57,56 @@ pub struct RecursorHandler {
 }
 
 impl RecursorHandler {
+    /// The cache, for control-socket inspection.
+    pub fn cache(&self) -> Arc<DnsCache> {
+        self.cache.clone()
+    }
+
+    /// The forwarder table, for control-socket inspection.
+    pub fn forwarders(&self) -> Arc<Forwarders> {
+        self.forwarders.clone()
+    }
+
+    /// Build the VCL-independent state (cache + forwarder table).
+    /// Exposed separately from `from_config` so `main.rs` can bring
+    /// up the control socket with live state before VCL/VPP is
+    /// ready — the supervisor's readiness gate watches
+    /// `/run/dnsd.sock` and that file needs to exist even if VPP is
+    /// slow to start.
+    pub fn build_cache_from_config(cfg: &DnsConfig) -> Arc<DnsCache> {
+        let cache_cfg = cfg.cache.clone().unwrap_or_default();
+        Arc::new(DnsCache::new(
+            cache_cfg.max_entries.unwrap_or(10_000) as u64,
+            cache_cfg.min_ttl.unwrap_or(0),
+            cache_cfg.max_ttl.unwrap_or(604_800),
+            cache_cfg.negative_ttl.unwrap_or(3_600),
+        ))
+    }
+
+    pub fn build_forwarders_from_config(cfg: &DnsConfig) -> anyhow::Result<Arc<Forwarders>> {
+        Forwarders::new(&cfg.forwarders).map(Arc::new)
+    }
+
     pub fn from_config(
         cfg: &DnsConfig,
         reactor: VclReactor,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        let cache_cfg = cfg.cache.clone().unwrap_or_default();
-        let cache = Arc::new(DnsCache::new(
-            cache_cfg.max_entries.unwrap_or(10_000) as u64,
-            cache_cfg.min_ttl.unwrap_or(0),
-            cache_cfg.max_ttl.unwrap_or(604_800),
-            cache_cfg.negative_ttl.unwrap_or(3_600),
-        ));
+        let cache = Self::build_cache_from_config(cfg);
+        let forwarders = Self::build_forwarders_from_config(cfg)?;
+        Self::from_parts(cfg, reactor, metrics, cache, forwarders)
+    }
 
-        let forwarders = Arc::new(Forwarders::new(&cfg.forwarders)?);
-
+    /// Build a RecursorHandler using a pre-constructed cache +
+    /// forwarder table. Used by `main.rs` to share those Arcs with
+    /// the control socket.
+    pub fn from_parts(
+        cfg: &DnsConfig,
+        reactor: VclReactor,
+        metrics: Arc<Metrics>,
+        cache: Arc<DnsCache>,
+        forwarders: Arc<Forwarders>,
+    ) -> anyhow::Result<Self> {
         let upstream_timeout_ms = cfg
             .recursion
             .as_ref()

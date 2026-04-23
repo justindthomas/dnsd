@@ -134,6 +134,45 @@ impl DnsCache {
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
     }
+
+    /// Drop every cached entry. Used by the control socket's `cache
+    /// flush` op.
+    pub fn flush(&self) {
+        self.inner.invalidate_all();
+    }
+
+    /// Materialise a lightweight summary of currently-cached entries.
+    /// Walks the moka cache and collects key + remaining TTL for each
+    /// live entry. Called at debug time from `cache dump` — not a
+    /// hot path.
+    pub fn dump(&self) -> Vec<CacheDumpEntry> {
+        let now = Instant::now();
+        self.inner
+            .iter()
+            .filter_map(|(k, v)| {
+                let remaining = v.expires.saturating_duration_since(now).as_secs();
+                if remaining == 0 {
+                    return None;
+                }
+                Some(CacheDumpEntry {
+                    name: k.name.to_string(),
+                    rtype: k.rtype.to_string(),
+                    class: k.class.to_string(),
+                    ttl_remaining_secs: remaining,
+                    size_bytes: v.bytes.len(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CacheDumpEntry {
+    pub name: String,
+    pub rtype: String,
+    pub class: String,
+    pub ttl_remaining_secs: u64,
+    pub size_bytes: usize,
 }
 
 /// Rewrite only the TXID in a cached wire response. Used on cache

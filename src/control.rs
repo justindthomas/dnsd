@@ -24,6 +24,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::recursor::cache::CacheDumpEntry;
+use crate::recursor::{DnsCache, Forwarders};
 
 pub const DEFAULT_SOCKET: &str = "/run/dnsd.sock";
 
@@ -48,11 +50,24 @@ pub enum ControlRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
     Stats(MetricsSnapshot),
-    Cache { summary: String },
-    Forwarders { forwarders: Vec<ForwarderInfo> },
-    Ok { message: String },
-    Trace { steps: Vec<String> },
-    Error { error: String },
+    CacheStats {
+        entries: u64,
+    },
+    CacheDump {
+        entries: Vec<CacheDumpEntry>,
+    },
+    Forwarders {
+        forwarders: Vec<ForwarderInfo>,
+    },
+    Ok {
+        message: String,
+    },
+    Trace {
+        steps: Vec<String>,
+    },
+    Error {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,14 +76,26 @@ pub struct ForwarderInfo {
     pub servers: Vec<String>,
 }
 
+/// Read-only view of state the control socket needs. Built once by
+/// `main.rs` after the RecursorHandler is constructed.
+#[derive(Clone)]
+pub struct ControlState {
+    pub metrics: Arc<Metrics>,
+    pub cache: Arc<DnsCache>,
+    pub forwarders: Arc<Forwarders>,
+}
+
 pub struct ControlServer {
     path: PathBuf,
-    metrics: Arc<Metrics>,
+    state: ControlState,
 }
 
 impl ControlServer {
-    pub fn new<P: Into<PathBuf>>(path: P, metrics: Arc<Metrics>) -> Self {
-        Self { path: path.into(), metrics }
+    pub fn new<P: Into<PathBuf>>(path: P, state: ControlState) -> Self {
+        Self {
+            path: path.into(),
+            state,
+        }
     }
 
     pub async fn serve(self) -> Result<()> {
@@ -80,9 +107,9 @@ impl ControlServer {
         tracing::info!(socket = %self.path.display(), "control socket bound");
         loop {
             let (stream, _) = listener.accept().await?;
-            let metrics = self.metrics.clone();
+            let state = self.state.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(stream, metrics).await {
+                if let Err(e) = handle_conn(stream, state).await {
                     tracing::debug!("control conn ended: {e}");
                 }
             });
@@ -90,7 +117,7 @@ impl ControlServer {
     }
 }
 
-async fn handle_conn(stream: UnixStream, metrics: Arc<Metrics>) -> Result<()> {
+async fn handle_conn(stream: UnixStream, state: ControlState) -> Result<()> {
     let (rx, mut tx) = stream.into_split();
     let mut rx = BufReader::new(rx);
     let mut line = String::new();
@@ -105,8 +132,10 @@ async fn handle_conn(stream: UnixStream, metrics: Arc<Metrics>) -> Result<()> {
             continue;
         }
         let resp = match serde_json::from_str::<ControlRequest>(trimmed) {
-            Ok(req) => dispatch(req, &metrics).await,
-            Err(e) => ControlResponse::Error { error: format!("bad request: {e}") },
+            Ok(req) => dispatch(req, &state).await,
+            Err(e) => ControlResponse::Error {
+                error: format!("bad request: {e}"),
+            },
         };
         let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| {
             format!("{{\"type\":\"error\",\"error\":\"encode: {e}\"}}")
@@ -116,25 +145,73 @@ async fn handle_conn(stream: UnixStream, metrics: Arc<Metrics>) -> Result<()> {
     }
 }
 
-async fn dispatch(req: ControlRequest, metrics: &Arc<Metrics>) -> ControlResponse {
+async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse {
     match req {
-        ControlRequest::Stats => ControlResponse::Stats(metrics.snapshot()),
-        ControlRequest::Cache { .. } => {
-            // Wired once recursor/cache.rs lands. Reports "unavailable"
-            // rather than a lie until it's implemented.
-            ControlResponse::Cache { summary: "cache not yet implemented".into() }
+        ControlRequest::Stats => ControlResponse::Stats(state.metrics.snapshot()),
+        ControlRequest::Cache { op, name, rrtype } => {
+            let op = op.as_deref().unwrap_or("stats");
+            match op {
+                "stats" => ControlResponse::CacheStats {
+                    entries: state.cache.entry_count(),
+                },
+                "flush" => {
+                    state.cache.flush();
+                    ControlResponse::Ok {
+                        message: "cache flushed".into(),
+                    }
+                }
+                "dump" => {
+                    let mut entries = state.cache.dump();
+                    // Allow name/rrtype filters for large caches.
+                    if let Some(n) = name {
+                        let n = n.to_lowercase();
+                        entries.retain(|e| e.name.to_lowercase().contains(&n));
+                    }
+                    if let Some(t) = rrtype {
+                        let t = t.to_uppercase();
+                        entries.retain(|e| e.rtype.eq_ignore_ascii_case(&t));
+                    }
+                    ControlResponse::CacheDump { entries }
+                }
+                other => ControlResponse::Error {
+                    error: format!("unknown cache op {other:?} (want stats|flush|dump)"),
+                },
+            }
         }
-        ControlRequest::Forwarders => ControlResponse::Forwarders { forwarders: vec![] },
+        ControlRequest::Forwarders => {
+            let forwarders = state
+                .forwarders
+                .snapshot()
+                .into_iter()
+                .map(|(domain, servers)| ForwarderInfo {
+                    domain,
+                    servers: servers.iter().map(|s| s.to_string()).collect(),
+                })
+                .collect();
+            ControlResponse::Forwarders { forwarders }
+        }
         ControlRequest::Reload => {
-            // A SIGHUP-equivalent reload triggered via the socket lets
-            // automation avoid shelling out to `pkill -HUP`. The shared
-            // signal path in main.rs will pick up a flipped AtomicBool
-            // set here once reload is wired end-to-end; for v1 we just
-            // acknowledge.
-            ControlResponse::Ok { message: "reload queued".into() }
+            // SIGHUP self — main.rs's signal loop picks it up the
+            // same way as an external `pkill -HUP`. Keeps the reload
+            // path single-sourced.
+            let rc = unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) };
+            if rc == 0 {
+                ControlResponse::Ok {
+                    message: "reload signal sent (SIGHUP to self)".into(),
+                }
+            } else {
+                ControlResponse::Error {
+                    error: format!("kill(SIGHUP) failed: rc={rc}"),
+                }
+            }
         }
         ControlRequest::Upstream { name } => ControlResponse::Trace {
-            steps: vec![format!("tracing {name} — not yet implemented")],
+            steps: vec![format!(
+                "per-query resolution tracing for {name:?} is a follow-up — \
+                 it requires instrumenting the forwarder/recursor path to \
+                 capture timings + server choices without affecting the hot \
+                 path"
+            )],
         },
     }
 }
