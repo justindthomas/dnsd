@@ -54,10 +54,12 @@ write_files:
       Pin-Priority: 1000
 
 runcmd:
-  # One bash script so failure halts (set -e) + output is grouped
-  # in cloud-init-output.log.
+  # One script so failure halts (set -eu) + output is grouped in
+  # cloud-init-output.log. Cloud-init runs runcmd via /bin/sh
+  # (dash on Debian) — no pipefail, no bash-isms.
   - |
-    set -euo pipefail
+    #!/bin/sh
+    set -eu
     exec 2>&1
 
     echo "==> mounting assets ISO"
