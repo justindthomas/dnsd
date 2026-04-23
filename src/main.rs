@@ -21,9 +21,10 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use dnsd::config::DnsConfig;
 use dnsd::control::{ControlServer, DEFAULT_SOCKET};
-use dnsd::handler::{RefusedHandler, SharedHandler};
+use dnsd::handler::SharedHandler;
 use dnsd::io::{tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
+use dnsd::recursor::RecursorHandler;
 use vcl_rs::{VclApp, VclReactor};
 
 #[derive(Parser, Debug)]
@@ -81,9 +82,13 @@ async fn main() -> Result<()> {
         VclApp::init("imp-dnsd").with_context(|| "VclApp::init — is VPP up and vcl.conf readable?")?;
     let reactor = VclReactor::new().with_context(|| "VclReactor::new")?;
 
-    // v1 handler = REFUSED stub. Swap for `dnsd::recursor::Handler`
-    // once task #8 lands.
-    let handler: SharedHandler = Arc::new(RefusedHandler);
+    // Forwarder + cache. Iterative recursion against the root is a
+    // follow-up; until then queries with no matching forwarder
+    // return SERVFAIL.
+    let handler: SharedHandler = Arc::new(
+        RecursorHandler::from_config(&cfg, reactor.clone(), metrics.clone())
+            .context("RecursorHandler init")?,
+    );
 
     let mut listener_tasks = Vec::new();
     for listener_cfg in &cfg.listeners {

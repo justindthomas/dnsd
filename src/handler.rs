@@ -54,21 +54,6 @@ impl DnsHandler for RefusedHandler {
     }
 }
 
-// Hickory's Message::to_vec is fallible; wrap the common call sites.
-pub trait MessageVecExt {
-    fn to_vec(&self) -> Result<Vec<u8>, hickory_proto::error::ProtoError>;
-}
-
-impl MessageVecExt for Message {
-    fn to_vec(&self) -> Result<Vec<u8>, hickory_proto::error::ProtoError> {
-        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-        let mut buf = Vec::with_capacity(512);
-        let mut encoder = BinEncoder::new(&mut buf);
-        self.emit(&mut encoder)?;
-        Ok(buf)
-    }
-}
-
 /// Convenience: make any `Arc<T: DnsHandler>` work as `Arc<dyn DnsHandler>`.
 pub type SharedHandler = Arc<dyn DnsHandler>;
 

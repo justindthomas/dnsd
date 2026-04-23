@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_SOCKET"],"enum":["ControlRequest","ControlResponse"],"fn":["send_request"],"struct":["ControlServer","ForwarderInfo"]};
