@@ -1,8 +1,13 @@
-; VPP startup CLI — runs after plugins load, before main loop takes
-; over. The dpdk plugin already created "wan" from the startup.conf
-; `dpdk { dev 0000:00:04.0 { name wan } }` block, so we just bring
-; it up and assign addresses here.
+; VPP startup exec-commands.
+;
+; The dpdk plugin has already created `wan` from startup.conf by
+; the time this runs. We intentionally DON'T do interface config
+; here — carrier state during VPP init is racy for virtio-dpdk and
+; `set interface ip address` silently fails when the interface is
+; operationally down. All interface config happens in
+; configure-vpp.sh (ExecStartPost) where carrier is reliably up.
+;
+; This file is kept so existing systemd units / startup.conf that
+; reference it don't error on missing path.
 
-set interface state wan up
-set interface ip address wan 10.99.0.2/24
-set interface ip address wan 2001:db8:99::2/64
+; (intentionally empty)
