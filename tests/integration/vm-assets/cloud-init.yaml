@@ -15,10 +15,9 @@ users:
 
 ssh_pwauth: true
 
-# Cloud-init builds /etc/netplan, but enp0s4 (the bridge-side NIC)
-# must be handed to VPP, not the kernel. Just bring it up without
-# an IP so af_xdp can grab it. enp0s3 (QEMU user-net) gets DHCP.
 write_files:
+  # enp0s3 (user-net) gets DHCP for SSH; enp0s4 (bridge) must stay
+  # address-less so VPP's af_xdp plugin can grab it.
   - path: /etc/systemd/network/00-mgmt.network
     content: |
       [Match]
@@ -30,11 +29,9 @@ write_files:
       [Match]
       Name=enp0s4
       [Network]
-      # No IP — VPP owns this NIC via af_xdp.
       LinkLocalAddressing=no
       IPv6AcceptRA=no
-
-  # Ensure systemd-resolved doesn't try to be clever on port 53.
+  # Don't let systemd-resolved steal port 53.
   - path: /etc/systemd/resolved.conf.d/no-stub.conf
     content: |
       [Resolve]
@@ -42,6 +39,12 @@ write_files:
   - path: /etc/resolv.conf
     content: |
       nameserver 1.1.1.1
+  # Pin VPP before apt install so we get 25.10 specifically.
+  - path: /etc/apt/preferences.d/vpp
+    content: |
+      Package: vpp* libvppcom* libvppinfra*
+      Pin: version 25.10*
+      Pin-Priority: 1000
 
 apt:
   sources:
@@ -61,16 +64,32 @@ packages:
   - dnsutils
 
 runcmd:
-  # Pin VPP to 25.10 to match what dnsd was compiled against.
-  - echo 'Package: vpp* libvppcom*' > /etc/apt/preferences.d/vpp
-  - echo 'Pin: version 25.10*' >> /etc/apt/preferences.d/vpp
-  - echo 'Pin-Priority: 1000' >> /etc/apt/preferences.d/vpp
+  # 1. Stop the vanilla VPP service that comes with the apt package.
+  #    We run VPP under vpp-test.service with our own config instead.
   - [bash, -c, "systemctl disable vpp.service || true"]
   - [bash, -c, "systemctl stop vpp.service || true"]
+
+  # 2. Pull our config files + systemd units off the DNSDASSETS ISO
+  #    attached alongside the cloud-init seed. MUST come before
+  #    any `systemctl enable` of our units or the enable fails.
+  - [mkdir, -p, /mnt/dnsd-assets, /etc/vpp, /etc/dnsd, /usr/local/bin]
+  - [mount, -o, ro, -t, iso9660, LABEL=DNSDASSETS, /mnt/dnsd-assets]
+  - [cp, /mnt/dnsd-assets/startup.conf, /etc/vpp/startup.conf]
+  - [cp, /mnt/dnsd-assets/vcl.conf,     /etc/vpp/vcl.conf]
+  - [cp, /mnt/dnsd-assets/commands.txt, /etc/vpp/commands.txt]
+  - [cp, /mnt/dnsd-assets/router.yaml,  /etc/dnsd/router.yaml]
+  - [install, -m, "755", /mnt/dnsd-assets/configure-vpp.sh, /usr/local/bin/configure-vpp.sh]
+  - [cp, /mnt/dnsd-assets/vpp-test.service, /etc/systemd/system/vpp-test.service]
+  - [cp, /mnt/dnsd-assets/dnsd.service,     /etc/systemd/system/dnsd.service]
+  - [systemctl, daemon-reload]
+
+  # 3. Enable the services + network bits. vpp-test comes up
+  #    automatically on next boot; dnsd waits on it (Requires=).
   - [systemctl, enable, systemd-networkd]
   - [systemctl, enable, --now, systemd-resolved]
   - [systemctl, enable, vpp-test.service]
   - [systemctl, enable, dnsd.service]
-  # Reboot so systemd-networkd picks up the drop-ins without the
-  # vanilla /etc/network/interfaces from the cloud image fighting it.
-  - [bash, -c, "touch /var/lib/dnsd-test-vm.setup-done"]
+
+  # 4. Sentinels run-tests.sh polls for.
+  - [touch, /var/lib/dnsd-test-vm.assets-installed]
+  - [touch, /var/lib/dnsd-test-vm.setup-done]

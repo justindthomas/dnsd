@@ -83,28 +83,9 @@ genisoimage -quiet -output "$ASSETS_ISO" -volid DNSDASSETS \
     "$ASSETS/vpp-test.service" \
     "$ASSETS/dnsd.service"
 
-# Extend cloud-init to mount that ISO and drop the files where the
-# systemd units expect them. We do this by appending to the
-# user-data before building the seed, so cloud-init drives the copy.
-log "extending user-data with asset-install step"
-# Rebuild user-data with the mount-and-install step appended to runcmd.
-cat > "$TMPDIR/user-data.final" <<'EOF'
-EOF
-awk '1; END { print "" }' "$ASSETS/cloud-init.yaml" > "$TMPDIR/user-data.final"
-cat >> "$TMPDIR/user-data.final" <<'EOF'
-  - [mkdir, -p, /mnt/dnsd-assets, /etc/vpp, /etc/dnsd, /usr/local/bin]
-  - [mount, -o, ro, -t, iso9660, LABEL=DNSDASSETS, /mnt/dnsd-assets]
-  - [cp, /mnt/dnsd-assets/startup.conf, /etc/vpp/startup.conf]
-  - [cp, /mnt/dnsd-assets/vcl.conf, /etc/vpp/vcl.conf]
-  - [cp, /mnt/dnsd-assets/commands.txt, /etc/vpp/commands.txt]
-  - [cp, /mnt/dnsd-assets/router.yaml, /etc/dnsd/router.yaml]
-  - [install, -m, "755", /mnt/dnsd-assets/configure-vpp.sh, /usr/local/bin/configure-vpp.sh]
-  - [cp, /mnt/dnsd-assets/vpp-test.service, /etc/systemd/system/vpp-test.service]
-  - [cp, /mnt/dnsd-assets/dnsd.service, /etc/systemd/system/dnsd.service]
-  - [systemctl, daemon-reload]
-  - [touch, /var/lib/dnsd-test-vm.assets-installed]
-EOF
-cloud-localds "$SEED" "$TMPDIR/user-data.final" "$TMPDIR/meta-data"
+# cloud-init.yaml already contains the asset-install runcmd in
+# the right order (mount ISO → copy → enable). No post-processing
+# needed.
 
 # Boot the VM so cloud-init can do its thing. No KVM accel assumed
 # since the build host's kvm group membership may not be in this
