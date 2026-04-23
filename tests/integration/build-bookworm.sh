@@ -40,7 +40,7 @@ $CONTAINER_CMD run --rm \
     debian:bookworm bash -c '
         set -euo pipefail
         apt-get update -qq
-        apt-get install -y -qq curl build-essential pkg-config libssl-dev ca-certificates gnupg
+        apt-get install -y -qq curl build-essential pkg-config libssl-dev ca-certificates gnupg git
 
         # Rust via rustup.
         curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
@@ -76,9 +76,7 @@ EOF
 
         # Clone vcl-rs next to dnsd-src so dnsds [patch] entry
         # (vcl-rs = { path = "../vcl-rs" }) resolves inside the
-        # container. Falls back to git source if the clone fails,
-        # but in practice the [patch] won't fire then.
-        apt-get install -y -qq git
+        # container.
         git clone --quiet --depth 1 https://github.com/justindthomas/vcl-rs.git /root/vcl-rs
 
         cp -r /src /root/dnsd-src
