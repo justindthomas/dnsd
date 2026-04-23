@@ -5,14 +5,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/ip link set ens4 up
-ExecStartPre=-/usr/bin/ip addr flush dev ens4
+# dpdk needs ens4 (PCI 0000:00:04.0) unbound from virtio-net and
+# bound to uio_pci_generic before VPP starts. Kernel module is in
+# stock Debian; no IOMMU required (unlike vfio-pci).
+# Idempotent: skip if already bound, tolerate absence on clean VMs.
+ExecStartPre=/usr/sbin/modprobe uio_pci_generic
+ExecStartPre=/bin/sh -c 'echo uio_pci_generic > /sys/bus/pci/devices/0000:00:04.0/driver_override'
+ExecStartPre=-/bin/sh -c '[ -e /sys/bus/pci/devices/0000:00:04.0/driver ] && echo 0000:00:04.0 > /sys/bus/pci/devices/0000:00:04.0/driver/unbind'
+ExecStartPre=/bin/sh -c 'echo 0000:00:04.0 > /sys/bus/pci/drivers/uio_pci_generic/bind'
+
 ExecStart=/usr/bin/vpp -c /etc/vpp/startup.conf
 # After VPP is serving its CLI, bind the default app-namespace to
 # the wan interface (see configure-vpp.sh).
 ExecStartPost=/usr/local/bin/configure-vpp.sh
 Restart=on-failure
 RestartSec=2
+# VPP takes a second or two to come fully up; systemd's default
+# 90s ExecStartPost timeout is plenty.
 
 [Install]
 WantedBy=multi-user.target
