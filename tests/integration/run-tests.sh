@@ -37,8 +37,12 @@ NET="${DNSD_TEST_NET:-10.99.0}"
 HOST_IP="${DNSD_TEST_HOST_IP:-${NET}.1}"
 VM_IP="${DNSD_TEST_VM_IP:-${NET}.2}"
 
-SSH_PORT="${DNSD_TEST_SSH_PORT:-2290}"
-VNC_DISPLAY="${DNSD_TEST_VNC:-50}"
+# 2290 collides with an unrelated FreeBSD VM on the current build
+# host; 2293 is outside every slim-suite range we've seen
+# (ospfd 2240-2242, bgpd 2250-2251, dhcpd 2260-2261, dnsd-slim
+# 2270-2271) and leaves 2291-2292 free for future nearby suites.
+SSH_PORT="${DNSD_TEST_SSH_PORT:-2293}"
+VNC_DISPLAY="${DNSD_TEST_VNC:-53}"
 
 REBUILD=false
 TEARDOWN=true
