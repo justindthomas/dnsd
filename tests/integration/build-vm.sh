@@ -147,11 +147,12 @@ set +x
 # Wait for SSH to come up (signals that cloud-init has at least set
 # up ssh + root password). Then wait for /var/lib/dnsd-test-vm.assets-installed.
 log "waiting for SSH + cloud-init to finish (PID=$QEMU_PID)"
+SSH_BUILD="ssh -i $SSH_KEY -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR -o ConnectTimeout=3 \
+    -p 2289 root@localhost"
 for i in $(seq 1 120); do
-    if sshpass -p dnsd ssh \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -o ConnectTimeout=3 \
-        -p 2289 root@localhost \
+    if $SSH_BUILD \
         'test -f /var/lib/dnsd-test-vm.assets-installed && test -f /var/lib/dnsd-test-vm.setup-done' 2>/dev/null; then
         log "setup complete after ${i}x5s poll"
         break
@@ -165,9 +166,7 @@ for i in $(seq 1 120); do
 done
 
 log "shutting down build VM"
-sshpass -p dnsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR -p 2289 root@localhost \
-    'systemctl poweroff' 2>/dev/null || true
+$SSH_BUILD 'systemctl poweroff' 2>/dev/null || true
 wait "$QEMU_PID" 2>/dev/null || true
 
 log "golden image ready: $GOLDEN"
