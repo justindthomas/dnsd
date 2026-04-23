@@ -76,8 +76,10 @@ runcmd:
     apt-get update -qq
 
     echo "==> apt-get install VPP 25.10"
+    # libvppcom.so ships inside the vpp package itself; there's no
+    # standalone libvppcom package in fd.io's bookworm repo.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        vpp vpp-plugin-core vpp-plugin-dpdk libvppcom dnsutils
+        vpp vpp-plugin-core vpp-plugin-dpdk dnsutils
 
     echo "==> disabling vanilla vpp.service"
     systemctl disable vpp.service || true
