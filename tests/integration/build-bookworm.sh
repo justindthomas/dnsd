@@ -74,6 +74,13 @@ EOF
         done
         ldconfig 2>/dev/null || true
 
+        # Clone vcl-rs next to dnsd-src so dnsds [patch] entry
+        # (vcl-rs = { path = "../vcl-rs" }) resolves inside the
+        # container. Falls back to git source if the clone fails,
+        # but in practice the [patch] won't fire then.
+        apt-get install -y -qq git
+        git clone --quiet --depth 1 https://github.com/justindthomas/vcl-rs.git /root/vcl-rs
+
         cp -r /src /root/dnsd-src
         export CARGO_TARGET_DIR=/root/cargo-target
         cd /root/dnsd-src
