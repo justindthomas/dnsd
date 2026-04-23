@@ -23,18 +23,18 @@ disable_root: false
 ssh_deletekeys: true
 
 write_files:
-  # enp0s3 (user-net) gets DHCP for SSH; enp0s4 (bridge) stays
+  # ens3 (user-net) gets DHCP for SSH; ens4 (bridge) stays
   # address-less so VPP's af_xdp plugin can grab it.
   - path: /etc/systemd/network/00-mgmt.network
     content: |
       [Match]
-      Name=enp0s3
+      Name=ens3
       [Network]
       DHCP=yes
   - path: /etc/systemd/network/10-wan-noaddr.network
     content: |
       [Match]
-      Name=enp0s4
+      Name=ens4
       [Network]
       LinkLocalAddressing=no
       IPv6AcceptRA=no

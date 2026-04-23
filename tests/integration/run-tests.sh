@@ -165,25 +165,65 @@ if [ ! -f "$DNSD_BINARY" ]; then
     log "[-] dnsd binary not found at $DNSD_BINARY"
     exit 1
 fi
-log "side-loading dnsd + dnsd-query from $DNSD_BINARY"
+log "side-loading fresh vm-assets + dnsd binary"
 SSHX="ssh -i $SSH_KEY -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR -p $SSH_PORT root@localhost"
 SCPX="scp -i $SSH_KEY -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR -P $SSH_PORT"
+
+# Ship the daemon binary + query tool.
 $SCPX "$DNSD_BINARY" root@localhost:/tmp/dnsd-new
 if [ -f "$WORK/dnsd-query-bookworm" ]; then
     $SCPX "$WORK/dnsd-query-bookworm" root@localhost:/tmp/dnsd-query-new
 fi
+
+# Ship fresh vm-assets too. Lets us iterate on VPP config / unit
+# files / router.yaml without rebuilding the golden image.
+_ASSET_TAR="$WORK/assets-sideload.tar"
+( cd "$ASSETS" && tar cf "$_ASSET_TAR" \
+    startup.conf vcl.conf commands.txt router.yaml \
+    configure-vpp.sh vpp-test.service dnsd.service )
+$SCPX "$_ASSET_TAR" root@localhost:/tmp/assets-sideload.tar
+rm -f "$_ASSET_TAR"
+
 $SSHX <<'REMOTE'
 set -e
+
+# 1. Fresh vm-assets.
+mkdir -p /tmp/assets-sideload
+tar xf /tmp/assets-sideload.tar -C /tmp/assets-sideload
+install -m 644 /tmp/assets-sideload/startup.conf     /etc/vpp/startup.conf
+install -m 644 /tmp/assets-sideload/vcl.conf         /etc/vpp/vcl.conf
+install -m 644 /tmp/assets-sideload/commands.txt     /etc/vpp/commands.txt
+install -m 644 /tmp/assets-sideload/router.yaml      /etc/dnsd/router.yaml
+install -m 755 /tmp/assets-sideload/configure-vpp.sh /usr/local/bin/configure-vpp.sh
+install -m 644 /tmp/assets-sideload/vpp-test.service /etc/systemd/system/vpp-test.service
+install -m 644 /tmp/assets-sideload/dnsd.service     /etc/systemd/system/dnsd.service
+systemctl daemon-reload
+
+# 2. Fresh dnsd binaries.
 install -m 755 /tmp/dnsd-new /usr/local/bin/dnsd
 if [ -f /tmp/dnsd-query-new ]; then
     install -m 755 /tmp/dnsd-query-new /usr/local/bin/dnsd-query
 fi
-rm -f /tmp/dnsd-new /tmp/dnsd-query-new
-systemctl restart dnsd.service
+rm -rf /tmp/assets-sideload /tmp/assets-sideload.tar /tmp/dnsd-new /tmp/dnsd-query-new
+
+# 3. Clean restart — stop dnsd so systemd can restart vpp-test
+#    without a cascading Requires= failure, then start both.
+systemctl stop dnsd.service vpp-test.service 2>/dev/null || true
+# Give VPP time to release shared-memory + VCL sockets.
+sleep 2
+systemctl restart vpp-test.service
+# vpp-test has ExecStartPost that waits for the wan interface to
+# appear via configure-vpp.sh; give it up to 30s before we try
+# bringing dnsd up.
+for i in $(seq 1 30); do
+    if systemctl is-active vpp-test.service | grep -q '^active$'; then break; fi
+    sleep 1
+done
+systemctl start dnsd.service
 REMOTE
 
 log "waiting for dnsd listener readiness (up to 60s)..."
