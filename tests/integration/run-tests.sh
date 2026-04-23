@@ -166,16 +166,17 @@ if [ ! -f "$DNSD_BINARY" ]; then
     exit 1
 fi
 log "side-loading dnsd + dnsd-query from $DNSD_BINARY"
-sshpass -p dnsd scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR -P "$SSH_PORT" \
-    "$DNSD_BINARY" root@localhost:/tmp/dnsd-new
+SSHX="ssh -i $SSH_KEY -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR -p $SSH_PORT root@localhost"
+SCPX="scp -i $SSH_KEY -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR -P $SSH_PORT"
+$SCPX "$DNSD_BINARY" root@localhost:/tmp/dnsd-new
 if [ -f "$WORK/dnsd-query-bookworm" ]; then
-    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o IdentitiesOnly=yes -o LogLevel=ERROR -P "$SSH_PORT" \
-        "$WORK/dnsd-query-bookworm" root@localhost:/tmp/dnsd-query-new
+    $SCPX "$WORK/dnsd-query-bookworm" root@localhost:/tmp/dnsd-query-new
 fi
-sshpass -p dnsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR -p "$SSH_PORT" root@localhost <<'REMOTE'
+$SSHX <<'REMOTE'
 set -e
 install -m 755 /tmp/dnsd-new /usr/local/bin/dnsd
 if [ -f /tmp/dnsd-query-new ]; then
@@ -187,9 +188,7 @@ REMOTE
 
 log "waiting for dnsd listener readiness (up to 60s)..."
 for i in $(seq 1 60); do
-    if sshpass -p dnsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -p "$SSH_PORT" root@localhost \
-        'dnsd-query stats 2>/dev/null | grep -q queries_udp' 2>/dev/null; then
+    if $SSHX 'dnsd-query stats 2>/dev/null | grep -q queries_udp' 2>/dev/null; then
         log "  dnsd ready"
         break
     fi
