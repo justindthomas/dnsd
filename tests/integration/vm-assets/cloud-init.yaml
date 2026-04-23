@@ -1,25 +1,26 @@
 #cloud-config
 # Cloud-init user-data for the dnsd integration test VM. Runs once
-# on first boot; makes the VM into a self-contained dnsd+VPP box.
+# on first boot; makes the VM into a self-contained dnsd + VPP box.
 #
-# All apt + service work happens in runcmd (deterministic order)
-# rather than cloud-init's `packages:` stage — otherwise the VPP
-# install races the apt repo configuration and fails with "Unable
-# to locate package vpp".
+# All the real work happens in a single `runcmd` script with
+# `set -euo pipefail` so any failure halts cloud-init and the
+# sentinels never get touched — build-vm.sh times out visibly
+# instead of silently producing a broken golden.
 
 hostname: dnsd-test-vm
 manage_etc_hosts: true
 
+# SSH-key auth only. The public key is substituted in by
+# build-vm.sh from an ephemeral keypair generated at build time.
+# No password path — robust against debian cloud image sshd_config
+# quirks around PasswordAuthentication.
 users:
   - name: root
-    plain_text_passwd: dnsd
-    lock_passwd: false
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
     shell: /bin/bash
-
-ssh_pwauth: true
-
-chpasswd:
-  expire: false
+disable_root: false
+ssh_deletekeys: true
 
 write_files:
   # enp0s3 (user-net) gets DHCP for SSH; enp0s4 (bridge) stays
@@ -45,8 +46,7 @@ write_files:
   - path: /etc/resolv.conf
     content: |
       nameserver 1.1.1.1
-  # Pin VPP to 25.10 so apt prefers fd.io's build over anything
-  # else that might end up on the path.
+  # Pin VPP to 25.10 so apt prefers fd.io's build.
   - path: /etc/apt/preferences.d/vpp
     content: |
       Package: vpp* libvppcom* libvppinfra*
@@ -54,43 +54,51 @@ write_files:
       Pin-Priority: 1000
 
 runcmd:
-  # 1. fd.io apt repo. Fetch the key directly (cloud-init's keyid
-  #    resolution through keyservers has been flaky) and register
-  #    the source with signed-by pointing at it.
-  - [bash, -c, "curl -fsSL https://packagecloud.io/fdio/release/gpgkey | gpg --dearmor -o /usr/share/keyrings/fdio-release.gpg"]
-  - [bash, -c, "echo 'deb [signed-by=/usr/share/keyrings/fdio-release.gpg] https://packagecloud.io/fdio/release/debian bookworm main' > /etc/apt/sources.list.d/fdio-release.list"]
-  - [apt-get, update, -qq]
+  # One bash script so failure halts (set -e) + output is grouped
+  # in cloud-init-output.log.
+  - |
+    set -euo pipefail
+    exec 2>&1
 
-  # 2. Install VPP + libvppcom now that the repo is configured.
-  #    DEBIAN_FRONTEND=noninteractive avoids debconf prompting
-  #    on slow consoles.
-  - [bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq vpp vpp-plugin-core vpp-plugin-dpdk libvppcom dnsutils"]
+    echo "==> mounting assets ISO"
+    mkdir -p /mnt/dnsd-assets /etc/vpp /etc/dnsd /usr/local/bin
+    mount -o ro -t iso9660 LABEL=DNSDASSETS /mnt/dnsd-assets
 
-  # 3. Kill the vanilla VPP unit — we run VPP under vpp-test.service
-  #    with our own config.
-  - [bash, -c, "systemctl disable vpp.service || true"]
-  - [bash, -c, "systemctl stop vpp.service || true"]
+    echo "==> installing fd.io apt repo (gpg key pre-baked by build-vm.sh)"
+    install -m 644 /mnt/dnsd-assets/fdio-release.gpg \
+        /usr/share/keyrings/fdio-release.gpg
+    echo 'deb [signed-by=/usr/share/keyrings/fdio-release.gpg] https://packagecloud.io/fdio/release/debian bookworm main' \
+        > /etc/apt/sources.list.d/fdio-release.list
 
-  # 4. Pull our config files + systemd units off the DNSDASSETS ISO
-  #    attached alongside the cloud-init seed. Must come before the
-  #    `systemctl enable` of our units.
-  - [mkdir, -p, /mnt/dnsd-assets, /etc/vpp, /etc/dnsd, /usr/local/bin]
-  - [mount, -o, ro, -t, iso9660, LABEL=DNSDASSETS, /mnt/dnsd-assets]
-  - [cp, /mnt/dnsd-assets/startup.conf, /etc/vpp/startup.conf]
-  - [cp, /mnt/dnsd-assets/vcl.conf,     /etc/vpp/vcl.conf]
-  - [cp, /mnt/dnsd-assets/commands.txt, /etc/vpp/commands.txt]
-  - [cp, /mnt/dnsd-assets/router.yaml,  /etc/dnsd/router.yaml]
-  - [install, -m, "755", /mnt/dnsd-assets/configure-vpp.sh, /usr/local/bin/configure-vpp.sh]
-  - [cp, /mnt/dnsd-assets/vpp-test.service, /etc/systemd/system/vpp-test.service]
-  - [cp, /mnt/dnsd-assets/dnsd.service,     /etc/systemd/system/dnsd.service]
-  - [systemctl, daemon-reload]
+    echo "==> apt-get update"
+    apt-get update -qq
 
-  # 5. Enable services + network bits.
-  - [systemctl, enable, systemd-networkd]
-  - [systemctl, enable, --now, systemd-resolved]
-  - [systemctl, enable, vpp-test.service]
-  - [systemctl, enable, dnsd.service]
+    echo "==> apt-get install VPP 25.10"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        vpp vpp-plugin-core vpp-plugin-dpdk libvppcom dnsutils
 
-  # 6. Sentinels run-tests.sh / build-vm.sh poll for.
-  - [touch, /var/lib/dnsd-test-vm.assets-installed]
-  - [touch, /var/lib/dnsd-test-vm.setup-done]
+    echo "==> disabling vanilla vpp.service"
+    systemctl disable vpp.service || true
+    systemctl stop    vpp.service || true
+
+    echo "==> installing dnsd config + systemd units"
+    cp /mnt/dnsd-assets/startup.conf     /etc/vpp/startup.conf
+    cp /mnt/dnsd-assets/vcl.conf         /etc/vpp/vcl.conf
+    cp /mnt/dnsd-assets/commands.txt     /etc/vpp/commands.txt
+    cp /mnt/dnsd-assets/router.yaml      /etc/dnsd/router.yaml
+    install -m 755 /mnt/dnsd-assets/configure-vpp.sh \
+        /usr/local/bin/configure-vpp.sh
+    cp /mnt/dnsd-assets/vpp-test.service /etc/systemd/system/vpp-test.service
+    cp /mnt/dnsd-assets/dnsd.service     /etc/systemd/system/dnsd.service
+    systemctl daemon-reload
+
+    echo "==> enabling services"
+    systemctl enable systemd-networkd
+    systemctl enable --now systemd-resolved
+    systemctl enable vpp-test.service
+    systemctl enable dnsd.service
+
+    echo "==> sentinels"
+    touch /var/lib/dnsd-test-vm.assets-installed
+    touch /var/lib/dnsd-test-vm.setup-done
+    echo "==> setup complete"

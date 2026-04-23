@@ -19,24 +19,22 @@ HOST = "localhost"
 SSH_PORT = int(os.environ.get("DNSD_TEST_SSH_PORT", "2290"))
 VM_IP = os.environ.get("DNSD_TEST_VM_IP", "10.99.0.2")
 HOST_IP = os.environ.get("DNSD_TEST_HOST_IP", "10.99.0.1")
-PASSWORD = os.environ.get("DNSD_TEST_PASSWORD", "dnsd")
+SSH_KEY = os.environ.get(
+    "DNSD_TEST_SSH_KEY",
+    str(Path(__file__).resolve().parent.parent / ".work" / "ssh-key"),
+)
 
 
 def _ssh(cmd: str, *, input_text: str | None = None, timeout: int = 30) -> tuple[int, str, str]:
     """Run `cmd` inside the test VM via ssh. Returns (rc, stdout, stderr)."""
     full = [
-        "sshpass",
-        "-p",
-        PASSWORD,
         "ssh",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "LogLevel=ERROR",
-        "-p",
-        str(SSH_PORT),
+        "-i", SSH_KEY,
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-p", str(SSH_PORT),
         f"root@{HOST}",
         cmd,
     ]

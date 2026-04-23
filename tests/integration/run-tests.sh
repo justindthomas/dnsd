@@ -26,6 +26,7 @@ DNSD_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 WORK="${DNSD_TEST_WORK:-$SCRIPT_DIR/.work}"
 GOLDEN="${DNSD_TEST_GOLDEN:-$WORK/dnsd-test-golden.qcow2}"
+SSH_KEY="$WORK/ssh-key"
 TEST_DISK="$WORK/dnsd-test-run.qcow2"
 SERIAL_LOG="$WORK/run-serial.log"
 PIDFILE="$WORK/run.pid"
@@ -132,8 +133,8 @@ $QEMU $QEMU_ACCEL \
 # inside the VM — dnsd-query talks to it).
 log "waiting for SSH..."
 for i in $(seq 1 60); do
-    if sshpass -p dnsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -o ConnectTimeout=3 \
+    if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes -o LogLevel=ERROR -o ConnectTimeout=3 \
         -p "$SSH_PORT" root@localhost 'true' 2>/dev/null; then
         log "  SSH ready"
         break
@@ -165,8 +166,8 @@ sshpass -p dnsd scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 
     -o LogLevel=ERROR -P "$SSH_PORT" \
     "$DNSD_BINARY" root@localhost:/tmp/dnsd-new
 if [ -f "$WORK/dnsd-query-bookworm" ]; then
-    sshpass -p dnsd scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -P "$SSH_PORT" \
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes -o LogLevel=ERROR -P "$SSH_PORT" \
         "$WORK/dnsd-query-bookworm" root@localhost:/tmp/dnsd-query-new
 fi
 sshpass -p dnsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -195,7 +196,7 @@ done
 export DNSD_TEST_SSH_PORT="$SSH_PORT"
 export DNSD_TEST_VM_IP="$VM_IP"
 export DNSD_TEST_HOST_IP="$HOST_IP"
-export DNSD_TEST_PASSWORD="dnsd"
+export DNSD_TEST_SSH_KEY="$SSH_KEY"
 
 PYTEST_ARGS=("$SCRIPT_DIR/pytests")
 [ -n "$PYTEST_K" ] && PYTEST_ARGS+=(-k "$PYTEST_K")

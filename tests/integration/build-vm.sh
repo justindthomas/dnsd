@@ -50,6 +50,24 @@ if [ ! -f "$BASE_IMAGE" ]; then
     exit 1
 fi
 
+# Generate an ephemeral SSH keypair for test access. Lives alongside
+# the golden image — both run-tests.sh and interactive ssh use it.
+SSH_KEY="$WORK/ssh-key"
+if [ ! -f "$SSH_KEY" ]; then
+    log "generating test SSH keypair → $SSH_KEY"
+    ssh-keygen -t ed25519 -N '' -f "$SSH_KEY" -q -C "dnsd-test"
+fi
+SSH_PUBKEY="$(cat "$SSH_KEY.pub")"
+
+# Pre-fetch fd.io's GPG key on the build host. curl-during-cloud-init
+# has been flaky enough to waste two build cycles; bake the key in so
+# the VM's apt just works.
+FDIO_KEY="$WORK/fdio-release.gpg"
+if [ ! -s "$FDIO_KEY" ]; then
+    log "fetching fd.io GPG key"
+    curl -fsSL https://packagecloud.io/fdio/release/gpgkey | gpg --dearmor -o "$FDIO_KEY"
+fi
+
 rm -f "$GOLDEN"
 log "cloning base → $GOLDEN"
 qemu-img create -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$GOLDEN" 20G
@@ -61,7 +79,9 @@ log "building cloud-init seed"
 SEED="$WORK/seed.iso"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
-cp "$ASSETS/cloud-init.yaml" "$TMPDIR/user-data"
+# Substitute our SSH pubkey into the template before cloud-localds
+# bakes it into the seed.
+sed "s|__SSH_PUBKEY__|${SSH_PUBKEY}|g" "$ASSETS/cloud-init.yaml" > "$TMPDIR/user-data"
 cat > "$TMPDIR/meta-data" <<EOF
 instance-id: dnsd-test-vm
 local-hostname: dnsd-test-vm
@@ -73,15 +93,20 @@ cloud-localds "$SEED" "$TMPDIR/user-data" "$TMPDIR/meta-data"
 # copies them to their final paths.
 log "bundling vm-assets into config ISO"
 ASSETS_ISO="$WORK/assets.iso"
+# Stage all the files (including the pre-fetched fd.io gpg key) in
+# one directory so genisoimage can snapshot them with stable names.
+STAGE="$TMPDIR/assets"
+mkdir -p "$STAGE"
+cp "$ASSETS/startup.conf"        "$STAGE/"
+cp "$ASSETS/vcl.conf"            "$STAGE/"
+cp "$ASSETS/commands.txt"        "$STAGE/"
+cp "$ASSETS/router.yaml"         "$STAGE/"
+cp "$ASSETS/configure-vpp.sh"    "$STAGE/"
+cp "$ASSETS/vpp-test.service"    "$STAGE/"
+cp "$ASSETS/dnsd.service"        "$STAGE/"
+cp "$FDIO_KEY"                   "$STAGE/fdio-release.gpg"
 genisoimage -quiet -output "$ASSETS_ISO" -volid DNSDASSETS \
-    -joliet -rock \
-    "$ASSETS/startup.conf" \
-    "$ASSETS/vcl.conf" \
-    "$ASSETS/commands.txt" \
-    "$ASSETS/router.yaml" \
-    "$ASSETS/configure-vpp.sh" \
-    "$ASSETS/vpp-test.service" \
-    "$ASSETS/dnsd.service"
+    -joliet -rock "$STAGE"/
 
 # cloud-init.yaml already contains the asset-install runcmd in
 # the right order (mount ISO → copy → enable). No post-processing
