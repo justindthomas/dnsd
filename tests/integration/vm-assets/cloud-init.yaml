@@ -1,12 +1,15 @@
 #cloud-config
 # Cloud-init user-data for the dnsd integration test VM. Runs once
 # on first boot; makes the VM into a self-contained dnsd+VPP box.
+#
+# All apt + service work happens in runcmd (deterministic order)
+# rather than cloud-init's `packages:` stage — otherwise the VPP
+# install races the apt repo configuration and fails with "Unable
+# to locate package vpp".
 
 hostname: dnsd-test-vm
 manage_etc_hosts: true
 
-# Root login via SSH with a well-known password — this VM is
-# throwaway and test-only. Don't expose it beyond the build host.
 users:
   - name: root
     plain_text_passwd: dnsd
@@ -15,8 +18,11 @@ users:
 
 ssh_pwauth: true
 
+chpasswd:
+  expire: false
+
 write_files:
-  # enp0s3 (user-net) gets DHCP for SSH; enp0s4 (bridge) must stay
+  # enp0s3 (user-net) gets DHCP for SSH; enp0s4 (bridge) stays
   # address-less so VPP's af_xdp plugin can grab it.
   - path: /etc/systemd/network/00-mgmt.network
     content: |
@@ -39,39 +45,35 @@ write_files:
   - path: /etc/resolv.conf
     content: |
       nameserver 1.1.1.1
-  # Pin VPP before apt install so we get 25.10 specifically.
+  # Pin VPP to 25.10 so apt prefers fd.io's build over anything
+  # else that might end up on the path.
   - path: /etc/apt/preferences.d/vpp
     content: |
       Package: vpp* libvppcom* libvppinfra*
       Pin: version 25.10*
       Pin-Priority: 1000
 
-apt:
-  sources:
-    fdio:
-      source: "deb https://packagecloud.io/fdio/release/debian bookworm main"
-      keyid: 1B1C90F0BD8F7ED72149AAEAD12C66EA1C0DE5F1
-
-package_update: true
-package_upgrade: false
-
-packages:
-  - vpp
-  - vpp-plugin-core
-  - vpp-plugin-dpdk
-  - libvppcom
-  - python3
-  - dnsutils
-
 runcmd:
-  # 1. Stop the vanilla VPP service that comes with the apt package.
-  #    We run VPP under vpp-test.service with our own config instead.
+  # 1. fd.io apt repo. Fetch the key directly (cloud-init's keyid
+  #    resolution through keyservers has been flaky) and register
+  #    the source with signed-by pointing at it.
+  - [bash, -c, "curl -fsSL https://packagecloud.io/fdio/release/gpgkey | gpg --dearmor -o /usr/share/keyrings/fdio-release.gpg"]
+  - [bash, -c, "echo 'deb [signed-by=/usr/share/keyrings/fdio-release.gpg] https://packagecloud.io/fdio/release/debian bookworm main' > /etc/apt/sources.list.d/fdio-release.list"]
+  - [apt-get, update, -qq]
+
+  # 2. Install VPP + libvppcom now that the repo is configured.
+  #    DEBIAN_FRONTEND=noninteractive avoids debconf prompting
+  #    on slow consoles.
+  - [bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq vpp vpp-plugin-core vpp-plugin-dpdk libvppcom dnsutils"]
+
+  # 3. Kill the vanilla VPP unit — we run VPP under vpp-test.service
+  #    with our own config.
   - [bash, -c, "systemctl disable vpp.service || true"]
   - [bash, -c, "systemctl stop vpp.service || true"]
 
-  # 2. Pull our config files + systemd units off the DNSDASSETS ISO
-  #    attached alongside the cloud-init seed. MUST come before
-  #    any `systemctl enable` of our units or the enable fails.
+  # 4. Pull our config files + systemd units off the DNSDASSETS ISO
+  #    attached alongside the cloud-init seed. Must come before the
+  #    `systemctl enable` of our units.
   - [mkdir, -p, /mnt/dnsd-assets, /etc/vpp, /etc/dnsd, /usr/local/bin]
   - [mount, -o, ro, -t, iso9660, LABEL=DNSDASSETS, /mnt/dnsd-assets]
   - [cp, /mnt/dnsd-assets/startup.conf, /etc/vpp/startup.conf]
@@ -83,13 +85,12 @@ runcmd:
   - [cp, /mnt/dnsd-assets/dnsd.service,     /etc/systemd/system/dnsd.service]
   - [systemctl, daemon-reload]
 
-  # 3. Enable the services + network bits. vpp-test comes up
-  #    automatically on next boot; dnsd waits on it (Requires=).
+  # 5. Enable services + network bits.
   - [systemctl, enable, systemd-networkd]
   - [systemctl, enable, --now, systemd-resolved]
   - [systemctl, enable, vpp-test.service]
   - [systemctl, enable, dnsd.service]
 
-  # 4. Sentinels run-tests.sh polls for.
+  # 6. Sentinels run-tests.sh / build-vm.sh poll for.
   - [touch, /var/lib/dnsd-test-vm.assets-installed]
   - [touch, /var/lib/dnsd-test-vm.setup-done]
