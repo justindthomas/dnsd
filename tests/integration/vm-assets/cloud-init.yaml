@@ -1,0 +1,76 @@
+#cloud-config
+# Cloud-init user-data for the dnsd integration test VM. Runs once
+# on first boot; makes the VM into a self-contained dnsd+VPP box.
+
+hostname: dnsd-test-vm
+manage_etc_hosts: true
+
+# Root login via SSH with a well-known password — this VM is
+# throwaway and test-only. Don't expose it beyond the build host.
+users:
+  - name: root
+    plain_text_passwd: dnsd
+    lock_passwd: false
+    shell: /bin/bash
+
+ssh_pwauth: true
+
+# Cloud-init builds /etc/netplan, but enp0s4 (the bridge-side NIC)
+# must be handed to VPP, not the kernel. Just bring it up without
+# an IP so af_xdp can grab it. enp0s3 (QEMU user-net) gets DHCP.
+write_files:
+  - path: /etc/systemd/network/00-mgmt.network
+    content: |
+      [Match]
+      Name=enp0s3
+      [Network]
+      DHCP=yes
+  - path: /etc/systemd/network/10-wan-noaddr.network
+    content: |
+      [Match]
+      Name=enp0s4
+      [Network]
+      # No IP — VPP owns this NIC via af_xdp.
+      LinkLocalAddressing=no
+      IPv6AcceptRA=no
+
+  # Ensure systemd-resolved doesn't try to be clever on port 53.
+  - path: /etc/systemd/resolved.conf.d/no-stub.conf
+    content: |
+      [Resolve]
+      DNSStubListener=no
+  - path: /etc/resolv.conf
+    content: |
+      nameserver 1.1.1.1
+
+apt:
+  sources:
+    fdio:
+      source: "deb https://packagecloud.io/fdio/release/debian bookworm main"
+      keyid: 1B1C90F0BD8F7ED72149AAEAD12C66EA1C0DE5F1
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - vpp
+  - vpp-plugin-core
+  - vpp-plugin-dpdk
+  - libvppcom
+  - python3
+  - dnsutils
+
+runcmd:
+  # Pin VPP to 25.10 to match what dnsd was compiled against.
+  - echo 'Package: vpp* libvppcom*' > /etc/apt/preferences.d/vpp
+  - echo 'Pin: version 25.10*' >> /etc/apt/preferences.d/vpp
+  - echo 'Pin-Priority: 1000' >> /etc/apt/preferences.d/vpp
+  - [bash, -c, "systemctl disable vpp.service || true"]
+  - [bash, -c, "systemctl stop vpp.service || true"]
+  - [systemctl, enable, systemd-networkd]
+  - [systemctl, enable, --now, systemd-resolved]
+  - [systemctl, enable, vpp-test.service]
+  - [systemctl, enable, dnsd.service]
+  # Reboot so systemd-networkd picks up the drop-ins without the
+  # vanilla /etc/network/interfaces from the cloud image fighting it.
+  - [bash, -c, "touch /var/lib/dnsd-test-vm.setup-done"]

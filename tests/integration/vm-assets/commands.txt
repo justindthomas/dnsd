@@ -1,0 +1,10 @@
+; VPP startup CLI — runs after plugins load, before main loop
+; takes over. Imports the host's enp0s4 interface via af_xdp and
+; gives it an address. The per-test configure-vpp.sh later adds
+; the app-namespace binding (can't do it here because the app
+; namespace plugin wants the sw_if_index after af_xdp creates it).
+
+create interface af_xdp host-if enp0s4 name wan num-rx-queues 1 mode copy
+set interface state wan up
+set interface ip address wan 10.99.0.2/24
+set interface ip address wan 2001:db8:99::2/64

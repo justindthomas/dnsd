@@ -1,0 +1,29 @@
+dns:
+  enabled: true
+  listeners:
+    - name: wan-v4
+      address: 10.99.0.2
+      port: 53
+      interface: wan
+      protocols: [udp, tcp]
+      # Allow the host side of the bridge.
+      allow_from: [10.99.0.0/24]
+    - name: wan-v6
+      address: "2001:db8:99::2"
+      port: 53
+      interface: wan
+      protocols: [udp, tcp]
+      allow_from: ["2001:db8:99::/64"]
+  forwarders:
+    # iana.org is a stable, well-known domain that returns both
+    # A and AAAA — good for smoke + DNS64 tests.
+    - domain: iana.org
+      servers: [1.1.1.1]
+  recursion:
+    # No iterative recursion in the smoke environment — we test a
+    # pure forwarder path. Iterative-recursion tests need reliable
+    # outbound to the root servers.
+    enabled: false
+  cache:
+    max_entries: 1000
+    negative_ttl: 60

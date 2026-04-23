@@ -1,0 +1,18 @@
+[Unit]
+Description=VPP (minimal, for dnsd integration test)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/ip link set enp0s4 up
+ExecStartPre=-/usr/bin/ip addr flush dev enp0s4
+ExecStart=/usr/bin/vpp -c /etc/vpp/startup.conf
+# After VPP is serving its CLI, bind the default app-namespace to
+# the wan interface (see configure-vpp.sh).
+ExecStartPost=/usr/local/bin/configure-vpp.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
