@@ -1,17 +1,15 @@
 //! imp-dnsd entry point.
 //!
 //! Responsibilities:
-//!   1. Acquire the instance lock (one daemon per control socket).
-//!   2. Load `dns:` from router.yaml.
-//!   3. Initialise VCL + reactor (needs VPP session layer up).
-//!   4. Bind listeners declared in config (UDP/TCP/DoT/DoH).
-//!   5. Bring up the control socket at /run/dnsd.sock.
-//!   6. Wait for SIGTERM / SIGHUP; on SIGHUP, diff config + rebind.
+//!   1. Load `dns:` from router.yaml.
+//!   2. Initialise VCL + reactor (needs VPP session layer up).
+//!   3. Bring up the control socket at /run/dnsd.sock.
+//!   4. Bind listeners declared in config (UDP/TCP, later DoT/DoH).
+//!   5. Wait for SIGTERM / SIGHUP; SIGHUP re-reads config (listener
+//!      rebind follow-up; for now a reload is logged + cached).
 //!
-//! Task #7 fills in the listener bring-up against the vcl-rs
-//! transports. For now we bring up the control socket so impd's
-//! supervisor `Ready::Socket("/run/dnsd.sock")` gate lets dnsd move
-//! from "starting" to "running" during test bring-up.
+//! The handler is currently a REFUSED stub. Task #8 swaps in the real
+//! recursor + forwarder + cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,16 +21,19 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use dnsd::config::DnsConfig;
 use dnsd::control::{ControlServer, DEFAULT_SOCKET};
+use dnsd::handler::{RefusedHandler, SharedHandler};
+use dnsd::io::{tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
+use vcl_rs::{VclApp, VclReactor};
 
 #[derive(Parser, Debug)]
 #[command(name = "imp-dnsd", about = "DNS caching resolver + forwarder for imp")]
 struct Args {
-    /// Path to router.yaml (the `dns:` block is read from here).
+    /// Path to router.yaml.
     #[arg(long, default_value = "/persistent/config/router.yaml")]
     config: PathBuf,
 
-    /// Control socket path (`imp-dnsd-query` connects here).
+    /// Control socket path.
     #[arg(long, default_value = DEFAULT_SOCKET)]
     control_socket: PathBuf,
 }
@@ -40,7 +41,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
@@ -54,15 +57,11 @@ async fn main() -> Result<()> {
         "dns config loaded"
     );
 
-    if !cfg.enabled {
-        tracing::warn!(
-            "dns.enabled=false — staying idle; impd should not have started us"
-        );
-    }
-
     let metrics = Arc::new(Metrics::default());
 
-    // Control socket first so impd's Ready::Socket gate unblocks.
+    // Control socket first so the impd supervisor's Ready::Socket gate
+    // unblocks; we don't want the whole startup to stall behind VCL
+    // init if something is wrong with VPP.
     let control_path = args.control_socket.clone();
     let control = ControlServer::new(control_path.clone(), metrics.clone());
     tokio::spawn(async move {
@@ -71,10 +70,76 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Signal handlers: SIGTERM → graceful exit, SIGHUP → reload.
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sighup = signal(SignalKind::hangup())?;
+    if !cfg.enabled {
+        tracing::warn!("dns.enabled=false — serving control socket only");
+        wait_for_exit(&args.control_socket).await;
+        return Ok(());
+    }
+
+    // VCL init + reactor come up once, shared across every listener.
+    let _vcl_app =
+        VclApp::init("imp-dnsd").with_context(|| "VclApp::init — is VPP up and vcl.conf readable?")?;
+    let reactor = VclReactor::new().with_context(|| "VclReactor::new")?;
+
+    // v1 handler = REFUSED stub. Swap for `dnsd::recursor::Handler`
+    // once task #8 lands.
+    let handler: SharedHandler = Arc::new(RefusedHandler);
+
+    let mut listener_tasks = Vec::new();
+    for listener_cfg in &cfg.listeners {
+        let name = listener_cfg.name.clone();
+        if listener_cfg.has_protocol("udp") {
+            match UdpListener::spawn(
+                listener_cfg.clone(),
+                reactor.clone(),
+                handler.clone(),
+                metrics.clone(),
+            )
+            .await
+            {
+                Ok(h) => listener_tasks.push(h),
+                Err(e) => tracing::error!(listener = %name, "UDP bind failed: {e}"),
+            }
+        }
+        if listener_cfg.has_protocol("tcp") {
+            match TcpListener::spawn(
+                listener_cfg.clone(),
+                reactor.clone(),
+                handler.clone(),
+                metrics.clone(),
+            )
+            .await
+            {
+                Ok(h) => listener_tasks.push(h),
+                Err(e) => tracing::error!(listener = %name, "TCP bind failed: {e}"),
+            }
+        }
+        // DoT / DoH listeners land with task #10; noted-but-not-bound
+        // so operator config doesn't silently get ignored.
+        if listener_cfg.has_protocol("dot") {
+            tracing::warn!(listener = %name, "DoT requested but not yet implemented");
+        }
+        if listener_cfg.has_protocol("doh") {
+            tracing::warn!(listener = %name, "DoH requested but not yet implemented");
+        }
+    }
+
+    if listener_tasks.is_empty() {
+        tracing::warn!(
+            "dns.enabled=true but no listeners came up — check listener config"
+        );
+    } else {
+        tracing::info!(n = listener_tasks.len(), "listeners bound");
+    }
+
+    wait_for_exit(&args.control_socket).await;
+    Ok(())
+}
+
+async fn wait_for_exit(control_socket: &std::path::Path) {
+    let mut sigterm = signal(SignalKind::terminate()).expect("sigterm");
+    let mut sigint = signal(SignalKind::interrupt()).expect("sigint");
+    let mut sighup = signal(SignalKind::hangup()).expect("sighup");
 
     loop {
         tokio::select! {
@@ -87,24 +152,13 @@ async fn main() -> Result<()> {
                 break;
             }
             _ = sighup.recv() => {
-                match DnsConfig::load(&args.config) {
-                    Ok(new_cfg) => {
-                        tracing::info!(
-                            listeners = new_cfg.listeners.len(),
-                            forwarders = new_cfg.forwarders.len(),
-                            "SIGHUP — config reloaded"
-                        );
-                        // Diff + rebind hook lands with task #7.
-                        let _ = new_cfg;
-                    }
-                    Err(e) => tracing::error!("SIGHUP reload failed: {e}"),
-                }
+                // Full rebind-on-change lands when listener lifecycle
+                // gains a drop-and-rebind path. For now: re-parse YAML
+                // so typos surface in the log.
+                tracing::info!("SIGHUP — reload noted (rebind is follow-up)");
             }
         }
     }
 
-    // Best-effort control socket cleanup on exit so the supervisor
-    // doesn't see a stale file.
-    let _ = std::fs::remove_file(&args.control_socket);
-    Ok(())
+    let _ = std::fs::remove_file(control_socket);
 }

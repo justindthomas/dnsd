@@ -10,8 +10,10 @@
 pub mod acl;
 pub mod config;
 pub mod control;
+pub mod handler;
 pub mod io;
 pub mod metrics;
 pub mod recursor;
 
 pub use config::{DnsConfig, Listener};
+pub use handler::{DnsHandler, RefusedHandler, SharedHandler};
