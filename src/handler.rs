@@ -19,12 +19,34 @@ use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::serialize::binary::BinDecodable;
 
+/// Per-listener policy carried alongside every query so the shared
+/// handler can vary behaviour based on which listener accepted the
+/// request. Today we only need to know whether DNS64 is on; adds
+/// (per-listener RRL thresholds, forwarder subset, etc.) go here.
+#[derive(Clone, Debug, Default)]
+pub struct ListenerContext {
+    pub name: String,
+    pub dns64: bool,
+}
+
+impl ListenerContext {
+    pub fn new(name: impl Into<String>, dns64: bool) -> Self {
+        Self { name: name.into(), dns64 }
+    }
+}
+
 #[async_trait]
 pub trait DnsHandler: Send + Sync + 'static {
     /// Dispatch a single DNS query. `query` is the raw wire format
     /// (no transport framing). `peer` is the remote IP (the transport
-    /// has already enforced the CIDR allow-list).
-    async fn handle_bytes(&self, query: &[u8], peer: IpAddr) -> Option<Vec<u8>>;
+    /// has already enforced the CIDR allow-list). `ctx` is the
+    /// per-listener policy for this query.
+    async fn handle_bytes(
+        &self,
+        query: &[u8],
+        peer: IpAddr,
+        ctx: &ListenerContext,
+    ) -> Option<Vec<u8>>;
 }
 
 /// Stub handler: parses the query, mirrors the TXID + question section
@@ -35,7 +57,12 @@ pub struct RefusedHandler;
 
 #[async_trait]
 impl DnsHandler for RefusedHandler {
-    async fn handle_bytes(&self, query: &[u8], _peer: IpAddr) -> Option<Vec<u8>> {
+    async fn handle_bytes(
+        &self,
+        query: &[u8],
+        _peer: IpAddr,
+        _ctx: &ListenerContext,
+    ) -> Option<Vec<u8>> {
         let msg = Message::from_bytes(query).ok()?;
         let mut resp = Message::new();
         resp.set_id(msg.id());
@@ -60,8 +87,8 @@ pub type SharedHandler = Arc<dyn DnsHandler>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::rr::{Name, RecordType};
     use hickory_proto::op::Query;
+    use hickory_proto::rr::{Name, RecordType};
 
     #[tokio::test]
     async fn refused_stub_mirrors_txid_and_question() {
@@ -77,7 +104,11 @@ mod tests {
         let bytes = req.to_vec().unwrap();
 
         let h = RefusedHandler;
-        let resp_bytes = h.handle_bytes(&bytes, "10.0.0.1".parse().unwrap()).await.unwrap();
+        let ctx = ListenerContext::default();
+        let resp_bytes = h
+            .handle_bytes(&bytes, "10.0.0.1".parse().unwrap(), &ctx)
+            .await
+            .unwrap();
         let resp = Message::from_bytes(&resp_bytes).unwrap();
         assert_eq!(resp.id(), 0x4242);
         assert_eq!(resp.response_code(), ResponseCode::Refused);

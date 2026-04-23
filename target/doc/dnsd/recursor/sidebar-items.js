@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["cache","dns64","dnssec","forwarder","rrl"],"struct":["RecursorHandler"]};

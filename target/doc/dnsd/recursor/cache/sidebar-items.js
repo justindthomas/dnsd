@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["rewrite_txid"],"struct":["CacheKey","DnsCache"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["acl","config","control","handler","io","metrics","recursor"]};

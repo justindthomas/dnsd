@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"struct":["RefusedHandler"],"trait":["DnsHandler","MessageVecExt"],"type":["SharedHandler"]};

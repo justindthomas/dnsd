@@ -1,1 +1,0 @@
-{"rustc":17575471286409424799,"features":"[]","declared_features":"[]","target":12549258498006181824,"profile":5347358027863023418,"path":16394116730435753542,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/tagptr-45f3e1cfebe2642f/dep-lib-tagptr","checksum":false}}],"rustflags":["-L/opt/homebrew/opt/libpq/lib"],"config":2069994364910194474,"compile_kind":0}
