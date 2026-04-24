@@ -123,7 +123,28 @@ impl RecursorHandler {
             .recursion
             .as_ref()
             .and_then(|r| r.upstream_timeout_ms);
-        let upstream = Arc::new(UpstreamClient::new(reactor, upstream_timeout_ms));
+        // Pick source IPs for outgoing upstream queries: the first
+        // listener address per family. VPP's auto-source-selection
+        // works on simple setups but emits packets with src=0.0.0.0
+        // on others (multi-interface, no default-route-to-peer).
+        // Binding the source IP at the recursor side is robust
+        // regardless of VPP's FIB shape.
+        let mut source_v4: Option<std::net::Ipv4Addr> = None;
+        let mut source_v6: Option<std::net::Ipv6Addr> = None;
+        for l in &cfg.listeners {
+            match l.address {
+                std::net::IpAddr::V4(v4) if source_v4.is_none() => {
+                    source_v4 = Some(v4);
+                }
+                std::net::IpAddr::V6(v6) if source_v6.is_none() => {
+                    source_v6 = Some(v6);
+                }
+                _ => {}
+            }
+        }
+        let mut upstream_inner = UpstreamClient::new(reactor, upstream_timeout_ms);
+        upstream_inner.set_source_ips(source_v4, source_v6);
+        let upstream = Arc::new(upstream_inner);
 
         // Build a DNS64 policy if any listener has dns64 enabled,
         // OR if the operator wrote an explicit `dns.dns64:` block

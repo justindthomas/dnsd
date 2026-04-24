@@ -113,6 +113,16 @@ pub struct UpstreamClient {
     #[allow(dead_code)]
     reactor: VclReactor,
     timeout: Duration,
+    /// Explicit source IP for outgoing v4 upstream queries. When
+    /// None, vcl-rs binds 0.0.0.0:<random> and relies on VPP's
+    /// FIB-based source selection — which works on most setups
+    /// but emits src=0.0.0.0 on some (multi-interface, no
+    /// default-route-to-peer, etc.). Setting this from the v4
+    /// listener address makes upstream queries always carry a
+    /// real source IP that real upstreams will accept.
+    source_v4: Option<std::net::Ipv4Addr>,
+    /// Same idea for v6 upstream queries.
+    source_v6: Option<std::net::Ipv6Addr>,
 }
 
 impl UpstreamClient {
@@ -120,7 +130,34 @@ impl UpstreamClient {
         let timeout = Duration::from_millis(
             timeout_ms.map(|t| t as u64).unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         );
-        Self { reactor, timeout }
+        Self {
+            reactor,
+            timeout,
+            source_v4: None,
+            source_v6: None,
+        }
+    }
+
+    /// Set the source IPs used for upstream queries. Called by
+    /// `RecursorHandler::from_parts` after listener config is parsed
+    /// so we can prefer "the address dnsd is bound to" as the
+    /// source — that's an interface VPP definitely has a route
+    /// for, and it makes packets attributable to dnsd in upstream
+    /// captures.
+    pub fn set_source_ips(
+        &mut self,
+        v4: Option<std::net::Ipv4Addr>,
+        v6: Option<std::net::Ipv6Addr>,
+    ) {
+        self.source_v4 = v4;
+        self.source_v6 = v6;
+    }
+
+    fn source_for(&self, peer: SocketAddr) -> Option<std::net::IpAddr> {
+        match peer.ip() {
+            std::net::IpAddr::V4(_) => self.source_v4.map(std::net::IpAddr::V4),
+            std::net::IpAddr::V6(_) => self.source_v6.map(std::net::IpAddr::V6),
+        }
     }
 
     /// Send `query` to the first server that answers (round-robin
@@ -207,8 +244,9 @@ impl UpstreamClient {
         let peer_addr = peer;
         let query_vec = query.to_vec();
         let timeout = self.timeout;
+        let source = self.source_for(peer);
         let (resp, from) = tokio::task::spawn_blocking(move || {
-            query_udp_sync(peer_addr, &query_vec, timeout)
+            query_udp_sync(peer_addr, source, &query_vec, timeout)
         })
         .await
         .with_context(|| format!("blocking-pool join for upstream {peer}"))?
@@ -253,8 +291,9 @@ impl UpstreamClient {
         let peer_addr = peer;
         let query_vec = query.to_vec();
         let timeout = self.timeout;
+        let source = self.source_for(peer);
         let resp = tokio::task::spawn_blocking(move || {
-            query_tcp_dns_sync(peer_addr, &query_vec, timeout)
+            query_tcp_dns_sync(peer_addr, source, &query_vec, timeout)
         })
         .await
         .with_context(|| format!("blocking-pool join for TCP upstream {peer}"))?
