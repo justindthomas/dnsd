@@ -5,7 +5,13 @@
 //! loop on the stream until the peer closes. Out-of-order replies are
 //! supported (every query gets its own spawned task) but are rare in
 //! practice because classic resolvers pipeline serially over TCP.
+//!
+//! `acl` and `ctx` are `ArcSwap`-backed so SIGHUP-triggered reload can
+//! publish a fresh allow-list / dns64 toggle without rebinding the
+//! socket — already-connected clients pick up the new ACL on their
+//! next query in the loop.
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,9 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use vcl_rs::{VclListener, VclReactor, VclStream};
 
-use crate::acl::ClientAcl;
-use crate::config::Listener;
-use crate::handler::{ListenerContext, SharedHandler};
+use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::metrics::Metrics;
 
 const MAX_TCP_MESSAGE: usize = 65535; // length field is u16
@@ -24,17 +28,19 @@ pub struct TcpListener;
 
 impl TcpListener {
     pub async fn spawn(
-        listener_cfg: Listener,
+        bind: SocketAddr,
         reactor: VclReactor,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
+        acl: AclSwap,
+        ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let bind = std::net::SocketAddr::new(listener_cfg.address, listener_cfg.port);
         let listener = VclListener::bind(bind, reactor.clone())
             .with_context(|| format!("TCP bind {bind}"))?;
-        let acl = Arc::new(ClientAcl::new(listener_cfg.allow_from.clone()));
-        let ctx = Arc::new(ListenerContext::new(&listener_cfg.name, listener_cfg.dns64));
-        tracing::info!(listener = %listener_cfg.name, addr = %bind, dns64 = ctx.dns64, "TCP listener up");
+        {
+            let snap = ctx.load();
+            tracing::info!(listener = %snap.name, addr = %bind, dns64 = snap.dns64, "TCP listener up");
+        }
 
         let handle = tokio::spawn(async move {
             accept_loop(listener, acl, handler, metrics, ctx).await;
@@ -45,21 +51,21 @@ impl TcpListener {
 
 async fn accept_loop(
     listener: VclListener,
-    acl: Arc<ClientAcl>,
+    acl: AclSwap,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: Arc<ListenerContext>,
+    ctx: CtxSwap,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(listener = %ctx.name, "accept: {e}");
+                tracing::error!(listener = %ctx.load().name, "accept: {e}");
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
         };
-        if !acl.allows(peer.ip()) {
+        if !acl.load().allows(peer.ip()) {
             metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
             drop(stream);
             continue;
@@ -67,10 +73,11 @@ async fn accept_loop(
 
         let handler = handler.clone();
         let metrics = metrics.clone();
+        let acl = acl.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(stream, peer, handler, metrics, &ctx).await {
-                tracing::debug!(listener = %ctx.name, %peer, "TCP conn: {e}");
+            if let Err(e) = serve_connection(stream, peer, handler, metrics, acl, ctx).await {
+                tracing::debug!(%peer, "TCP conn: {e}");
             }
         });
     }
@@ -81,7 +88,8 @@ async fn serve_connection(
     peer: std::net::SocketAddr,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: &ListenerContext,
+    acl: AclSwap,
+    ctx: CtxSwap,
 ) -> anyhow::Result<()> {
     // Serve queries serially on a TCP connection. RFC 7766 allows
     // clients to pipeline, but concurrent writes on the same VclStream
@@ -103,9 +111,19 @@ async fn serve_connection(
 
         let mut query = vec![0u8; len];
         stream.read_exact(&mut query).await?;
+
+        // Re-check ACL on each query inside the connection so a
+        // SIGHUP that drops a CIDR boots already-connected clients
+        // that fall outside the new allow-list — same enforcement
+        // posture as a fresh accept.
+        if !acl.load().allows(peer.ip()) {
+            metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         metrics.queries_tcp.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(response) = handler.handle_bytes(&query, peer.ip(), ctx).await {
+        let ctx_snap = ctx.load_full();
+        if let Some(response) = handler.handle_bytes(&query, peer.ip(), &ctx_snap).await {
             let mut framed = Vec::with_capacity(2 + response.len());
             framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
             framed.extend_from_slice(&response);

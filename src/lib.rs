@@ -1,4 +1,4 @@
-//! imp-dnsd — DNS caching recursor + forwarder.
+//! dnsd — DNS caching recursor + forwarder.
 //!
 //! Runs as a supervised child of `impd` inside the dataplane netns.
 //! Every socket goes through VPP's session layer via `vcl-rs` — no

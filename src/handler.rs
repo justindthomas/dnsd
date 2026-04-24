@@ -19,6 +19,21 @@ use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::serialize::binary::BinDecodable;
 
+use crate::acl::ClientAcl;
+
+/// Hot-swappable per-listener ACL. Each listener task holds one of
+/// these and `load()`s it on every recv/accept; reload publishes a
+/// fresh `ClientAcl` here so a `dns.listeners[*].allow_from` change
+/// takes effect on the next packet — no rebind, no lost TCP/TLS
+/// connections.
+pub type AclSwap = Arc<arc_swap::ArcSwap<ClientAcl>>;
+
+/// Hot-swappable per-listener context (name, dns64 toggle). Same
+/// pattern as `AclSwap` — listener tasks load a fresh snapshot per
+/// query, so toggling `dns64: true|false` or renaming a listener
+/// applies on the next query without rebinding.
+pub type CtxSwap = Arc<arc_swap::ArcSwap<ListenerContext>>;
+
 /// Per-listener policy carried alongside every query so the shared
 /// handler can vary behaviour based on which listener accepted the
 /// request. Today we only need to know whether DNS64 is on; adds

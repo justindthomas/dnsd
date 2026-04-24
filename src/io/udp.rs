@@ -6,16 +6,19 @@
 //! upstream queries). Datagrams up to 4096 B are accepted — enough
 //! for an EDNS0-advertised MTU that fits in our normal MTU, larger
 //! responses drop TC=1 and the client retries over TCP.
+//!
+//! `acl` and `ctx` are `ArcSwap`-backed so SIGHUP-triggered reload can
+//! publish a fresh allow-list / dns64 toggle without rebinding the
+//! socket — every recv loads the current snapshot.
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use vcl_rs::{VclDgramSocket, VclReactor};
 
-use crate::acl::ClientAcl;
-use crate::config::Listener;
-use crate::handler::{ListenerContext, SharedHandler};
+use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::metrics::Metrics;
 
 const UDP_BUF_SIZE: usize = 4096;
@@ -27,17 +30,19 @@ impl UdpListener {
     /// current Tokio runtime. Returns once the socket is bound; the
     /// loop runs until `reactor` / `handler` are dropped.
     pub async fn spawn(
-        listener_cfg: Listener,
+        bind: SocketAddr,
         reactor: VclReactor,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
+        acl: AclSwap,
+        ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let bind = std::net::SocketAddr::new(listener_cfg.address, listener_cfg.port);
         let sock = VclDgramSocket::bind(bind, reactor)
             .with_context(|| format!("UDP bind {bind}"))?;
-        let acl = ClientAcl::new(listener_cfg.allow_from.clone());
-        let ctx = Arc::new(ListenerContext::new(&listener_cfg.name, listener_cfg.dns64));
-        tracing::info!(listener = %listener_cfg.name, addr = %bind, dns64 = ctx.dns64, "UDP listener up");
+        {
+            let snap = ctx.load();
+            tracing::info!(listener = %snap.name, addr = %bind, dns64 = snap.dns64, "UDP listener up");
+        }
 
         let handle = tokio::spawn(async move {
             serve_loop(sock, acl, handler, metrics, ctx).await;
@@ -48,10 +53,10 @@ impl UdpListener {
 
 async fn serve_loop(
     sock: VclDgramSocket,
-    acl: ClientAcl,
+    acl: AclSwap,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: Arc<ListenerContext>,
+    ctx: CtxSwap,
 ) {
     let sock = Arc::new(sock);
     let mut buf = vec![0u8; UDP_BUF_SIZE];
@@ -59,15 +64,15 @@ async fn serve_loop(
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(listener = %ctx.name, "recv_from: {e}");
+                tracing::error!(listener = %ctx.load().name, "recv_from: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             }
         };
 
-        if !acl.allows(peer.ip()) {
+        if !acl.load().allows(peer.ip()) {
             metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(listener = %ctx.name, %peer, "ACL denied");
+            tracing::debug!(listener = %ctx.load().name, %peer, "ACL denied");
             continue;
         }
 
@@ -75,12 +80,15 @@ async fn serve_loop(
 
         let handler = handler.clone();
         let sock = sock.clone();
-        let ctx = ctx.clone();
+        // Snapshot ctx for the duration of this query. A concurrent
+        // reload can update the swap mid-flight; the in-flight query
+        // keeps the version it started with.
+        let ctx_snap = ctx.load_full();
         let query = buf[..n].to_vec();
         tokio::spawn(async move {
-            if let Some(response) = handler.handle_bytes(&query, peer.ip(), &ctx).await {
+            if let Some(response) = handler.handle_bytes(&query, peer.ip(), &ctx_snap).await {
                 if let Err(e) = sock.send_to(&response, peer).await {
-                    tracing::debug!(listener = %ctx.name, %peer, "send_to: {e}");
+                    tracing::debug!(listener = %ctx_snap.name, %peer, "send_to: {e}");
                 }
             }
         });

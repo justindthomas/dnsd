@@ -11,7 +11,7 @@
 //!      keep unchanged) without dropping the cache.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,10 +22,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinHandle;
 use tracing_subscriber::{fmt, EnvFilter};
 
+use dnsd::acl::ClientAcl;
 use dnsd::acme;
 use dnsd::config::{DnsConfig, Listener as ListenerCfg};
 use dnsd::control::{ControlServer, ControlState, DEFAULT_SOCKET};
-use dnsd::handler::{LiveHandler, SharedHandler};
+use dnsd::handler::{AclSwap, CtxSwap, ListenerContext, LiveHandler, SharedHandler};
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
 use dnsd::recursor::{DnsCache, Forwarders, RecursorHandler};
@@ -41,12 +42,31 @@ struct ListenerKey {
     proto: &'static str, // "udp" | "tcp" | "dot" | "doh"
 }
 
+/// Hot-swappable runtime for a bound listener. The listener task
+/// loads `acl` and `ctx` on every recv/accept, so reload can publish
+/// fresh values (allow_from CIDRs, dns64 toggle, name) without
+/// rebinding — already-connected TCP/DoT/DoH peers see the change on
+/// their next request.
 struct LiveListener {
     name: String,
+    acl: AclSwap,
+    ctx: CtxSwap,
     handle: JoinHandle<()>,
 }
 
 type LiveListeners = HashMap<ListenerKey, LiveListener>;
+
+fn make_acl_swap(lc: &ListenerCfg) -> AclSwap {
+    Arc::new(arc_swap::ArcSwap::from_pointee(ClientAcl::new(
+        lc.allow_from.clone(),
+    )))
+}
+
+fn make_ctx_swap(lc: &ListenerCfg) -> CtxSwap {
+    Arc::new(arc_swap::ArcSwap::from_pointee(ListenerContext::new(
+        &lc.name, lc.dns64,
+    )))
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dnsd", about = "DNS caching resolver + forwarder")]
@@ -264,7 +284,9 @@ async fn async_main(args: Args, cfg: DnsConfig, _vcl_app: VclApp) -> Result<()> 
 /// * `Ok(Some(handle))` — bound, listener task spawned.
 /// * `Ok(None)` — permanently skipped (DoT/DoH without TLS, or
 ///   unknown protocol).
-/// * `Err(_)` — transient bind failure; caller should retry.
+/// * `Err(_)` — transient bind failure; caller should retry. The
+///   provided `acl` / `ctx` swaps are reused across retries so the
+///   reload path's hot-swap pointers stay stable.
 async fn try_bind_one(
     lc: &ListenerCfg,
     proto: &'static str,
@@ -272,22 +294,41 @@ async fn try_bind_one(
     handler: &SharedHandler,
     metrics: &Arc<Metrics>,
     tls: Option<&Arc<rustls::ServerConfig>>,
+    acl: &AclSwap,
+    ctx: &CtxSwap,
 ) -> Result<Option<JoinHandle<()>>> {
+    let bind = SocketAddr::new(lc.address, lc.port);
     let name = lc.name.clone();
     match proto {
-        "udp" => UdpListener::spawn(lc.clone(), reactor.clone(), handler.clone(), metrics.clone())
-            .await
-            .map(Some),
-        "tcp" => TcpListener::spawn(lc.clone(), reactor.clone(), handler.clone(), metrics.clone())
-            .await
-            .map(Some),
+        "udp" => UdpListener::spawn(
+            bind,
+            reactor.clone(),
+            handler.clone(),
+            metrics.clone(),
+            acl.clone(),
+            ctx.clone(),
+        )
+        .await
+        .map(Some),
+        "tcp" => TcpListener::spawn(
+            bind,
+            reactor.clone(),
+            handler.clone(),
+            metrics.clone(),
+            acl.clone(),
+            ctx.clone(),
+        )
+        .await
+        .map(Some),
         "dot" => match tls {
             Some(t) => DotListener::spawn(
-                lc.clone(),
+                bind,
                 reactor.clone(),
                 handler.clone(),
                 metrics.clone(),
                 t.clone(),
+                acl.clone(),
+                ctx.clone(),
             )
             .await
             .map(Some),
@@ -298,11 +339,13 @@ async fn try_bind_one(
         },
         "doh" => match tls {
             Some(t) => DohListener::spawn(
-                lc.clone(),
+                bind,
                 reactor.clone(),
                 handler.clone(),
                 metrics.clone(),
                 t.clone(),
+                acl.clone(),
+                ctx.clone(),
             )
             .await
             .map(Some),
@@ -319,7 +362,11 @@ async fn try_bind_one(
 /// not already in `out`, retrying transient bind failures every
 /// 200ms until either everything is bound or `deadline` elapses.
 /// VPP's FIB may not have addresses ready when dnsd starts; this
-/// retry handles that race. Items in `out` already are left alone.
+/// retry handles that race. Items already in `out` are left alone.
+///
+/// Per-listener `acl` and `ctx` swaps are allocated once per
+/// (lc, proto) and reused across retries — the same Arc pointers
+/// land in `out` so reload's hot-swap path can find them later.
 async fn bind_listener_set_with_retry(
     cfg: &DnsConfig,
     reactor: &VclReactor,
@@ -332,8 +379,20 @@ async fn bind_listener_set_with_retry(
     let deadline = Instant::now() + total_deadline;
     let backoff = Duration::from_millis(200);
 
-    let mut pending: Vec<(ListenerCfg, &'static str)> = Vec::new();
+    struct Pending {
+        lc: ListenerCfg,
+        proto: &'static str,
+        acl: AclSwap,
+        ctx: CtxSwap,
+    }
+
+    let mut pending: Vec<Pending> = Vec::new();
     for lc in &cfg.listeners {
+        // One ACL/ctx swap per logical listener; UDP and TCP for the
+        // same listener share so an allow_from edit applies to both
+        // protocols at once.
+        let acl = make_acl_swap(lc);
+        let ctx = make_ctx_swap(lc);
         for proto in ["udp", "tcp", "dot", "doh"] {
             if !lc.has_protocol(proto) {
                 continue;
@@ -346,7 +405,12 @@ async fn bind_listener_set_with_retry(
             if out.contains_key(&key) {
                 continue; // already bound (this is the reload-diff path)
             }
-            pending.push((lc.clone(), proto));
+            pending.push(Pending {
+                lc: lc.clone(),
+                proto,
+                acl: acl.clone(),
+                ctx: ctx.clone(),
+            });
         }
     }
 
@@ -354,18 +418,22 @@ async fn bind_listener_set_with_retry(
     while !pending.is_empty() {
         attempt += 1;
         let mut still_pending = Vec::new();
-        for (lc, proto) in pending.drain(..) {
+        for p in pending.drain(..) {
             let key = ListenerKey {
-                addr: lc.address,
-                port: lc.port,
-                proto,
+                addr: p.lc.address,
+                port: p.lc.port,
+                proto: p.proto,
             };
-            match try_bind_one(&lc, proto, reactor, handler, metrics, tls).await {
+            match try_bind_one(&p.lc, p.proto, reactor, handler, metrics, tls, &p.acl, &p.ctx)
+                .await
+            {
                 Ok(Some(handle)) => {
                     out.insert(
                         key,
                         LiveListener {
-                            name: lc.name.clone(),
+                            name: p.lc.name.clone(),
+                            acl: p.acl,
+                            ctx: p.ctx,
                             handle,
                         },
                     );
@@ -373,12 +441,12 @@ async fn bind_listener_set_with_retry(
                 Ok(None) => {} // permanent skip
                 Err(e) => {
                     tracing::debug!(
-                        listener = %lc.name,
-                        proto,
+                        listener = %p.lc.name,
+                        proto = p.proto,
                         attempt,
                         "bind failed (will retry): {e}"
                     );
-                    still_pending.push((lc, proto));
+                    still_pending.push(p);
                 }
             }
         }
@@ -387,10 +455,10 @@ async fn bind_listener_set_with_retry(
             break;
         }
         if Instant::now() >= deadline {
-            for (lc, proto) in &pending {
+            for p in &pending {
                 tracing::error!(
-                    listener = %lc.name,
-                    proto,
+                    listener = %p.lc.name,
+                    proto = p.proto,
                     "bind giving up after retry deadline"
                 );
             }
@@ -475,25 +543,30 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
     args.live.swap(new_recursor);
     tracing::info!("recursor handler swapped");
 
-    // Listener diff. Compute desired set from new_cfg, abort any
-    // listener whose key isn't there anymore.
-    let mut desired: std::collections::HashSet<ListenerKey> =
-        std::collections::HashSet::new();
+    // Listener diff. Build the desired set indexed by ListenerKey
+    // so we can correlate each existing listener with its new
+    // ListenerCfg for hot-swap of allow_from / dns64 / name.
+    let mut desired: HashMap<ListenerKey, ListenerCfg> = HashMap::new();
     for lc in &new_cfg.listeners {
         for proto in ["udp", "tcp", "dot", "doh"] {
             if lc.has_protocol(proto) {
-                desired.insert(ListenerKey {
-                    addr: lc.address,
-                    port: lc.port,
-                    proto,
-                });
+                desired.insert(
+                    ListenerKey {
+                        addr: lc.address,
+                        port: lc.port,
+                        proto,
+                    },
+                    lc.clone(),
+                );
             }
         }
     }
 
+    // Abort listeners whose (addr, port, proto) is no longer in
+    // config. The remaining ones get an in-place ACL/ctx update.
     let mut aborted = 0u32;
     listeners.retain(|key, live| {
-        if desired.contains(key) {
+        if desired.contains_key(key) {
             true
         } else {
             tracing::info!(
@@ -508,6 +581,26 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
             false
         }
     });
+
+    // Hot-swap ACL + ctx for kept listeners. The listener task picks
+    // up the new values on its next recv/accept (and on every read
+    // inside an open TCP/DoT/DoH connection), so a CIDR change or
+    // dns64 toggle takes effect without dropping live connections.
+    let mut updated = 0u32;
+    for (key, lc) in &desired {
+        if let Some(live) = listeners.get_mut(key) {
+            let new_acl = Arc::new(ClientAcl::new(lc.allow_from.clone()));
+            let new_ctx = Arc::new(ListenerContext::new(&lc.name, lc.dns64));
+            live.acl.store(new_acl);
+            live.ctx.store(new_ctx);
+            // Cached name is what we use in the abort log line; keep
+            // it in sync with the swap so logs reflect renames.
+            if live.name != lc.name {
+                live.name = lc.name.clone();
+            }
+            updated += 1;
+        }
+    }
 
     let handler: SharedHandler = args.live.clone();
     let before = listeners.len();
@@ -526,6 +619,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
     tracing::info!(
         active = listeners.len(),
         aborted,
+        updated,
         added,
         "reload complete"
     );

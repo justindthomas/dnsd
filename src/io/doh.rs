@@ -17,8 +17,16 @@
 //! Today only HTTP/1.1 is handled (hyper::server::conn::http1). HTTP/2
 //! over axum-rustls needs a bit more plumbing (hyper::server::conn::
 //! http2::Builder + GracefulShutdown) and will follow up.
+//!
+//! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
+//! tcp.rs and udp.rs for the pattern). The ACL is checked at TCP
+//! accept time AND on every HTTP request (since axum routes after
+//! the per-connection handshake) so a SIGHUP that drops a CIDR
+//! takes effect on the next request even on already-open
+//! connections.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -39,16 +47,15 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use vcl_rs::{VclListener, VclReactor};
 
-use crate::acl::ClientAcl;
-use crate::config::Listener;
-use crate::handler::{ListenerContext, SharedHandler};
+use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::metrics::Metrics;
 
 #[derive(Clone)]
 struct AppState {
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: Arc<ListenerContext>,
+    ctx: CtxSwap,
+    acl: AclSwap,
     peer: std::net::IpAddr,
 }
 
@@ -56,19 +63,21 @@ pub struct DohListener;
 
 impl DohListener {
     pub async fn spawn(
-        listener_cfg: Listener,
+        bind: SocketAddr,
         reactor: VclReactor,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
         tls_config: Arc<rustls::ServerConfig>,
+        acl: AclSwap,
+        ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let bind = std::net::SocketAddr::new(listener_cfg.address, listener_cfg.port);
         let listener = VclListener::bind(bind, reactor.clone())
             .with_context(|| format!("DoH bind {bind}"))?;
-        let acl = Arc::new(ClientAcl::new(listener_cfg.allow_from.clone()));
-        let ctx = Arc::new(ListenerContext::new(&listener_cfg.name, listener_cfg.dns64));
         let acceptor = TlsAcceptor::from(tls_config);
-        tracing::info!(listener = %listener_cfg.name, addr = %bind, dns64 = ctx.dns64, "DoH listener up");
+        {
+            let snap = ctx.load();
+            tracing::info!(listener = %snap.name, addr = %bind, dns64 = snap.dns64, "DoH listener up");
+        }
 
         let handle = tokio::spawn(async move {
             accept_loop(listener, acceptor, acl, handler, metrics, ctx).await;
@@ -80,21 +89,21 @@ impl DohListener {
 async fn accept_loop(
     listener: VclListener,
     acceptor: TlsAcceptor,
-    acl: Arc<ClientAcl>,
+    acl: AclSwap,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: Arc<ListenerContext>,
+    ctx: CtxSwap,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(listener = %ctx.name, "DoH accept: {e}");
+                tracing::error!(listener = %ctx.load().name, "DoH accept: {e}");
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
         };
-        if !acl.allows(peer.ip()) {
+        if !acl.load().allows(peer.ip()) {
             metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
             drop(stream);
             continue;
@@ -102,6 +111,7 @@ async fn accept_loop(
 
         let handler = handler.clone();
         let metrics = metrics.clone();
+        let acl = acl.clone();
         let ctx = ctx.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
@@ -110,7 +120,8 @@ async fn accept_loop(
                     let state = AppState {
                         handler,
                         metrics,
-                        ctx: ctx.clone(),
+                        ctx,
+                        acl,
                         peer: peer.ip(),
                     };
                     let app = Router::new()
@@ -126,11 +137,11 @@ async fn accept_loop(
                         .serve_connection(io, service)
                         .await
                     {
-                        tracing::debug!(listener = %ctx.name, %peer, "DoH serve: {e}");
+                        tracing::debug!(%peer, "DoH serve: {e}");
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(listener = %ctx.name, %peer, "DoH TLS handshake: {e}");
+                    tracing::debug!(%peer, "DoH TLS handshake: {e}");
                 }
             }
         });
@@ -146,6 +157,10 @@ async fn handle_get(
     State(state): State<AppState>,
     Query(q): Query<DnsQuery>,
 ) -> Response {
+    if !state.acl.load().allows(state.peer) {
+        state.metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+        return (StatusCode::FORBIDDEN, "ACL").into_response();
+    }
     state.metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
     let wire = match BASE64_URL_SAFE_NO_PAD.decode(q.dns.as_bytes()) {
         Ok(b) => b,
@@ -161,6 +176,10 @@ async fn handle_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !state.acl.load().allows(state.peer) {
+        state.metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+        return (StatusCode::FORBIDDEN, "ACL").into_response();
+    }
     state.metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
     if headers
         .get(header::CONTENT_TYPE)
@@ -178,7 +197,8 @@ async fn handle_post(
 }
 
 async fn dispatch(state: AppState, wire: Vec<u8>) -> Response {
-    let Some(response) = state.handler.handle_bytes(&wire, state.peer, &state.ctx).await else {
+    let ctx_snap = state.ctx.load_full();
+    let Some(response) = state.handler.handle_bytes(&wire, state.peer, &ctx_snap).await else {
         return (StatusCode::BAD_REQUEST, "malformed DNS query").into_response();
     };
     let ttl = min_ttl_from_response(&response).unwrap_or(0);

@@ -14,7 +14,11 @@
 //! under a path referenced by `dns.tls.cert_path` / `key_path`).
 //! ACME is a separate module (`acme/`) and bolts into the same
 //! `Arc<ServerConfig>` once it's wired.
+//!
+//! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
+//! tcp.rs and udp.rs for the pattern).
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 use vcl_rs::{VclListener, VclReactor};
 
-use crate::acl::ClientAcl;
-use crate::config::Listener;
-use crate::handler::{ListenerContext, SharedHandler};
+use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::metrics::Metrics;
 
 const MAX_TCP_MESSAGE: usize = 65535;
@@ -35,19 +37,21 @@ pub struct DotListener;
 
 impl DotListener {
     pub async fn spawn(
-        listener_cfg: Listener,
+        bind: SocketAddr,
         reactor: VclReactor,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
         tls_config: Arc<rustls::ServerConfig>,
+        acl: AclSwap,
+        ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let bind = std::net::SocketAddr::new(listener_cfg.address, listener_cfg.port);
         let listener = VclListener::bind(bind, reactor.clone())
             .with_context(|| format!("DoT bind {bind}"))?;
-        let acl = Arc::new(ClientAcl::new(listener_cfg.allow_from.clone()));
-        let ctx = Arc::new(ListenerContext::new(&listener_cfg.name, listener_cfg.dns64));
         let acceptor = TlsAcceptor::from(tls_config);
-        tracing::info!(listener = %listener_cfg.name, addr = %bind, dns64 = ctx.dns64, "DoT listener up");
+        {
+            let snap = ctx.load();
+            tracing::info!(listener = %snap.name, addr = %bind, dns64 = snap.dns64, "DoT listener up");
+        }
 
         let handle = tokio::spawn(async move {
             accept_loop(listener, acceptor, acl, handler, metrics, ctx).await;
@@ -59,21 +63,21 @@ impl DotListener {
 async fn accept_loop(
     listener: VclListener,
     acceptor: TlsAcceptor,
-    acl: Arc<ClientAcl>,
+    acl: AclSwap,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: Arc<ListenerContext>,
+    ctx: CtxSwap,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(listener = %ctx.name, "DoT accept: {e}");
+                tracing::error!(listener = %ctx.load().name, "DoT accept: {e}");
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
         };
-        if !acl.allows(peer.ip()) {
+        if !acl.load().allows(peer.ip()) {
             metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
             drop(stream);
             continue;
@@ -81,17 +85,20 @@ async fn accept_loop(
 
         let handler = handler.clone();
         let metrics = metrics.clone();
+        let acl = acl.clone();
         let ctx = ctx.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = serve_tls(tls_stream, peer, handler, metrics, &ctx).await {
-                        tracing::debug!(listener = %ctx.name, %peer, "DoT conn: {e}");
+                    if let Err(e) =
+                        serve_tls(tls_stream, peer, handler, metrics, acl, ctx).await
+                    {
+                        tracing::debug!(%peer, "DoT conn: {e}");
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(listener = %ctx.name, %peer, "TLS handshake: {e}");
+                    tracing::debug!(%peer, "TLS handshake: {e}");
                 }
             }
         });
@@ -103,7 +110,8 @@ async fn serve_tls<S>(
     peer: std::net::SocketAddr,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
-    ctx: &ListenerContext,
+    acl: AclSwap,
+    ctx: CtxSwap,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -121,9 +129,15 @@ where
         }
         let mut query = vec![0u8; len];
         stream.read_exact(&mut query).await?;
+
+        if !acl.load().allows(peer.ip()) {
+            metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         metrics.queries_dot.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(response) = handler.handle_bytes(&query, peer.ip(), ctx).await {
+        let ctx_snap = ctx.load_full();
+        if let Some(response) = handler.handle_bytes(&query, peer.ip(), &ctx_snap).await {
             let mut framed = Vec::with_capacity(2 + response.len());
             framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
             framed.extend_from_slice(&response);

@@ -161,6 +161,57 @@ def test_sighup_spawns_added_listener(ssh):
         _restore_canonical_and_reload(ssh)
 
 
+def test_sighup_acl_change_takes_effect(ssh, query_udp, dnsd_query):
+    """Narrow allow_from + SIGHUP — the next query from the build
+    host must be denied. Without this, an operator tightening an
+    ACL via router.yaml + reload would believe the change applied
+    while the listener kept serving on the old CIDR set.
+
+    Listener identity is (addr, port, proto) so the rebind path
+    isn't triggered by allow_from alone — the ACL has to be
+    hot-swapped into the running listener."""
+    _save_canonical(ssh)
+    try:
+        # Sanity: query from the host succeeds with default allow_from
+        # (10.99.0.0/24, which includes 10.99.0.1).
+        before = query_udp("iana.org.", rtype=1, timeout=2.0)
+        assert "rcode" in before, f"baseline query failed: {before}"
+        denied_before = dnsd_query("stats").get("acl_denied", 0)
+
+        # Replace 10.99.0.0/24 with a CIDR that does NOT contain the
+        # build host's source IP (10.99.0.1).
+        _patch_yaml_remote(
+            ssh,
+            "text = text.replace('[10.99.0.0/24]', '[10.99.0.99/32]')",
+        )
+        rc, _, _ = ssh("pkill -HUP dnsd")
+        assert rc == 0
+        time.sleep(0.5)
+
+        # Now the query should be silently dropped — ACL deny doesn't
+        # send REFUSED (avoids amplification leakage), so we expect a
+        # client-side timeout.
+        denied = query_udp("iana.org.", rtype=1, timeout=2.0)
+        assert denied.get("timeout") is True, (
+            f"ACL change after SIGHUP did NOT take effect — query still "
+            f"answered: {denied}"
+        )
+
+        denied_after = dnsd_query("stats").get("acl_denied", 0)
+        assert denied_after > denied_before, (
+            f"acl_denied counter didn't bump (before={denied_before}, "
+            f"after={denied_after})"
+        )
+    finally:
+        _restore_canonical_and_reload(ssh)
+        # Verify queries work again after the canonical restore — if
+        # the cleanup itself failed we want to know.
+        post = query_udp("iana.org.", rtype=1, timeout=2.0)
+        assert "rcode" in post, (
+            f"post-restore query still denied — cleanup broken: {post}"
+        )
+
+
 def test_sighup_invalid_config_keeps_old_state(ssh, dnsd_query):
     """A malformed router.yaml must NOT swap state — the daemon
     keeps serving with the previous handler + listener set. Any
