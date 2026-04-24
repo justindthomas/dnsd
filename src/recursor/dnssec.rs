@@ -29,22 +29,39 @@
 //! * RRSIG validity-period checks with clock skew.
 //! * Algorithm-downgrade protection.
 //!
-//! For now, operators who set `dns.recursion.dnssec_validate: true`
-//! get: AD cleared on every response (never misleadingly AD=1) and
-//! an Extended DNS Error of 22 ("No Reachable Authority") attached
-//! when signature verification is attempted but fails. Once the
-//! chain walk lands, Secure responses will set AD=1 naturally.
+//! Operators choose behavior via `dns.recursion.dnssec:`:
+//!   * `passthrough` (default) — honour the upstream's AD bit
+//!   * `strip` — unconditionally clear AD
+//!   * `validate` — chain-walk every iterative answer; AD=1 on
+//!     Secure, SERVFAIL+EDE 6 on Bogus. Requires `trust_anchor:` to
+//!     point at a root.key file.
+//!
+//! The legacy boolean `dnssec_validate: true` is still honoured (it
+//! maps to `dnssec: validate`) for backward compat with pre-v1
+//! router.yaml.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context as _, Result};
-use hickory_proto::op::Message;
-use hickory_proto::rr::dnssec::rdata::DNSKEY;
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::rr::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::rr::dnssec::Verifier as _;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
 
 use crate::config::Recursion;
+use crate::recursor::forwarder::UpstreamClient;
+use crate::recursor::iterative::WalkChain;
+
+/// Clock-skew tolerance for RRSIG validity-window checks. Matches
+/// common recursor defaults (BIND/Unbound both ~300 s).
+const CLOCK_SKEW: Duration = Duration::from_secs(300);
+
+/// EDNS Extended DNS Error codes relevant to DNSSEC responses.
+pub const EDE_DNSSEC_BOGUS: u16 = 6;
+pub const EDE_NO_REACHABLE_AUTHORITY: u16 = 22;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DnssecPolicy {
@@ -63,9 +80,11 @@ pub enum DnssecPolicy {
 
 impl DnssecPolicy {
     pub fn from_recursion(r: Option<&Recursion>) -> Self {
-        match r {
-            Some(r) if r.dnssec_validate => DnssecPolicy::Validate,
-            _ => DnssecPolicy::PassThrough,
+        use crate::config::DnssecMode;
+        match r.map(|r| r.effective_dnssec()).unwrap_or_default() {
+            DnssecMode::PassThrough => DnssecPolicy::PassThrough,
+            DnssecMode::Strip => DnssecPolicy::Strip,
+            DnssecMode::Validate => DnssecPolicy::Validate,
         }
     }
 
@@ -351,16 +370,945 @@ pub fn apply_validation(resp: &mut Message, status: &ValidationStatus) {
 /// can be cheaply cloned across tasks.
 pub struct Validator {
     pub anchors: Arc<TrustAnchors>,
+    /// Upstream client used to fetch per-zone DNSKEY RRsets during
+    /// chain validation.
+    pub upstream: Arc<UpstreamClient>,
+    /// Shared handle to the live root-hint set — the validator uses
+    /// these IPs to fetch the root DNSKEY RRset before descending
+    /// into the per-delegation chain walk (the trust-anchor KSK
+    /// only signs DNSKEY; the root ZSK that signs TLD DS records
+    /// isn't in the anchor file).
+    pub roots: Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
 }
 
 impl Validator {
-    pub fn new(anchors: Arc<TrustAnchors>) -> Self {
-        Self { anchors }
+    pub fn new(
+        anchors: Arc<TrustAnchors>,
+        upstream: Arc<UpstreamClient>,
+        roots: Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
+    ) -> Self {
+        Self {
+            anchors,
+            upstream,
+            roots,
+        }
     }
 
+    /// Quick-path validation against pre-loaded anchors only. Used
+    /// for tests and for responses we don't have a WalkChain for.
     pub fn validate(&self, resp: &Message) -> ValidationStatus {
         validate_response(resp, &self.anchors)
     }
+
+    /// Full chain validation for an iterative-resolve result:
+    ///   1. Seed the trust chain with the loaded trust anchors
+    ///      (typically the root KSK).
+    ///   2. For each delegation step, fetch the child zone's DNSKEY
+    ///      RRset, verify its self-signed RRSIG, and confirm at
+    ///      least one DS hash from the parent's referral matches one
+    ///      of the child's KSKs.
+    ///   3. Verify the parent's DS RRset's own RRSIG using the
+    ///      parent zone's DNSKEYs (already trusted).
+    ///   4. Validate the answer RRsets' RRSIGs using the terminal
+    ///      zone's DNSKEYs.
+    ///
+    /// Missing DS at any step → "insecure delegation": the remaining
+    /// chain is treated as Insecure (AD=0). NSEC/NSEC3 denial-of-DS
+    /// proofs that would promote this to Bogus-on-downgrade land in
+    /// a v1.x follow-up — for v1 we optimise for not-breaking
+    /// legitimately-unsigned zones.
+    pub async fn validate_walk(
+        &self,
+        walk: &WalkChain,
+        answer: &Message,
+    ) -> ValidationStatus {
+        let mut chain_keys: Vec<(Name, Vec<DNSKEY>)> = Vec::new();
+
+        // Seed with trust anchors.
+        for (name, key) in &self.anchors.keys {
+            let entry = chain_keys
+                .iter_mut()
+                .find(|(n, _)| n == name);
+            match entry {
+                Some((_, v)) => v.push(key.clone()),
+                None => chain_keys.push((name.clone(), vec![key.clone()])),
+            }
+        }
+        if chain_keys.is_empty() {
+            // No trust anchor loaded at all — we can't validate
+            // anything. Call it Insecure so the handler doesn't set
+            // AD but doesn't SERVFAIL either.
+            return ValidationStatus::Insecure;
+        }
+
+        // Fetch root DNSKEY and splice the ZSK into the root entry.
+        // The trust anchor only contains the KSK (which signs only
+        // the DNSKEY RRset itself); the ZSK that signs every other
+        // root RRset (including TLD DS records) has to be learned
+        // from the root and anchored under the KSK.
+        let root = Name::root();
+        let root_ips: Vec<std::net::IpAddr> = self.roots.read().unwrap().clone();
+        if let Err(e) = self
+            .splice_in_zone_dnskey(&mut chain_keys, &root, &root_ips)
+            .await
+        {
+            return ValidationStatus::Bogus(format!("root DNSKEY bootstrap: {e}"));
+        }
+
+        // Walk each delegation step, promoting the chain as we go.
+        let mut insecure_from: Option<Name> = None;
+        for step in &walk.steps {
+            if insecure_from.is_some() {
+                // Already entered insecure territory.
+                break;
+            }
+            // Find the parent zone's keys — the closest already-
+            // trusted ancestor of step.zone.
+            let parent_keys = closest_trusted_keys(&chain_keys, &step.zone);
+            if parent_keys.is_empty() {
+                // No trust above this step — can't validate.
+                insecure_from = Some(step.zone.clone());
+                break;
+            }
+
+            // If the parent didn't hand us any DS records, this is a
+            // legitimately insecure delegation (per our scope, absent
+            // a denial-of-DS proof).
+            if step.ds.is_empty() {
+                insecure_from = Some(step.zone.clone());
+                break;
+            }
+
+            // Verify the DS RRset's own signature with parent keys.
+            // Pass the ORIGINAL records (not reconstructed) so their
+            // TTL matches what the signer used.
+            let ds_rrsig = match step.ds_rrsig.iter().find(|s| s.type_covered() == RecordType::DS) {
+                Some(s) => s,
+                None => {
+                    return ValidationStatus::Bogus(format!(
+                        "DS for {} came without an RRSIG",
+                        step.zone
+                    ));
+                }
+            };
+            if let Err(e) = check_rrsig_validity(ds_rrsig) {
+                return ValidationStatus::Bogus(format!(
+                    "DS RRSIG for {} invalid: {e}",
+                    step.zone
+                ));
+            }
+            let mut ds_verified = false;
+            for k in &parent_keys {
+                match verify_rrset(&step.ds, ds_rrsig, k) {
+                    Ok(()) => {
+                        ds_verified = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            zone = %step.zone,
+                            signer = %ds_rrsig.signer_name(),
+                            key_tag = ds_rrsig.key_tag(),
+                            algo = ?ds_rrsig.algorithm(),
+                            ds_count = step.ds.len(),
+                            "DS RRSIG verify attempt failed: {e}"
+                        );
+                    }
+                }
+            }
+            if !ds_verified {
+                return ValidationStatus::Bogus(format!(
+                    "DS RRSIG for {} did not verify under parent keys",
+                    step.zone
+                ));
+            }
+
+            // Fetch DNSKEY RRset from the child zone itself —
+            // returns the full Records (TTL intact) + their covering
+            // RRSIG + an unwrapped DNSKEY vec for convenience.
+            let (dnskey_records, dnskeys, dnskey_rrsig) =
+                match self.fetch_dnskey_rrset(&step.zone, &step.ns_ips).await {
+                    Ok(tuple) => tuple,
+                    Err(e) => {
+                        return ValidationStatus::Bogus(format!(
+                            "fetching DNSKEY for {}: {e}",
+                            step.zone
+                        ));
+                    }
+                };
+            if dnskeys.is_empty() {
+                return ValidationStatus::Bogus(format!(
+                    "no DNSKEY records returned for {}",
+                    step.zone
+                ));
+            }
+            let dnskey_rrsig = match dnskey_rrsig {
+                Some(s) => s,
+                None => {
+                    return ValidationStatus::Bogus(format!(
+                        "DNSKEY RRset for {} unsigned",
+                        step.zone
+                    ));
+                }
+            };
+            if let Err(e) = check_rrsig_validity(&dnskey_rrsig) {
+                return ValidationStatus::Bogus(format!(
+                    "DNSKEY RRSIG for {} invalid: {e}",
+                    step.zone
+                ));
+            }
+
+            // The DNSKEY RRset is self-signed: verify with one of
+            // its own keys.
+            let self_signed = dnskeys
+                .iter()
+                .any(|k| verify_rrset(&dnskey_records, &dnskey_rrsig, k).is_ok());
+            if !self_signed {
+                return ValidationStatus::Bogus(format!(
+                    "DNSKEY RRset for {} is not self-signed",
+                    step.zone
+                ));
+            }
+
+            // Confirm at least one DNSKEY hashes to a DS we saw.
+            let ds_values: Vec<&DS> = step
+                .ds
+                .iter()
+                .filter_map(|r| match r.data() {
+                    Some(RData::DNSSEC(DNSSECRData::DS(d))) => Some(d),
+                    _ => None,
+                })
+                .collect();
+            let ds_match = dnskeys.iter().any(|k| {
+                ds_values
+                    .iter()
+                    .any(|d| d.covers(&step.zone, k).unwrap_or(false))
+            });
+            if !ds_match {
+                return ValidationStatus::Bogus(format!(
+                    "no DNSKEY for {} matches any DS from parent",
+                    step.zone
+                ));
+            }
+
+            chain_keys.push((step.zone.clone(), dnskeys));
+        }
+
+        if insecure_from.is_some() {
+            return ValidationStatus::Insecure;
+        }
+
+        // Validate the answer RRSIGs against the terminal zone's
+        // DNSKEYs (or the closest trusted ancestor if we can't
+        // identify a terminal zone). For empty-answer responses
+        // (NXDOMAIN / NODATA) fall through to denial-of-existence
+        // proof validation using the NSEC or NSEC3 records in the
+        // authority section.
+        let (qname, qtype) = answer
+            .queries()
+            .first()
+            .map(|q| (q.name().clone(), q.query_type()))
+            .unwrap_or_else(|| (Name::root(), RecordType::A));
+        validate_answer_against_chain(answer, &chain_keys, &qname, qtype)
+    }
+
+    /// Fetch `zone DNSKEY`, self-verify the RRset (the KSK signs
+    /// the RRset using its own key), and splice the ZSK(s) into
+    /// `chain_keys` alongside any existing entry for `zone`. Used
+    /// for (a) the root bootstrap — the trust anchor only holds
+    /// the KSK but we need the root ZSK to verify TLD DS records —
+    /// and (b) every delegation step's child-zone DNSKEY fetch.
+    ///
+    /// Requires the zone already has at least one trusted key in
+    /// `chain_keys` (either from the trust anchor, for root, or
+    /// via the DS-covers check against the child's KSK, for
+    /// deeper zones).
+    async fn splice_in_zone_dnskey(
+        &self,
+        chain_keys: &mut Vec<(Name, Vec<DNSKEY>)>,
+        zone: &Name,
+        ns_ips: &[std::net::IpAddr],
+    ) -> Result<()> {
+        let (records, keys, sig) = self
+            .fetch_dnskey_rrset(zone, ns_ips)
+            .await
+            .with_context(|| format!("fetching {zone} DNSKEY"))?;
+        let sig = sig
+            .ok_or_else(|| anyhow!("{zone} DNSKEY RRset came without an RRSIG"))?;
+        check_rrsig_validity(&sig).with_context(|| format!("{zone} DNSKEY RRSIG"))?;
+
+        // Verify using any trusted key for this zone (KSK from
+        // trust anchor for root; previously-validated keys
+        // otherwise).
+        let existing = chain_keys
+            .iter()
+            .find(|(n, _)| n == zone)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let verified = existing
+            .iter()
+            .any(|k| verify_rrset(&records, &sig, k).is_ok());
+        if !verified {
+            anyhow::bail!(
+                "{zone} DNSKEY RRSIG did not verify under any existing trusted key"
+            );
+        }
+
+        // Replace the chain entry for `zone` with the full set of
+        // DNSKEYs — keeps both KSK and ZSK so subsequent RRSIGs
+        // (signed by ZSK) validate.
+        chain_keys.retain(|(n, _)| n != zone);
+        chain_keys.push((zone.clone(), keys));
+        Ok(())
+    }
+
+    /// Query `zone DNSKEY` at one of the given NS IPs. Returns
+    /// `(full_records, dnskey_rdata, rrsig)` — the records carry
+    /// their signed TTLs so `verify_rrsig` can reconstruct the
+    /// canonical form; the rdata vec is a convenience for hash
+    /// comparisons against the parent's DS.
+    async fn fetch_dnskey_rrset(
+        &self,
+        zone: &Name,
+        ns_ips: &[std::net::IpAddr],
+    ) -> Result<(Vec<Record>, Vec<DNSKEY>, Option<RRSIG>)> {
+        if ns_ips.is_empty() {
+            return Err(anyhow!("no NS addresses to query for {zone} DNSKEY"));
+        }
+        let wire = build_dnskey_query(zone)?;
+        let resp_bytes = self
+            .upstream
+            .query(ns_ips, &wire)
+            .await
+            .with_context(|| format!("fetching DNSKEY for {zone}"))?;
+        let resp = Message::from_bytes(&resp_bytes)
+            .with_context(|| format!("parsing DNSKEY response for {zone}"))?;
+        let mut records = Vec::new();
+        let mut keys = Vec::new();
+        let mut sig: Option<RRSIG> = None;
+        let zone_lower = zone.to_lowercase();
+        for r in resp.answers() {
+            if r.name().to_lowercase() != zone_lower {
+                continue;
+            }
+            match r.data() {
+                Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => {
+                    records.push(r.clone());
+                    keys.push(k.clone());
+                }
+                Some(RData::DNSSEC(DNSSECRData::RRSIG(s)))
+                    if s.type_covered() == RecordType::DNSKEY =>
+                {
+                    sig = Some(s.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok((records, keys, sig))
+    }
+}
+
+fn closest_trusted_keys<'a>(
+    chain: &'a [(Name, Vec<DNSKEY>)],
+    zone: &Name,
+) -> Vec<&'a DNSKEY> {
+    // Pick the entry whose name is the LONGEST ancestor of `zone`
+    // (equivalent to "deepest zone cut above or at `zone`"). Uses
+    // hickory's `zone_of`: `self.zone_of(other)` is true when
+    // `other` is a subzone of `self`.
+    let zone_lower = zone.to_lowercase();
+    let mut best: Option<&(Name, Vec<DNSKEY>)> = None;
+    for entry in chain {
+        if entry.0.to_lowercase() == zone_lower || entry.0.zone_of(&zone_lower) {
+            match best {
+                None => best = Some(entry),
+                Some(b) if entry.0.num_labels() > b.0.num_labels() => best = Some(entry),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(_, keys)| keys.iter().collect()).unwrap_or_default()
+}
+
+fn validate_answer_against_chain(
+    resp: &Message,
+    chain: &[(Name, Vec<DNSKEY>)],
+    qname: &Name,
+    qtype: RecordType,
+) -> ValidationStatus {
+    let mut groups: std::collections::BTreeMap<(Name, RecordType, DNSClass), Vec<Record>> =
+        Default::default();
+    let mut sigs: Vec<(RRSIG, Record)> = Vec::new();
+    for r in resp.answers() {
+        match r.data() {
+            Some(RData::DNSSEC(DNSSECRData::RRSIG(s))) => sigs.push((s.clone(), r.clone())),
+            Some(_) => {
+                groups
+                    .entry((r.name().clone(), r.record_type(), r.dns_class()))
+                    .or_default()
+                    .push(r.clone());
+            }
+            None => {}
+        }
+    }
+
+    if groups.is_empty() {
+        // NXDOMAIN / NODATA — the authoritative denial proof lives
+        // in the authority section as NSEC or NSEC3 records. If the
+        // chain walk actually reached a signed zone and the denial
+        // verifies, promote to Secure; otherwise Insecure.
+        return match validate_denial(resp, chain, qname, qtype) {
+            DenialOutcome::Secure => ValidationStatus::Secure,
+            DenialOutcome::Insecure => ValidationStatus::Insecure,
+            DenialOutcome::Bogus(msg) => ValidationStatus::Bogus(msg),
+        };
+    }
+
+    let mut saw_secure = false;
+    for ((name, rtype, _class), rrset) in &groups {
+        let (sig, _sig_rec) = match sigs.iter().find(|(s, _)| s.type_covered() == *rtype) {
+            Some(s) => s,
+            None => return ValidationStatus::Insecure, // unsigned RRset
+        };
+        if let Err(e) = check_rrsig_validity(sig) {
+            return ValidationStatus::Bogus(format!(
+                "answer RRSIG for {name}/{rtype:?} invalid: {e}"
+            ));
+        }
+        let signer = sig.signer_name().clone();
+        let keys = closest_trusted_keys(chain, &signer);
+        if keys.is_empty() {
+            return ValidationStatus::Insecure;
+        }
+        let verified = keys
+            .iter()
+            .any(|k| verify_rrset(rrset, sig, k).is_ok());
+        if !verified {
+            return ValidationStatus::Bogus(format!(
+                "answer RRSIG for {name}/{rtype:?} did not verify under {signer}"
+            ));
+        }
+
+        // Wildcard-expansion detection: RFC 4034 §6.2.1 — if the
+        // RRSIG's labels field is FEWER than the owner name's label
+        // count, the answer was synthesised from a wildcard. Full
+        // RFC-compliance requires an NSEC/NSEC3 proof that no exact
+        // match for qname exists under the closest encloser (so an
+        // attacker can't replay a wildcard answer for a name that
+        // DOES have an exact match at the auth server). We accept
+        // wildcard answers whose RRSIG validates (the wildcard is
+        // signed) as Secure — confirming the nonexistence proof is
+        // a v1.x follow-up.
+        let owner_labels = name.num_labels();
+        if sig.num_labels() < owner_labels {
+            tracing::debug!(
+                qname = %qname,
+                owner = %name,
+                sig_labels = sig.num_labels(),
+                "wildcard-expanded answer accepted without nonexistence proof (v1 scope)"
+            );
+        }
+
+        saw_secure = true;
+    }
+
+    if saw_secure {
+        ValidationStatus::Secure
+    } else {
+        ValidationStatus::Insecure
+    }
+}
+
+// --- NSEC / NSEC3 denial-of-existence proofs (RFC 4035 §5,
+// --- RFC 5155 §8) ---------------------------------------------
+
+/// Outcome of denial validation. Insecure is the "unsigned zone"
+/// case; Secure means a valid NSEC/NSEC3 proof was found AND all
+/// its RRSIGs verified.
+#[derive(Debug)]
+enum DenialOutcome {
+    Secure,
+    Insecure,
+    Bogus(String),
+}
+
+/// Walk the authority section looking for NSEC or NSEC3 records
+/// that prove either NXDOMAIN or NODATA for (qname, qtype).
+fn validate_denial(
+    resp: &Message,
+    chain: &[(Name, Vec<DNSKEY>)],
+    qname: &Name,
+    qtype: RecordType,
+) -> DenialOutcome {
+    // Collect authority records grouped by owner + rtype, plus the
+    // RRSIGs covering them. We need the RRSIGs so the verifier can
+    // confirm the denial records aren't forgeries.
+    let mut nsec_sets: std::collections::BTreeMap<Name, Vec<Record>> = Default::default();
+    let mut nsec3_sets: std::collections::BTreeMap<Name, Vec<Record>> = Default::default();
+    let mut nsec_rrsigs: std::collections::BTreeMap<Name, Vec<RRSIG>> = Default::default();
+    let mut nsec3_rrsigs: std::collections::BTreeMap<Name, Vec<RRSIG>> = Default::default();
+    for r in resp.name_servers() {
+        match r.data() {
+            Some(RData::DNSSEC(DNSSECRData::NSEC(_))) => {
+                nsec_sets.entry(r.name().clone()).or_default().push(r.clone());
+            }
+            Some(RData::DNSSEC(DNSSECRData::NSEC3(_))) => {
+                nsec3_sets.entry(r.name().clone()).or_default().push(r.clone());
+            }
+            Some(RData::DNSSEC(DNSSECRData::RRSIG(s))) => match s.type_covered() {
+                RecordType::NSEC => {
+                    nsec_rrsigs
+                        .entry(r.name().clone())
+                        .or_default()
+                        .push(s.clone());
+                }
+                RecordType::NSEC3 => {
+                    nsec3_rrsigs
+                        .entry(r.name().clone())
+                        .or_default()
+                        .push(s.clone());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    if nsec_sets.is_empty() && nsec3_sets.is_empty() {
+        return DenialOutcome::Insecure;
+    }
+
+    // Verify every NSEC and NSEC3 RRset with the chain keys.
+    // If any fails, the whole denial is Bogus — a partial-forgery
+    // attacker can't remove RRSIGs from real denials without being
+    // caught.
+    if !nsec_sets.is_empty() {
+        if let Err(e) = verify_authority_rrsets(&nsec_sets, &nsec_rrsigs, chain) {
+            return DenialOutcome::Bogus(e);
+        }
+    }
+    if !nsec3_sets.is_empty() {
+        if let Err(e) = verify_authority_rrsets(&nsec3_sets, &nsec3_rrsigs, chain) {
+            return DenialOutcome::Bogus(e);
+        }
+    }
+
+    // Now the proof logic. NSEC3 takes precedence if present (zones
+    // don't mix them in a response).
+    if !nsec3_sets.is_empty() {
+        return prove_denial_nsec3(&nsec3_sets, qname, qtype, resp.response_code());
+    }
+    prove_denial_nsec(&nsec_sets, qname, qtype, resp.response_code())
+}
+
+/// Verify every RRset in `sets` against its covering RRSIG using
+/// keys from the validated chain.
+fn verify_authority_rrsets(
+    sets: &std::collections::BTreeMap<Name, Vec<Record>>,
+    rrsigs_by_owner: &std::collections::BTreeMap<Name, Vec<RRSIG>>,
+    chain: &[(Name, Vec<DNSKEY>)],
+) -> std::result::Result<(), String> {
+    for (owner, rrset) in sets {
+        let rtype = rrset[0].record_type();
+        let sigs = rrsigs_by_owner.get(owner).map(|v| v.as_slice()).unwrap_or(&[]);
+        let sig = match sigs.iter().find(|s| s.type_covered() == rtype) {
+            Some(s) => s,
+            None => return Err(format!("denial RRset at {owner} has no RRSIG")),
+        };
+        if let Err(e) = check_rrsig_validity(sig) {
+            return Err(format!("denial RRSIG at {owner} invalid: {e}"));
+        }
+        let keys = closest_trusted_keys(chain, sig.signer_name());
+        if keys.is_empty() {
+            return Err(format!(
+                "no trusted keys under {} to verify denial at {owner}",
+                sig.signer_name()
+            ));
+        }
+        let verified = keys.iter().any(|k| verify_rrset(rrset, sig, k).is_ok());
+        if !verified {
+            return Err(format!(
+                "denial RRSIG at {owner} did not verify under {}",
+                sig.signer_name()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// NSEC denial logic (RFC 4035 §5):
+///
+/// * NODATA: the zone returns an NSEC record with owner = qname
+///   whose type-bit-map doesn't contain qtype.
+/// * NXDOMAIN: two NSECs (possibly the same in small zones):
+///     1. one covering a name range that includes qname
+///     2. one covering a name range that includes a synthesised
+///        wildcard at the closest encloser (proves no `*.enc`).
+fn prove_denial_nsec(
+    sets: &std::collections::BTreeMap<Name, Vec<Record>>,
+    qname: &Name,
+    qtype: RecordType,
+    rcode: hickory_proto::op::ResponseCode,
+) -> DenialOutcome {
+    use hickory_proto::op::ResponseCode;
+    let qname_lower = qname.to_lowercase();
+
+    // NODATA?  rcode == NoError AND an NSEC with owner == qname
+    // exists whose type-bit-map omits qtype.
+    if rcode == ResponseCode::NoError {
+        for (owner, records) in sets {
+            if owner.to_lowercase() != qname_lower {
+                continue;
+            }
+            let nsec = match records[0].data() {
+                Some(RData::DNSSEC(DNSSECRData::NSEC(n))) => n,
+                _ => continue,
+            };
+            if !nsec.type_bit_maps().contains(&qtype) {
+                return DenialOutcome::Secure;
+            }
+            return DenialOutcome::Bogus(format!(
+                "NODATA claimed for {qname}/{qtype:?} but NSEC shows type present"
+            ));
+        }
+    }
+
+    // NXDOMAIN: need two NSEC covers.
+    if rcode == ResponseCode::NXDomain {
+        let mut saw_name_cover = false;
+        let mut saw_wildcard_cover = false;
+        for (owner, records) in sets {
+            let nsec = match records[0].data() {
+                Some(RData::DNSSEC(DNSSECRData::NSEC(n))) => n,
+                _ => continue,
+            };
+            let next = nsec.next_domain_name();
+            // Name range cover: owner < qname < next (canonical).
+            if canonical_lt(owner, &qname_lower) && canonical_lt(&qname_lower, next) {
+                saw_name_cover = true;
+            }
+            // Wildcard cover: find the closest encloser (the longest
+            // ancestor of qname that's ALSO an ancestor of owner or
+            // next). Then check a synthetic "*.encloser" falls in a
+            // gap.
+            let encloser = closest_encloser(&qname_lower, &[owner.clone(), next.clone()]);
+            let wildcard = match synthetic_wildcard(&encloser) {
+                Some(w) => w,
+                None => continue,
+            };
+            if canonical_lt(owner, &wildcard) && canonical_lt(&wildcard, next) {
+                saw_wildcard_cover = true;
+            }
+            // Edge case: the NSEC at the wildcard itself proves
+            // *.encloser doesn't have the requested type — but we're
+            // here on NXDOMAIN so the wildcard shouldn't exist at
+            // all. Accept if owner == wildcard & type bitmap omits
+            // qtype (strict wildcard NoData on an NXDOMAIN-style
+            // response is an edge case most zones don't hit).
+            if owner.to_lowercase() == wildcard {
+                if !nsec.type_bit_maps().contains(&qtype) {
+                    saw_wildcard_cover = true;
+                }
+            }
+        }
+        if saw_name_cover && saw_wildcard_cover {
+            return DenialOutcome::Secure;
+        }
+        return DenialOutcome::Bogus(format!(
+            "NSEC NXDOMAIN proof incomplete for {qname}: name_cover={saw_name_cover} wildcard_cover={saw_wildcard_cover}"
+        ));
+    }
+
+    DenialOutcome::Insecure
+}
+
+/// NSEC3 denial logic (RFC 5155 §8). NSEC3 hashes the owner names
+/// so proofs operate on hash intervals instead of name intervals.
+/// Uses hickory's built-in SHA1 hasher — the only hash algorithm
+/// defined for NSEC3 at time of writing.
+fn prove_denial_nsec3(
+    sets: &std::collections::BTreeMap<Name, Vec<Record>>,
+    qname: &Name,
+    qtype: RecordType,
+    rcode: hickory_proto::op::ResponseCode,
+) -> DenialOutcome {
+    use hickory_proto::op::ResponseCode;
+    use hickory_proto::rr::dnssec::Nsec3HashAlgorithm;
+
+    // Pull salt + iterations from the first NSEC3 — all NSEC3s in a
+    // zone share parameters.
+    let mut first_nsec3: Option<&hickory_proto::rr::dnssec::rdata::NSEC3> = None;
+    for records in sets.values() {
+        if let Some(RData::DNSSEC(DNSSECRData::NSEC3(n))) = records[0].data() {
+            first_nsec3 = Some(n);
+            break;
+        }
+    }
+    let params = match first_nsec3 {
+        Some(n) => n,
+        None => return DenialOutcome::Insecure,
+    };
+    let salt = params.salt().to_vec();
+    let iter = params.iterations();
+    let hash_algo = params.hash_algorithm();
+    if hash_algo != Nsec3HashAlgorithm::SHA1 {
+        return DenialOutcome::Bogus(format!("unsupported NSEC3 hash algo {hash_algo:?}"));
+    }
+
+    // Parse each NSEC3 into (hash_of_owner, next_hashed, type_bits).
+    let mut intervals: Vec<(Vec<u8>, Vec<u8>, Vec<RecordType>, bool)> = Vec::new();
+    for (owner, records) in sets {
+        let nsec3 = match records[0].data() {
+            Some(RData::DNSSEC(DNSSECRData::NSEC3(n))) => n,
+            _ => continue,
+        };
+        // The NSEC3 owner name's leftmost label IS the base32-hex-
+        // encoded hash of some zone owner. Decode it.
+        let leftmost = match owner.iter().next() {
+            Some(l) => l,
+            None => continue,
+        };
+        let owner_hash = match base32_hex_decode(leftmost) {
+            Some(h) => h,
+            None => continue,
+        };
+        let next_hash = nsec3.next_hashed_owner_name().to_vec();
+        intervals.push((
+            owner_hash,
+            next_hash,
+            nsec3.type_bit_maps().to_vec(),
+            nsec3.opt_out(),
+        ));
+    }
+
+    // Helper: hash a name with the zone's NSEC3 params.
+    let hash_of = |name: &Name| -> Option<Vec<u8>> {
+        Nsec3HashAlgorithm::SHA1
+            .hash(&salt, name, iter)
+            .ok()
+            .map(|d| d.as_ref().to_vec())
+    };
+
+    // NODATA: NSEC3 at H(qname) with type bitmap lacking qtype.
+    if rcode == ResponseCode::NoError {
+        let target = match hash_of(qname) {
+            Some(h) => h,
+            None => return DenialOutcome::Insecure,
+        };
+        for (owner_hash, _, types, _) in &intervals {
+            if owner_hash == &target {
+                if !types.contains(&qtype) {
+                    return DenialOutcome::Secure;
+                }
+                return DenialOutcome::Bogus(format!(
+                    "NSEC3 NODATA claim contradicted by type bitmap for {qname}/{qtype:?}"
+                ));
+            }
+        }
+        // No exact-match NSEC3 for NODATA. This could still be an
+        // opt-out NODATA, but for simplicity we treat it as Insecure.
+        return DenialOutcome::Insecure;
+    }
+
+    // NXDOMAIN: need (a) closest-encloser proof + (b) next-closer
+    // name coverage + (c) wildcard-at-encloser coverage.
+    if rcode == ResponseCode::NXDomain {
+        // Closest encloser: longest ancestor of qname whose hash
+        // matches an NSEC3 owner.
+        let mut closest_encloser: Option<Name> = None;
+        let mut current = qname.clone();
+        while current.num_labels() > 0 {
+            current = match current.trim_to(current.num_labels() as usize - 1) {
+                n => n,
+            };
+            let h = match hash_of(&current) {
+                Some(h) => h,
+                None => break,
+            };
+            if intervals.iter().any(|(o, _, _, _)| o == &h) {
+                closest_encloser = Some(current.clone());
+                break;
+            }
+            if current.is_root() {
+                break;
+            }
+        }
+        let encloser = match closest_encloser {
+            Some(e) => e,
+            None => {
+                return DenialOutcome::Bogus(format!(
+                    "NSEC3 NXDOMAIN: no closest-encloser found for {qname}"
+                ));
+            }
+        };
+
+        // Next-closer name: qname truncated to encloser.num_labels()+1.
+        let nc_labels = encloser.num_labels() as usize + 1;
+        if nc_labels > qname.num_labels() as usize {
+            return DenialOutcome::Bogus(format!(
+                "NSEC3 NXDOMAIN: {qname} same as closest encloser {encloser}"
+            ));
+        }
+        let next_closer = qname.trim_to(nc_labels);
+        let nc_hash = match hash_of(&next_closer) {
+            Some(h) => h,
+            None => return DenialOutcome::Insecure,
+        };
+        let nc_covered = intervals
+            .iter()
+            .any(|(o, n, _, _)| hash_in_range(&nc_hash, o, n));
+        if !nc_covered {
+            return DenialOutcome::Bogus(format!(
+                "NSEC3 NXDOMAIN: no NSEC3 covers next-closer {next_closer}"
+            ));
+        }
+
+        // Wildcard at encloser.
+        let wildcard = match prepend_wildcard(&encloser) {
+            Some(w) => w,
+            None => return DenialOutcome::Insecure,
+        };
+        let wc_hash = match hash_of(&wildcard) {
+            Some(h) => h,
+            None => return DenialOutcome::Insecure,
+        };
+        let wc_covered = intervals
+            .iter()
+            .any(|(o, n, _, _)| hash_in_range(&wc_hash, o, n) || o == &wc_hash);
+        if !wc_covered {
+            return DenialOutcome::Bogus(format!(
+                "NSEC3 NXDOMAIN: no NSEC3 covers wildcard {wildcard}"
+            ));
+        }
+
+        return DenialOutcome::Secure;
+    }
+
+    DenialOutcome::Insecure
+}
+
+/// Canonical DNS name ordering per RFC 4034 §6.1. Compare labels
+/// right-to-left, lowercase byte-wise. hickory's `Name::cmp` does
+/// this already — this is just a thin predicate wrapper.
+fn canonical_lt(a: &Name, b: &Name) -> bool {
+    a.to_lowercase().cmp(&b.to_lowercase()) == std::cmp::Ordering::Less
+}
+
+/// Compute the closest encloser of `qname` given the owner and next
+/// names of an NSEC. For our purposes "closest encloser" is the
+/// longest suffix of qname that is also a suffix of either bound —
+/// the NSEC ownership interval necessarily contains qname's
+/// ancestors up to some point.
+fn closest_encloser(qname: &Name, candidates: &[Name]) -> Name {
+    let mut best = Name::root();
+    for cand in candidates {
+        let cand_lower = cand.to_lowercase();
+        // Walk qname's ancestors; pick the longest one that's an
+        // ancestor of the candidate too.
+        let mut anc = qname.clone();
+        while anc.num_labels() > 0 {
+            if anc.zone_of(&cand_lower) || anc == cand_lower {
+                if anc.num_labels() > best.num_labels() {
+                    best = anc.clone();
+                }
+                break;
+            }
+            anc = anc.trim_to(anc.num_labels() as usize - 1);
+        }
+    }
+    best
+}
+
+/// Synthesise `*.owner` — used for NSEC wildcard-cover proofs.
+fn synthetic_wildcard(owner: &Name) -> Option<Name> {
+    prepend_wildcard(owner)
+}
+
+fn prepend_wildcard(owner: &Name) -> Option<Name> {
+    Name::from_ascii("*")
+        .ok()?
+        .append_domain(owner)
+        .ok()
+        .map(|n| n.to_lowercase())
+}
+
+fn hash_in_range(target: &[u8], owner_hash: &[u8], next_hash: &[u8]) -> bool {
+    // NSEC3 intervals are ORDERED ranges on the hash axis. A hash h
+    // is "covered" when owner_hash < h < next_hash, with wrap-around
+    // at the end of the zone.
+    use std::cmp::Ordering;
+    match (owner_hash.cmp(target), target.cmp(next_hash)) {
+        (Ordering::Less, Ordering::Less) => true,
+        _ => {
+            // Wrap case: owner_hash > next_hash means the range
+            // spans the zero boundary. Target is covered if it's
+            // greater than owner or less than next.
+            if owner_hash.cmp(next_hash) == Ordering::Greater {
+                owner_hash.cmp(target) == Ordering::Less
+                    || target.cmp(next_hash) == Ordering::Less
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Decode a base32-hex (RFC 4648 §7) octet sequence from a leftmost-
+/// label byte slice. NSEC3 owner names use this encoding.
+fn base32_hex_decode(label: &[u8]) -> Option<Vec<u8>> {
+    // Uppercase the label first — the spec says base32hex is
+    // case-insensitive and hickory sometimes delivers lowercase.
+    let upper: String = std::str::from_utf8(label).ok()?.to_ascii_uppercase();
+    data_encoding::BASE32HEX_NOPAD.decode(upper.as_bytes()).ok()
+}
+
+/// Build a DNSKEY query for `zone`. Always sets DO=1 — otherwise
+/// the server omits the covering RRSIG which is what we actually
+/// need.
+fn build_dnskey_query(zone: &Name) -> Result<Vec<u8>> {
+    let mut msg = Message::new();
+    msg.set_id(rand::random());
+    msg.set_message_type(MessageType::Query);
+    msg.set_op_code(OpCode::Query);
+    msg.set_recursion_desired(false);
+    let mut q = Query::query(zone.clone(), RecordType::DNSKEY);
+    q.set_query_class(DNSClass::IN);
+    msg.add_query(q);
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(1232);
+    edns.set_version(0);
+    edns.set_dnssec_ok(true);
+    msg.set_edns(edns);
+    msg.to_vec().context("encode DNSKEY query")
+}
+
+/// Validity-window + sanity check on an RRSIG. Catches expired
+/// signatures (RFC 4034 §3.1.5) and garbage inception/expiry.
+fn check_rrsig_validity(sig: &RRSIG) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    let inception = sig.sig_inception();
+    let expiration = sig.sig_expiration();
+    if expiration < inception {
+        return Err(anyhow!(
+            "RRSIG expiration {expiration} precedes inception {inception}"
+        ));
+    }
+    let skew = CLOCK_SKEW.as_secs() as u32;
+    if now + skew < inception {
+        return Err(anyhow!(
+            "RRSIG inception {inception} is > clock+skew {}",
+            now + skew
+        ));
+    }
+    if now > expiration + skew {
+        return Err(anyhow!(
+            "RRSIG expired at {expiration} (now={now}, skew={skew})"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -410,7 +1358,24 @@ mod tests {
     }
 
     #[test]
-    fn policy_validate_when_flag_set() {
+    fn policy_validate_when_mode_is_validate() {
+        use crate::config::DnssecMode;
+        let r = Recursion {
+            enabled: true,
+            dnssec: DnssecMode::Validate,
+            ..Default::default()
+        };
+        assert_eq!(
+            DnssecPolicy::from_recursion(Some(&r)),
+            DnssecPolicy::Validate
+        );
+    }
+
+    #[test]
+    fn policy_validate_honours_legacy_boolean() {
+        // Pre-v1 configs that wrote `dnssec_validate: true` without
+        // the new `dnssec:` enum still promote to Validate. Exercises
+        // `Recursion::effective_dnssec`.
         let r = Recursion {
             enabled: true,
             dnssec_validate: true,
@@ -419,6 +1384,37 @@ mod tests {
         assert_eq!(
             DnssecPolicy::from_recursion(Some(&r)),
             DnssecPolicy::Validate
+        );
+    }
+
+    #[test]
+    fn policy_strip_when_mode_is_strip() {
+        use crate::config::DnssecMode;
+        let r = Recursion {
+            enabled: true,
+            dnssec: DnssecMode::Strip,
+            ..Default::default()
+        };
+        assert_eq!(
+            DnssecPolicy::from_recursion(Some(&r)),
+            DnssecPolicy::Strip
+        );
+    }
+
+    #[test]
+    fn explicit_dnssec_overrides_legacy_boolean() {
+        // If operator wrote both (unlikely in practice), the
+        // explicit `dnssec:` enum wins.
+        use crate::config::DnssecMode;
+        let r = Recursion {
+            enabled: true,
+            dnssec: DnssecMode::Strip,
+            dnssec_validate: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            DnssecPolicy::from_recursion(Some(&r)),
+            DnssecPolicy::Strip
         );
     }
 

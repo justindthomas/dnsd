@@ -211,9 +211,15 @@ pub fn should_synthesise(
     if policy.is_excluded(qname) {
         return false;
     }
-    // Two triggers: NODATA (NoError + empty answers) or NXDOMAIN.
+    // RFC 6147 §5.1.6: synthesise on NXDOMAIN OR on NoError with no
+    // terminal AAAA records in the answer. A CNAME chain with no
+    // AAAA at the end is still a DNS64 trigger — the name exists
+    // but has no v6 address, which is exactly what DNS64 is for.
     match response.response_code() {
-        ResponseCode::NoError => response.answers().is_empty(),
+        ResponseCode::NoError => !response
+            .answers()
+            .iter()
+            .any(|r| r.record_type() == RecordType::AAAA),
         ResponseCode::NXDomain => true,
         _ => false,
     }
@@ -239,15 +245,28 @@ pub fn synthesise_from_a(
     for q in original_query.queries() {
         resp.add_query(q.clone());
     }
+    // Walk the A-response's answer section. Preserve CNAME records
+    // verbatim (clients need the chain to understand why the AAAAs
+    // at a different owner name "belong" to their query), synthesise
+    // each A into an AAAA at the same owner. RFC 6147 §5.1.6.
     for rec in a_response.answers() {
-        if rec.record_type() != RecordType::A {
-            continue;
+        match rec.record_type() {
+            RecordType::CNAME => {
+                resp.add_answer(rec.clone());
+            }
+            RecordType::A => {
+                let Some(RData::A(a)) = rec.data() else { continue };
+                let v6 = embed_v4(&policy.prefix, a.0);
+                let mut new_rec = Record::from_rdata(
+                    rec.name().clone(),
+                    rec.ttl(),
+                    RData::AAAA(AAAA(v6)),
+                );
+                new_rec.set_dns_class(rec.dns_class());
+                resp.add_answer(new_rec);
+            }
+            _ => {}
         }
-        let Some(RData::A(a)) = rec.data() else { continue };
-        let v6 = embed_v4(&policy.prefix, a.0);
-        let mut new_rec = Record::from_rdata(rec.name().clone(), rec.ttl(), RData::AAAA(AAAA(v6)));
-        new_rec.set_dns_class(rec.dns_class());
-        resp.add_answer(new_rec);
     }
     resp
 }

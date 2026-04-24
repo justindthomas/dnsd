@@ -57,6 +57,10 @@ pub struct RecursorHandler {
     metrics: Arc<Metrics>,
     dns64: Option<Arc<Dns64Policy>>,
     dnssec: DnssecPolicy,
+    /// When `dnssec` is `Validate`, the validator holds the trust
+    /// anchors + the upstream client for DNSKEY fetches during chain
+    /// walks. None in PassThrough / Strip modes.
+    validator: Option<Arc<dnssec::Validator>>,
     rrl: Option<Arc<Rrl>>,
     iterative: Option<Arc<IterativeResolver>>,
 }
@@ -99,18 +103,21 @@ impl RecursorHandler {
     ) -> anyhow::Result<Self> {
         let cache = Self::build_cache_from_config(cfg);
         let forwarders = Self::build_forwarders_from_config(cfg)?;
-        Self::from_parts(cfg, reactor, metrics, cache, forwarders)
+        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None)
     }
 
     /// Build a RecursorHandler using a pre-constructed cache +
     /// forwarder table. Used by `main.rs` to share those Arcs with
-    /// the control socket.
+    /// the control socket. `root_hints_path`, when set, lets the
+    /// iterative recursor persist the primed root set across
+    /// restarts (e.g. `/persistent/data/dnsd/root-hints` on imp).
     pub fn from_parts(
         cfg: &DnsConfig,
         reactor: VclReactor,
         metrics: Arc<Metrics>,
         cache: Arc<DnsCache>,
         forwarders: Arc<Forwarders>,
+        root_hints_path: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let upstream_timeout_ms = cfg
             .recursion
@@ -136,6 +143,22 @@ impl RecursorHandler {
 
         let dnssec = DnssecPolicy::from_recursion(cfg.recursion.as_ref());
 
+        // Forwarders are trust boundaries: the operator configured
+        // them knowing those upstreams speak for those domains. dnsd
+        // does NOT re-walk the chain of trust on the forwarder path
+        // — it would double every query and defeat the forwarder's
+        // purpose. If validation is on AND forwarders are also set,
+        // make the operator aware that forwarded responses will have
+        // AD stripped (unless they switch to PassThrough).
+        if matches!(dnssec, DnssecPolicy::Validate) && !cfg.forwarders.is_empty() {
+            tracing::warn!(
+                forwarders = cfg.forwarders.len(),
+                "dnssec: validate + forwarders configured: forwarded responses will return AD=0 \
+                 (validation only runs on the iterative path). Route sensitive zones through iterative \
+                 or accept the forwarder's own validation via `dnssec: passthrough`."
+            );
+        }
+
         let rrl = Rrl::from_config(cfg.rate_limit.as_ref()).map(Arc::new);
 
         // Iterative recursion is enabled by default when no explicit
@@ -151,12 +174,80 @@ impl RecursorHandler {
             .as_ref()
             .and_then(|r| r.max_cname_depth)
             .unwrap_or(iterative::DEFAULT_MAX_CNAME);
+        let ipv6_upstream = cfg
+            .recursion
+            .as_ref()
+            .map(|r| r.ipv6_upstream)
+            .unwrap_or(true);
+        // When validation is on, the iterative recursor asks for
+        // RRSIG/NSEC records (DO=1) so the validator has something
+        // to verify. When validation is off we keep DO=0 to cut a
+        // few bytes off every response.
+        let dnssec_ok = matches!(dnssec, DnssecPolicy::Validate);
         let iterative = if iterative_enabled {
             Some(Arc::new(IterativeResolver::new(
                 upstream.clone(),
                 cache.clone(),
                 metrics.clone(),
                 max_cname,
+                ipv6_upstream,
+                root_hints_path,
+                dnssec_ok,
+            )))
+        } else {
+            None
+        };
+
+        // Validator needs access to the live root IPs (to bootstrap
+        // the root ZSK under the trust anchor's KSK). Snapshot the
+        // shared Arc from the resolver if it's running; otherwise
+        // seed a fresh one — the validator won't actually be called
+        // without a recursor, but we keep the type non-Option.
+        let validator_roots = iterative
+            .as_ref()
+            .map(|r| r.roots_arc())
+            .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(Vec::new())));
+
+        // Load trust anchors if a path is configured AND DNSSEC
+        // validation is on. Anchor-load failures log a warning but
+        // don't fail startup — operators can fix the file and SIGHUP
+        // once it's in place.
+        let validator = if matches!(dnssec, DnssecPolicy::Validate) {
+            let anchors = match cfg
+                .recursion
+                .as_ref()
+                .and_then(|r| r.trust_anchor.as_ref())
+            {
+                Some(path) => match dnssec::TrustAnchors::load_from_file(
+                    std::path::Path::new(path),
+                ) {
+                    Ok(a) => {
+                        tracing::info!(
+                            path = %path,
+                            keys = a.len(),
+                            "loaded DNSSEC trust anchors"
+                        );
+                        Arc::new(a)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            "failed to load trust anchors: {e} (validation disabled)"
+                        );
+                        Arc::new(dnssec::TrustAnchors::new())
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        "dnssec: validate is set but no trust_anchor path configured — validation will report Insecure"
+                    );
+                    Arc::new(dnssec::TrustAnchors::new())
+                }
+            };
+            Some(Arc::new(dnssec::Validator::new(
+                anchors,
+                upstream.clone(),
+                validator_roots,
             )))
         } else {
             None
@@ -169,6 +260,7 @@ impl RecursorHandler {
             metrics,
             dns64,
             dnssec,
+            validator,
             rrl,
             iterative,
         })
@@ -228,14 +320,42 @@ impl DnsHandler for RecursorHandler {
         if let Some(mut cached) = self.cache.get(&key).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             cache::rewrite_txid(&mut cached, msg.id());
-            // Apply DNSSEC policy to the cached bytes too.
             if let Ok(mut parsed) = Message::from_bytes(&cached) {
-                self.dnssec.apply_to_response(&mut parsed);
-                if let Ok(reencoded) = parsed.to_vec() {
-                    return Some(reencoded);
+                // Cache-hit DNS64: if the cached AAAA response is
+                // empty/NXDOMAIN and this listener wants DNS64,
+                // synthesise from the cached A (if any). We don't
+                // cache synthesised responses because DNS64 policy
+                // is per-listener; the cached A is always authentic.
+                if dns64::should_synthesise(
+                    self.dns64.as_deref(),
+                    ctx.dns64,
+                    q.name(),
+                    q.query_type(),
+                    &parsed,
+                ) {
+                    if let Some(policy) = self.dns64.as_deref() {
+                        if let Some(synth) =
+                            self.synthesise_from_cached_a(policy, &msg, q.name()).await
+                        {
+                            self.metrics
+                                .dns64_synthesised
+                                .fetch_add(1, Ordering::Relaxed);
+                            return synth.to_vec().ok();
+                        }
+                        // Cached A missed — fall through to regular
+                        // resolution (forwarder or iterative) which
+                        // will fire the A query itself.
+                    }
+                } else {
+                    self.dnssec.apply_to_response(&mut parsed);
+                    if let Ok(reencoded) = parsed.to_vec() {
+                        return Some(reencoded);
+                    }
+                    return Some(cached);
                 }
+            } else {
+                return Some(cached);
             }
-            return Some(cached);
         }
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -250,12 +370,96 @@ impl DnsHandler for RecursorHandler {
                 // No forwarder match — fall through to iterative
                 // recursion if enabled, otherwise SERVFAIL.
                 return match self.iterative.as_ref() {
-                    Some(iter) => match iter.resolve(&msg).await {
-                        Ok(mut bytes) => {
-                            // apply_to_response needs to mutate a
-                            // typed Message — parse, fix AD, re-emit.
+                    Some(iter) => match iter.resolve_with_chain(&msg).await {
+                        Ok((mut bytes, walk_chain)) => {
                             if let Ok(mut parsed) = Message::from_bytes(&bytes) {
-                                self.dnssec.apply_to_response(&mut parsed);
+                                // If DNSSEC validation is on, run the
+                                // chain validator BEFORE applying the
+                                // policy's AD-bit defaulting — a
+                                // Secure result promotes AD=1, Bogus
+                                // flips to SERVFAIL + EDE.
+                                if let Some(validator) = self.validator.as_ref() {
+                                    let status =
+                                        validator.validate_walk(&walk_chain, &parsed).await;
+                                    match status {
+                                        dnssec::ValidationStatus::Secure => {
+                                            self.metrics.dnssec_validated
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            parsed.set_authentic_data(true);
+                                        }
+                                        dnssec::ValidationStatus::Insecure => {
+                                            parsed.set_authentic_data(false);
+                                        }
+                                        dnssec::ValidationStatus::Bogus(reason) => {
+                                            self.metrics.dnssec_failed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            tracing::warn!(
+                                                qname = %q.name(),
+                                                "DNSSEC validation bogus: {reason}"
+                                            );
+                                            return Some(servfail_with_ede(
+                                                &msg,
+                                                dnssec::EDE_DNSSEC_BOGUS,
+                                                &reason,
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    // Not validating — honour the
+                                    // configured policy's AD handling.
+                                    self.dnssec.apply_to_response(&mut parsed);
+                                }
+
+                                // DNS64 synthesis: fires when the
+                                // AAAA response is empty/NXDOMAIN,
+                                // the listener opted into DNS64, and
+                                // the name isn't on the exclusion
+                                // list. We fire a follow-up A query
+                                // on the same iterative path and
+                                // wrap the answers into v4-in-v6.
+                                if dns64::should_synthesise(
+                                    self.dns64.as_deref(),
+                                    ctx.dns64,
+                                    q.name(),
+                                    q.query_type(),
+                                    &parsed,
+                                ) {
+                                    if let Some(policy) = self.dns64.as_deref() {
+                                        let mut a_query = msg.clone();
+                                        a_query.take_queries();
+                                        a_query.add_query(Query::query(
+                                            q.name().clone(),
+                                            RecordType::A,
+                                        ));
+                                        if let Ok((a_bytes, _)) =
+                                            iter.resolve_with_chain(&a_query).await
+                                        {
+                                            if let Ok(a_resp) = Message::from_bytes(&a_bytes) {
+                                                if !a_resp.answers().is_empty() {
+                                                    let mut synth = dns64::synthesise_from_a(
+                                                        policy, &msg, &a_resp,
+                                                    );
+                                                    self.metrics.dns64_synthesised.fetch_add(
+                                                        1,
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    self.dnssec.apply_to_response(&mut synth);
+                                                    if let Ok(synth_bytes) = synth.to_vec() {
+                                                        // DON'T cache the synthesised response
+                                                        // under the AAAA key — that would serve
+                                                        // DNS64 answers to listeners that haven't
+                                                        // opted in. The underlying A query is
+                                                        // already cached by iter.resolve, so
+                                                        // re-synthesising on the next query is
+                                                        // cheap.
+                                                        return Some(synth_bytes);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if let Ok(re) = parsed.to_vec() {
                                     bytes = re;
                                 }
@@ -318,10 +522,8 @@ impl DnsHandler for RecursorHandler {
                                 let bytes = synth
                                     .to_vec()
                                     .unwrap_or_else(|_| servfail(&msg));
-                                // Cache the synthesised response under
-                                // the AAAA key so subsequent queries
-                                // don't re-trigger synthesis.
-                                self.cache.put(key, &synth, bytes.clone()).await;
+                                // Don't cache the synthesised response —
+                                // see iterative branch above for why.
                                 return Some(bytes);
                             }
                         }
@@ -346,6 +548,30 @@ impl RecursorHandler {
     /// name through the forwarder + cache path, return the raw
     /// response bytes. Does not apply DNS64 post-processing itself —
     /// the caller does that with `rewrap_ptr_response`.
+    /// Look up the cached A response for `qname`; if present,
+    /// synthesise an AAAA response from its answers. Returns None
+    /// when A isn't cached (caller falls through to re-resolution).
+    async fn synthesise_from_cached_a(
+        &self,
+        policy: &Dns64Policy,
+        original_query: &Message,
+        qname: &hickory_proto::rr::Name,
+    ) -> Option<Message> {
+        let a_key = CacheKey::new(qname, RecordType::A, hickory_proto::rr::DNSClass::IN);
+        let a_bytes = self.cache.get(&a_key).await?;
+        let a_resp = Message::from_bytes(&a_bytes).ok()?;
+        if !a_resp
+            .answers()
+            .iter()
+            .any(|r| r.record_type() == RecordType::A)
+        {
+            return None;
+        }
+        let mut synth = dns64::synthesise_from_a(policy, original_query, &a_resp);
+        self.dnssec.apply_to_response(&mut synth);
+        Some(synth)
+    }
+
     async fn resolve_forwarded(
         &self,
         query_msg: &Message,
@@ -403,4 +629,39 @@ fn servfail(req: &Message) -> Vec<u8> {
         buf[3] = 0x02; // RCODE=SERVFAIL
         buf
     })
+}
+
+/// SERVFAIL + EDNS0 Extended DNS Error (RFC 8914). Used for DNSSEC
+/// Bogus so operators + curious clients can see *why* validation
+/// failed instead of just "SERVFAIL, unknown reason".
+fn servfail_with_ede(req: &Message, info_code: u16, extra_text: &str) -> Vec<u8> {
+    let mut resp = Message::new();
+    resp.set_id(req.id());
+    resp.set_message_type(MessageType::Response);
+    resp.set_op_code(OpCode::Query);
+    resp.set_recursion_desired(req.recursion_desired());
+    resp.set_recursion_available(false);
+    resp.set_response_code(ResponseCode::ServFail);
+    for q in req.queries() {
+        resp.add_query(q.clone());
+    }
+
+    // EDE encoded as an OPT record option (RFC 8914 §2): code 15,
+    // payload = 2-byte info-code + UTF-8 extra-text. Text truncated
+    // to 255 bytes to avoid bloating the response past the edns
+    // payload size.
+    let mut extra_bytes = Vec::with_capacity(2 + extra_text.len().min(255));
+    extra_bytes.extend_from_slice(&info_code.to_be_bytes());
+    extra_bytes.extend_from_slice(&extra_text.as_bytes()[..extra_text.len().min(255)]);
+
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(1232);
+    edns.set_version(0);
+    edns.options_mut().insert(hickory_proto::rr::rdata::opt::EdnsOption::Unknown(
+        15, // EDE option code
+        extra_bytes,
+    ));
+    resp.set_edns(edns);
+
+    resp.to_vec().unwrap_or_else(|_| servfail(req))
 }

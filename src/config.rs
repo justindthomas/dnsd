@@ -66,15 +66,87 @@ pub struct Forwarder {
     pub servers: Vec<IpAddr>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Operator-facing DNSSEC mode. Maps 1:1 onto
+/// `recursor::dnssec::DnssecPolicy`.
+///
+/// `passthrough` (default): leave the upstream's AD bit alone.
+/// Right when the operator trusts the configured forwarder to
+/// validate on their behalf.
+///
+/// `strip`: clear AD unconditionally, regardless of upstream. Use
+/// when the forwarder is NOT trusted for validation and clients
+/// should never see AD=1 for data dnsd didn't check itself.
+///
+/// `validate`: chain-validate every iterative response against the
+/// configured trust anchor; Secure → AD=1, Bogus → SERVFAIL with
+/// EDE 6. Forwarder path still runs PassThrough-ish but logs a
+/// warning at startup that forwarded responses aren't revalidated.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnssecMode {
+    #[default]
+    PassThrough,
+    Strip,
+    Validate,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Recursion {
     pub enabled: bool,
+    /// DNSSEC policy. Accepts the string `passthrough` / `strip` /
+    /// `validate`. For backward-compat with pre-v1 configs, the
+    /// boolean `dnssec_validate: true` still promotes to Validate
+    /// via `finalize()` below.
+    pub dnssec: DnssecMode,
+    /// Legacy boolean knob kept for existing router.yaml files.
+    /// `dnssec_validate: true` is equivalent to `dnssec: validate`.
+    /// When set, it overrides `dnssec` only if `dnssec` is the
+    /// default (PassThrough); otherwise the explicit `dnssec`
+    /// value wins.
+    #[serde(default)]
     pub dnssec_validate: bool,
     pub trust_anchor: Option<String>,
     pub serve_stale_seconds: Option<u32>,
     pub upstream_timeout_ms: Option<u32>,
     pub max_cname_depth: Option<u32>,
+    /// Whether the iterative recursor may contact IPv6 upstream
+    /// servers (root hints + glue AAAAs). Defaults to true. Set
+    /// false in environments where the dataplane has no IPv6 route
+    /// — the v6 bind/send fails cost time and VCL sessions per
+    /// query. Has no effect on downstream listeners.
+    pub ipv6_upstream: bool,
+}
+
+impl Recursion {
+    /// Resolve the effective DNSSEC mode, accounting for the legacy
+    /// `dnssec_validate` boolean.
+    pub fn effective_dnssec(&self) -> DnssecMode {
+        // Explicit `dnssec: strip|validate` wins over the legacy
+        // boolean. The only case where legacy matters is when
+        // `dnssec` is left at its default (PassThrough) but the
+        // operator wrote `dnssec_validate: true` in a pre-v1 config.
+        if self.dnssec == DnssecMode::PassThrough && self.dnssec_validate {
+            DnssecMode::Validate
+        } else {
+            self.dnssec
+        }
+    }
+}
+
+impl Default for Recursion {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dnssec: DnssecMode::PassThrough,
+            dnssec_validate: false,
+            trust_anchor: None,
+            serve_stale_seconds: None,
+            upstream_timeout_ms: None,
+            max_cname_depth: None,
+            ipv6_upstream: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -31,8 +31,12 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use hickory_proto::rr::dnssec::rdata::{DNSSECRData, RRSIG};
 
 use anyhow::{anyhow, Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -50,15 +54,72 @@ pub const DEFAULT_MAX_DEPTH: u32 = 16;
 pub const DEFAULT_MAX_QUERIES: u32 = 100;
 pub const DEFAULT_MAX_CNAME: u32 = 8;
 
+/// A single delegation step seen during a walk, in enough detail
+/// for a DNSSEC validator to reconstruct the chain of trust afterwards.
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    /// The zone being delegated TO at this step (child of the
+    /// zone we were querying; for the first entry this is usually
+    /// a TLD delegation from the root).
+    pub zone: hickory_proto::rr::Name,
+    /// Full DS records from the parent's authority section covering
+    /// `zone` — kept as-parsed (TTL intact) because the RRSIG
+    /// verifier needs the originally-signed TTL (RFC 4034 §6.2
+    /// canonical form). Empty means the parent provided no DS —
+    /// either the zone is unsigned (legit insecure delegation) or
+    /// the response was stripped (downgrade attack that we can't
+    /// detect without NSEC/NSEC3 denial-of-DS proof — tracked as
+    /// v1.x follow-up).
+    pub ds: Vec<Record>,
+    /// Covering RRSIGs for the DS RRset, from the same authority
+    /// section. Empty when ds is empty.
+    pub ds_rrsig: Vec<RRSIG>,
+    /// IPs the validator can use to fetch `zone`'s DNSKEY RRset
+    /// later — these are the NSes we just got referred to.
+    pub ns_ips: Vec<IpAddr>,
+}
+
+/// The delegation chain a single walk traversed, from the root on
+/// down to the answer's authoritative zone. Consumed by the DNSSEC
+/// validator to build a trust chain without re-walking the tree.
+#[derive(Debug, Clone, Default)]
+pub struct WalkChain {
+    pub steps: Vec<ChainStep>,
+}
+
+impl WalkChain {
+    /// The zone that served the final answer (last step's `zone`).
+    /// Empty (`None`) for a direct-from-root answer.
+    pub fn answer_zone(&self) -> Option<&hickory_proto::rr::Name> {
+        self.steps.last().map(|s| &s.zone)
+    }
+}
+
 #[derive(Clone)]
 pub struct IterativeResolver {
     upstream: Arc<UpstreamClient>,
     cache: Arc<DnsCache>,
     metrics: Arc<Metrics>,
-    roots: Vec<IpAddr>,
+    /// Live root-server address set. Starts as either the compiled-in
+    /// hardcoded list or the last-primed list read from disk;
+    /// `prime()` replaces it with the glue from an authoritative
+    /// `./NS` response. Wrapped in RwLock so the background priming
+    /// task can swap it in without blocking walks.
+    roots: Arc<RwLock<Vec<IpAddr>>>,
+    /// Path for persisting the primed root set across restarts. When
+    /// Some, `prime()` writes one IP per line to this path after a
+    /// successful fetch, and `new()` tries to preload from it before
+    /// falling back to the hardcoded list. None disables persistence.
+    root_hints_path: Option<PathBuf>,
     max_depth: u32,
     max_queries: u32,
     max_cname: u32,
+    ipv6_upstream: bool,
+    /// When true, upstream queries set the DO bit in EDNS0 so the
+    /// server includes RRSIG/NSEC/NSEC3 records in its response. The
+    /// recursor collects DS records seen during walks so the
+    /// validator can later fetch DNSKEYs and verify the chain.
+    dnssec_ok: bool,
 }
 
 impl IterativeResolver {
@@ -67,21 +128,81 @@ impl IterativeResolver {
         cache: Arc<DnsCache>,
         metrics: Arc<Metrics>,
         max_cname: u32,
+        ipv6_upstream: bool,
+        root_hints_path: Option<PathBuf>,
+        dnssec_ok: bool,
     ) -> Self {
-        Self {
+        // Start with either the persisted root hints or the
+        // hardcoded fallback. Persisted hints are preferred because
+        // they reflect the last time we successfully primed — fresher
+        // than the compiled-in list if IANA renumbered a root letter
+        // since the binary was built.
+        let mut roots = match root_hints_path
+            .as_deref()
+            .and_then(|p| read_root_hints_file(p).ok())
+        {
+            Some(ips) if !ips.is_empty() => {
+                tracing::info!(
+                    path = %root_hints_path.as_deref().unwrap().display(),
+                    count = ips.len(),
+                    "loaded persisted root hints"
+                );
+                ips
+            }
+            _ => default_root_hints(),
+        };
+        if !ipv6_upstream {
+            roots.retain(IpAddr::is_ipv4);
+        }
+        let resolver = Self {
             upstream,
             cache,
             metrics,
-            roots: default_root_hints(),
+            roots: Arc::new(RwLock::new(roots)),
+            root_hints_path,
             max_depth: DEFAULT_MAX_DEPTH,
             max_queries: DEFAULT_MAX_QUERIES,
             max_cname: max_cname.max(1).min(DEFAULT_MAX_CNAME * 2),
-        }
+            ipv6_upstream,
+            dnssec_ok,
+        };
+
+        // Prime the root-hint set in the background: query `./NS`
+        // against one of the seed roots, cache the authoritative
+        // response + glue, swap `roots` to the live IP set, and
+        // persist them to disk for the next cold start. If priming
+        // fails we log + keep using whatever roots we already have,
+        // so startup never blocks on internet reachability.
+        let cloned = resolver.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cloned.prime().await {
+                tracing::warn!("root priming failed: {e} (keeping existing root hints)");
+            }
+        });
+
+        resolver
+    }
+
+    /// Shared handle to the live root-hint IP set. Used by the
+    /// DNSSEC validator to bootstrap the chain of trust from root.
+    pub fn roots_arc(&self) -> Arc<RwLock<Vec<IpAddr>>> {
+        self.roots.clone()
     }
 
     /// Resolve `qname` / `qtype` iteratively. Returns a full wire
     /// response whose TXID matches the input query's TXID.
     pub async fn resolve(&self, client_query: &Message) -> Result<Vec<u8>> {
+        self.resolve_with_chain(client_query).await.map(|(b, _)| b)
+    }
+
+    /// Same as `resolve` but also returns the delegation chain the
+    /// walk traversed (for the DNSSEC validator). The validator
+    /// ignores the chain if DNSSEC is off; callers that don't care
+    /// should use `resolve()` for the shorter signature.
+    pub async fn resolve_with_chain(
+        &self,
+        client_query: &Message,
+    ) -> Result<(Vec<u8>, WalkChain)> {
         let q = client_query
             .queries()
             .first()
@@ -91,8 +212,15 @@ impl IterativeResolver {
         self.metrics.recursion_walked.fetch_add(1, Ordering::Relaxed);
 
         let mut budget = Budget::new(self.max_depth, self.max_queries, self.max_cname);
+        let mut chain = WalkChain::default();
         let answer = self
-            .walk(&q.name().clone(), q.query_type(), q.query_class(), &mut budget)
+            .walk(
+                &q.name().clone(),
+                q.query_type(),
+                q.query_class(),
+                &mut budget,
+                &mut chain,
+            )
             .await?;
 
         // Stitch the answer onto a response carrying the client's
@@ -118,24 +246,34 @@ impl IterativeResolver {
         // Cache under the original question (lowercased).
         let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
         self.cache.put(key, &response, bytes.clone()).await;
-        Ok(bytes)
+        Ok((bytes, chain))
     }
 
     /// Core delegation walk. `qname` + `qtype` is the target; we
     /// start at the roots and descend until we either hit an
     /// authoritative answer or run out of budget.
+    ///
+    /// `chain` accumulates one entry per delegation boundary (the
+    /// zone being delegated to + any DS records + the NS IPs we used
+    /// to reach it). Passing `None` from internal callers (CNAME
+    /// sub-walks, glueless NS resolution) would record a partial
+    /// chain — for v1 we only populate the outermost walk so the
+    /// validator has a clean root-to-answer chain.
     async fn walk(
         &self,
         qname: &Name,
         qtype: RecordType,
         qclass: DNSClass,
         budget: &mut Budget,
+        chain: &mut WalkChain,
     ) -> Result<Message> {
         budget.referral()?;
 
         // Current working set of name-server IPs to query. Start
-        // at the roots; each referral replaces this.
-        let mut ns_ips: Vec<IpAddr> = self.roots.clone();
+        // at the roots; each referral replaces this. Snapshot the
+        // live root set under the RwLock so a concurrent re-prime
+        // doesn't tear the Vec mid-walk.
+        let mut ns_ips: Vec<IpAddr> = self.roots.read().unwrap().clone();
         // Current zone we're talking to. Starts at the root ".".
         let mut current_zone = Name::root();
 
@@ -154,10 +292,15 @@ impl IterativeResolver {
 
                 Classification::Cname(target) => {
                     // CNAME chase: restart from the roots with the
-                    // new qname, same qtype.
+                    // new qname, same qtype. The sub-walk gets its
+                    // own temporary chain — merging CNAME chain
+                    // segments into the validator is a v1.x follow-up.
                     budget.cname()?;
-                    let cname_resp =
-                        Box::pin(self.walk(&target, qtype, qclass, budget)).await?;
+                    let mut sub_chain = WalkChain::default();
+                    let cname_resp = Box::pin(self.walk(
+                        &target, qtype, qclass, budget, &mut sub_chain,
+                    ))
+                    .await?;
                     // Stitch the CNAME plus the chased answer into
                     // a single Message so the client sees the full
                     // chain.
@@ -188,6 +331,19 @@ impl IterativeResolver {
                     }
                     current_zone = new_zone;
 
+                    // Cache any glue we got — later walks (or
+                    // sub-walks for glueless siblings of the same
+                    // delegation) can use these addresses without
+                    // re-traversing from the root.
+                    self.cache_glue(&glue).await;
+
+                    // Extract DS records + their RRSIGs from the
+                    // authority section — the validator needs them
+                    // later to build the trust chain. `ds` is empty
+                    // when the parent is unsigned or doesn't delegate
+                    // with DNSSEC (legit insecure delegation).
+                    let (ds, ds_rrsig) = extract_ds_and_rrsig(&resp, &current_zone);
+
                     // Resolve NS addresses — prefer glue, fall back
                     // to a sub-resolution for out-of-bailiwick NS.
                     ns_ips = self
@@ -198,6 +354,14 @@ impl IterativeResolver {
                             "referral to {current_zone} yielded no usable NS addresses"
                         ));
                     }
+
+                    // Record the delegation step for the validator.
+                    chain.steps.push(ChainStep {
+                        zone: current_zone.clone(),
+                        ds,
+                        ds_rrsig,
+                        ns_ips: ns_ips.clone(),
+                    });
                 }
 
                 Classification::Empty => {
@@ -226,7 +390,7 @@ impl IterativeResolver {
         let mut order: Vec<IpAddr> = ns_ips.to_vec();
         order.shuffle(&mut rand::thread_rng());
 
-        let wire = build_query(qname, qtype, qclass)?;
+        let wire = build_query(qname, qtype, qclass, self.dnssec_ok)?;
 
         let mut last_err = None;
         for ip in order {
@@ -265,18 +429,43 @@ impl IterativeResolver {
             let Some(RData::NS(target)) = ns.data() else { continue };
             let target_name = target.0.to_lowercase();
             if let Some(glued) = glue.get(&target_name) {
-                ips.extend_from_slice(glued);
+                for ip in glued {
+                    if !self.ipv6_upstream && ip.is_ipv6() {
+                        continue;
+                    }
+                    ips.push(*ip);
+                }
                 continue;
             }
-            // No glue — recurse to find the NS's address(es). We
-            // prefer A over AAAA to minimise further iteration (the
-            // v6 path may itself need a glueless walk). Failures are
-            // not fatal; we skip this NS and try the next.
+            // Glueless in THIS referral — but we may have seen glue
+            // for this NS earlier in the walk (e.g. root's delegation
+            // to .net included glue for gtld-servers.net nameservers;
+            // a later referral from .net to gtld-servers.net itself
+            // does NOT include glue but we cached it above). Check
+            // the cache before kicking off a sub-walk.
+            let cached = self.cached_ns_ips(&target_name).await;
+            if !cached.is_empty() {
+                ips.extend(cached);
+                continue;
+            }
+            // No glue, no cache — recurse to find the NS's
+            // address(es). We prefer A over AAAA to minimise further
+            // iteration (the v6 path may itself need a glueless
+            // walk). Failures are not fatal; we skip this NS and try
+            // the next.
             let sub_budget_ok = budget.can_substep();
             if !sub_budget_ok {
                 continue;
             }
-            match Box::pin(self.walk(&target_name, RecordType::A, qclass, budget)).await {
+            // Glueless-NS sub-walks get their own temporary chain —
+            // the main walk's `chain` only tracks the resolution
+            // path we're actually delivering to the validator.
+            let mut sub_chain = WalkChain::default();
+            match Box::pin(self.walk(
+                &target_name, RecordType::A, qclass, budget, &mut sub_chain,
+            ))
+            .await
+            {
                 Ok(resp) => {
                     for a in resp.answers() {
                         if let Some(RData::A(A(v4))) = a.data() {
@@ -292,6 +481,270 @@ impl IterativeResolver {
         ips.dedup();
         Ok(ips)
     }
+
+    /// Synthesise A/AAAA answer-messages from a glue map and push
+    /// them into the shared DnsCache. Referrals commonly carry glue
+    /// for child-zone NSes that is NOT returned again by the child
+    /// itself (e.g. Verisign's .net delegation to gtld-servers.net —
+    /// the root provides glue for a.gtld-servers.net in the .net
+    /// delegation, but .net itself omits it when re-referring). The
+    /// recursor relies on cache replay to avoid looping.
+    async fn cache_glue(&self, glue: &HashMap<Name, Vec<IpAddr>>) {
+        for (name, ips) in glue {
+            let v4s: Vec<_> = ips.iter().filter(|ip| ip.is_ipv4()).collect();
+            let v6s: Vec<_> = ips.iter().filter(|ip| ip.is_ipv6()).collect();
+            if !v4s.is_empty() {
+                if let Some((msg, bytes)) =
+                    build_synthetic_answer(name, RecordType::A, ips)
+                {
+                    let key = CacheKey::new(name, RecordType::A, DNSClass::IN);
+                    self.cache.put(key, &msg, bytes).await;
+                }
+            }
+            if !v6s.is_empty() {
+                if let Some((msg, bytes)) =
+                    build_synthetic_answer(name, RecordType::AAAA, ips)
+                {
+                    let key = CacheKey::new(name, RecordType::AAAA, DNSClass::IN);
+                    self.cache.put(key, &msg, bytes).await;
+                }
+            }
+        }
+    }
+
+    /// Look up cached A (and AAAA when v6 is enabled) for an NS name
+    /// we've previously seen as glue. Returns an empty Vec on miss.
+    async fn cached_ns_ips(&self, name: &Name) -> Vec<IpAddr> {
+        let mut out = Vec::new();
+        let key_a = CacheKey::new(name, RecordType::A, DNSClass::IN);
+        if let Some(bytes) = self.cache.get(&key_a).await {
+            if let Ok(msg) = Message::from_bytes(&bytes) {
+                for ans in msg.answers() {
+                    if let Some(RData::A(A(v4))) = ans.data() {
+                        out.push(IpAddr::V4(*v4));
+                    }
+                }
+            }
+        }
+        if self.ipv6_upstream {
+            let key_aaaa = CacheKey::new(name, RecordType::AAAA, DNSClass::IN);
+            if let Some(bytes) = self.cache.get(&key_aaaa).await {
+                if let Ok(msg) = Message::from_bytes(&bytes) {
+                    for ans in msg.answers() {
+                        if let Some(RData::AAAA(AAAA(v6))) = ans.data() {
+                            out.push(IpAddr::V6(*v6));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Fetch an authoritative root NS set — query `./NS` at one of
+    /// the hardcoded root IPs, cache the response + glue, and swap
+    /// `self.roots` to the live set. Called once at startup from
+    /// `new()`. Failure is non-fatal — we fall back to the hardcoded
+    /// list and log a warning.
+    ///
+    /// Why not block on this? Recursors on fresh boot often can't
+    /// reach the internet yet (NIC not up, DHCP pending). If priming
+    /// blocked startup, a cold-boot machine with VPP coming up in
+    /// parallel would stall. Running it as a detached task means
+    /// queries served before priming completes use the hardcoded
+    /// IPs — those are current as of the binary build, so it's a
+    /// correct degraded mode rather than a failure.
+    async fn prime(&self) -> anyhow::Result<()> {
+        let seed = {
+            let snapshot = self.roots.read().unwrap();
+            // Prefer a v4 seed to avoid v6 transport questions on
+            // priming itself; if the list is v6-only fall back to v6.
+            snapshot
+                .iter()
+                .find(|ip| ip.is_ipv4())
+                .copied()
+                .or_else(|| snapshot.first().copied())
+                .ok_or_else(|| anyhow!("no hardcoded roots available for priming"))?
+        };
+
+        // Priming doesn't need DNSSEC records — we only care about
+        // the NS set + glue. Even if DNSSEC is enabled, root priming
+        // runs before the validator is consulted, and we cache the
+        // authoritative response wholesale.
+        let wire = build_query(&Name::root(), RecordType::NS, DNSClass::IN, false)?;
+        let resp_bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.upstream.query(&[seed], &wire),
+        )
+        .await
+        .map_err(|_| anyhow!("priming query to {seed} timed out"))??;
+        let resp = Message::from_bytes(&resp_bytes)
+            .context("parse priming response")?;
+
+        // Extract NS targets from the answer section (root is
+        // authoritative for itself, so the NS RRset is in Answers).
+        let ns_targets: Vec<Name> = resp
+            .answers()
+            .iter()
+            .filter(|r| r.record_type() == RecordType::NS)
+            .filter_map(|r| match r.data() {
+                Some(RData::NS(target)) => Some(target.0.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        if ns_targets.is_empty() {
+            return Err(anyhow!(
+                "priming response had no NS records in the answer section"
+            ));
+        }
+
+        // Build a name→ips glue map from the Additional section.
+        let mut glue: HashMap<Name, Vec<IpAddr>> = HashMap::new();
+        for add in resp.additionals() {
+            let owner = add.name().to_lowercase();
+            match add.data() {
+                Some(RData::A(A(v4))) => {
+                    glue.entry(owner).or_default().push(IpAddr::V4(*v4));
+                }
+                Some(RData::AAAA(AAAA(v6))) => {
+                    glue.entry(owner).or_default().push(IpAddr::V6(*v6));
+                }
+                _ => {}
+            }
+        }
+
+        // Cache every glue record — lets clients resolve
+        // `a.root-servers.net A` etc. without a fresh walk.
+        self.cache_glue(&glue).await;
+
+        // Cache the authoritative ./NS response itself so `. IN NS`
+        // queries to the recursor hit cache.
+        let ns_key = CacheKey::new(&Name::root(), RecordType::NS, DNSClass::IN);
+        self.cache.put(ns_key, &resp, resp_bytes).await;
+
+        // Build the new root IP set from NS-target glue only. Names
+        // in the NS list that lack glue are skipped (operator can
+        // still refresh manually if needed).
+        let mut new_roots: Vec<IpAddr> = Vec::new();
+        for name in &ns_targets {
+            if let Some(ips) = glue.get(name) {
+                for ip in ips {
+                    if !self.ipv6_upstream && ip.is_ipv6() {
+                        continue;
+                    }
+                    new_roots.push(*ip);
+                }
+            }
+        }
+        if new_roots.is_empty() {
+            return Err(anyhow!("priming response had no usable glue"));
+        }
+
+        let count = new_roots.len();
+        if let Some(path) = self.root_hints_path.as_deref() {
+            if let Err(e) = write_root_hints_file(path, &new_roots) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "couldn't persist root hints: {e}"
+                );
+            }
+        }
+        *self.roots.write().unwrap() = new_roots;
+        tracing::info!(seed = %seed, roots = count, "root hints primed");
+        Ok(())
+    }
+}
+
+/// Read a persisted root-hints file. Format: one IP per line, `#`
+/// comments and blank lines ignored. Returns `Err` on I/O trouble or
+/// if parsing finds no usable IPs.
+fn read_root_hints_file(path: &std::path::Path) -> anyhow::Result<Vec<IpAddr>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let ips: Vec<IpAddr> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.parse::<IpAddr>().ok())
+        .collect();
+    if ips.is_empty() {
+        anyhow::bail!("{} has no parseable IP addresses", path.display());
+    }
+    Ok(ips)
+}
+
+/// Write the primed root-hint IPs to `path` atomically (write to
+/// `.tmp` sibling, rename). Leaves a parseable text file — one IP
+/// per line with a short header.
+fn write_root_hints_file(
+    path: &std::path::Path,
+    ips: &[IpAddr],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        writeln!(f, "# dnsd primed root hints — machine-generated, do not edit")?;
+        writeln!(f, "# Refreshed on each successful `./NS` priming query.")?;
+        for ip in ips {
+            writeln!(f, "{ip}")?;
+        }
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Build a minimal response Message containing `name`'s glue
+/// addresses of the given rtype as Answer records, plus the
+/// corresponding wire encoding. Returns None if encoding fails or
+/// there's nothing of that rtype to emit.
+///
+/// TTL is fixed at 300s — glue is non-authoritative data, so we keep
+/// it cached briefly but not long enough to paper over real
+/// delegation changes.
+fn build_synthetic_answer(
+    name: &Name,
+    rtype: RecordType,
+    ips: &[IpAddr],
+) -> Option<(Message, Vec<u8>)> {
+    let mut msg = Message::new();
+    msg.set_id(0);
+    msg.set_message_type(MessageType::Response);
+    msg.set_op_code(OpCode::Query);
+    msg.set_response_code(ResponseCode::NoError);
+    let mut q = Query::query(name.clone(), rtype);
+    q.set_query_class(DNSClass::IN);
+    msg.add_query(q);
+
+    let mut added = 0;
+    for ip in ips {
+        match (rtype, ip) {
+            (RecordType::A, IpAddr::V4(v4)) => {
+                msg.add_answer(Record::from_rdata(
+                    name.clone(),
+                    300,
+                    RData::A(A(*v4)),
+                ));
+                added += 1;
+            }
+            (RecordType::AAAA, IpAddr::V6(v6)) => {
+                msg.add_answer(Record::from_rdata(
+                    name.clone(),
+                    300,
+                    RData::AAAA(AAAA(*v6)),
+                ));
+                added += 1;
+            }
+            _ => {}
+        }
+    }
+    if added == 0 {
+        return None;
+    }
+    let bytes = msg.to_vec().ok()?;
+    Some((msg, bytes))
 }
 
 /// Hardcoded IANA root hints as of 2026 (IPv4 + IPv6 per root
@@ -346,6 +799,35 @@ enum Classification {
     Referral(Name, Vec<Record>, HashMap<Name, Vec<IpAddr>>),
     /// Transport-level problem — caller should try another NS.
     ServFail,
+}
+
+/// Pull DS records + their covering RRSIGs out of a referral's
+/// authority section. The owner of a proper DS RRset matches the
+/// delegated-zone name; this is what the DNSSEC validator consumes
+/// to anchor the child zone's DNSKEY under the parent's chain.
+///
+/// Returns full Records (not unwrapped DS rdata) so the validator
+/// can feed them to `verify_rrsig` with their original TTL — that
+/// TTL is part of the canonical form RFC 4034 §6.2 signatures cover.
+fn extract_ds_and_rrsig(resp: &Message, child_zone: &Name) -> (Vec<Record>, Vec<RRSIG>) {
+    let child_lower = child_zone.to_lowercase();
+    let mut ds = Vec::new();
+    let mut sigs = Vec::new();
+    for r in resp.name_servers() {
+        if r.name().to_lowercase() != child_lower {
+            continue;
+        }
+        match r.data() {
+            Some(RData::DNSSEC(DNSSECRData::DS(_))) => ds.push(r.clone()),
+            Some(RData::DNSSEC(DNSSECRData::RRSIG(s))) => {
+                if s.type_covered() == RecordType::DS {
+                    sigs.push(s.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    (ds, sigs)
 }
 
 fn classify(resp: &Message, qname: &Name, qtype: RecordType) -> Classification {
@@ -413,10 +895,26 @@ fn classify(resp: &Message, qname: &Name, qtype: RecordType) -> Classification {
     Classification::Empty
 }
 
-/// Build a plain UDP-shape wire query for (qname, qtype, qclass)
-/// with RD=0 (we're the recursor — we don't ask our upstream to
-/// recurse for us).
-fn build_query(qname: &Name, qtype: RecordType, qclass: DNSClass) -> Result<Vec<u8>> {
+/// Build an EDNS0-enabled UDP-shape wire query for (qname, qtype,
+/// qclass) with RD=0 (we're the recursor — we don't ask our upstream
+/// to recurse for us).
+///
+/// The OPT pseudo-record advertises a 1232-byte receive buffer, the
+/// DNS-flag-day-2020 consensus value that fits cleanly within an
+/// IPv6 minimum MTU without fragmentation. Without an OPT record,
+/// servers must follow RFC 1035's 512-byte limit and tend to strip
+/// glue records when the answer gets tight.
+///
+/// When `dnssec_ok` is true the DO bit in the OPT flags is set,
+/// asking the server to include RRSIG / NSEC / NSEC3 records with
+/// its response. Without DO, upstreams are free to strip signature
+/// data and chain validation becomes impossible.
+fn build_query(
+    qname: &Name,
+    qtype: RecordType,
+    qclass: DNSClass,
+    dnssec_ok: bool,
+) -> Result<Vec<u8>> {
     let mut msg = Message::new();
     msg.set_id(rand::random());
     msg.set_message_type(MessageType::Query);
@@ -425,6 +923,11 @@ fn build_query(qname: &Name, qtype: RecordType, qclass: DNSClass) -> Result<Vec<
     let mut q = Query::query(qname.clone(), qtype);
     q.set_query_class(qclass);
     msg.add_query(q);
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(1232);
+    edns.set_version(0);
+    edns.set_dnssec_ok(dnssec_ok);
+    msg.set_edns(edns);
     msg.to_vec().context("encode iterative query")
 }
 

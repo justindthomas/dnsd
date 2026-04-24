@@ -132,7 +132,12 @@ impl DnsCache {
     }
 
     pub fn entry_count(&self) -> u64 {
-        self.inner.entry_count()
+        // moka's `entry_count` is eventually-consistent — fresh
+        // inserts can lag behind the counter by a scheduler tick or
+        // two, which makes test assertions flaky ("I just put an
+        // entry in, why is count 0?"). Walk iter() for an accurate
+        // live count. Fine for observability paths; not a hot path.
+        self.inner.iter().count() as u64
     }
 
     /// Drop every cached entry. Used by the control socket's `cache

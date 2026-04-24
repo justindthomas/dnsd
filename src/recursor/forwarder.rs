@@ -28,13 +28,16 @@ use rand::Rng;
 // on `&self` that Rust picks before any trait impl; AsyncWriteExt is
 // pulled in only so we can call `.flush()` (no inherent flush on
 // VclStream since VCL has no userspace buffer).
-use tokio::io::AsyncWriteExt;
-use vcl_rs::{VclDgramSocket, VclReactor, VclStream};
+use vcl_rs::{query_tcp_dns_sync, query_udp_sync, VclReactor};
+
+// `VclReactor` is kept in the `new()` signature for API stability —
+// dnsd's RecursorHandler still hands one in — but the sync upstream
+// paths don't need it. `#[allow(dead_code)]` keeps the field around
+// for future use without compiler noise.
 
 use crate::config::Forwarder as ForwarderCfg;
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
-const UPSTREAM_BUF: usize = 4096;
 const MAX_TCP_MESSAGE: usize = 65535;
 
 #[derive(Clone)]
@@ -65,8 +68,13 @@ impl Forwarders {
     pub fn new(configs: &[ForwarderCfg]) -> Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for c in configs {
-            let domain = Name::from_ascii(&c.domain)
+            // Query names off the wire are FQDNs; `zone_of` only
+            // matches when both names are FQDNs. Operator configs
+            // typically omit the trailing dot (`iana.org`, not
+            // `iana.org.`), so normalise here.
+            let mut domain = Name::from_ascii(&c.domain)
                 .with_context(|| format!("bad forwarder domain {:?}", c.domain))?;
+            domain.set_fqdn(true);
             entries.push(ForwarderEntry {
                 domain: domain.to_lowercase(),
                 servers: c.servers.clone(),
@@ -90,14 +98,19 @@ impl Forwarders {
     }
 }
 
+/// True when `suffix` is an ancestor (or equal) of `name` —
+/// i.e. `name` ends in `suffix`. Note hickory's `zone.zone_of(name)`
+/// reads as "is `name` a subzone of `zone`", so the call order is
+/// `suffix.zone_of(name)`, not the reverse.
 fn is_suffix(name: &Name, suffix: &Name) -> bool {
     if name.num_labels() < suffix.num_labels() {
         return false;
     }
-    name.zone_of(suffix)
+    suffix.zone_of(name)
 }
 
 pub struct UpstreamClient {
+    #[allow(dead_code)]
     reactor: VclReactor,
     timeout: Duration,
 }
@@ -183,48 +196,53 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        // Ephemeral source socket — different ephemeral port per
-        // query is part of the Kaminsky baseline.
-        let sock = if peer.is_ipv4() {
-            VclDgramSocket::bind_ephemeral_v4(self.reactor.clone())
-        } else {
-            VclDgramSocket::bind_ephemeral_v6(self.reactor.clone())
-        }
-        .with_context(|| format!("ephemeral UDP bind for upstream {peer}"))?;
-
-        sock.send_to(query, peer)
-            .await
-            .with_context(|| format!("UDP send_to {peer}"))?;
-
-        let mut buf = vec![0u8; UPSTREAM_BUF];
-        let (n, from) = tokio::time::timeout(self.timeout, sock.recv_from(&mut buf))
-            .await
-            .map_err(|_| anyhow!("upstream UDP {peer} timeout"))?
-            .with_context(|| format!("UDP recv_from {peer}"))?;
+        // Upstream UDP queries run on the tokio blocking pool via
+        // `query_udp_sync` — VCL's `vppcom_session_listen` blocks the
+        // calling thread in a usleep loop (see
+        // project_dnsd_vcl_threading.md note 5), which would freeze the
+        // single-threaded runtime under recursor load. Offloading to a
+        // blocking thread keeps the reactor + listener tasks
+        // responsive, and each spawn_blocking thread is already VCL-
+        // registered via `on_thread_start` in main.rs.
+        let peer_addr = peer;
+        let query_vec = query.to_vec();
+        let timeout = self.timeout;
+        let (resp, from) = tokio::task::spawn_blocking(move || {
+            query_udp_sync(peer_addr, &query_vec, timeout)
+        })
+        .await
+        .with_context(|| format!("blocking-pool join for upstream {peer}"))?
+        .with_context(|| format!("upstream UDP {peer}"))?;
 
         if from.ip() != peer.ip() {
             return Err(anyhow!(
                 "upstream UDP response from unexpected address {from} (wanted {peer})"
             ));
         }
+        let n = resp.len();
         if n < 12 {
             return Err(anyhow!("short upstream UDP response ({n} bytes)"));
         }
-        let rx_txid = u16::from_be_bytes([buf[0], buf[1]]);
+        let rx_txid = u16::from_be_bytes([resp[0], resp[1]]);
         if rx_txid != expected_txid {
             return Err(anyhow!(
                 "upstream UDP TXID mismatch: got {rx_txid:#06x} expected {expected_txid:#06x}"
             ));
         }
-        buf.truncate(n);
-        super::zeroxtwenty::verify(&buf, expected_qname)
+        super::zeroxtwenty::verify(&resp, expected_qname)
             .with_context(|| format!("upstream UDP {peer} 0x20 mismatch"))?;
-        Ok(buf)
+        Ok(resp)
     }
 
     /// Send one query to `peer` over TCP (RFC 1035 §4.2.2 2-byte
     /// length framing). Used both for TC-fallback and for forwarders
     /// configured as TCP-only upstreams.
+    ///
+    /// Runs on the tokio blocking pool via `query_tcp_dns_sync` for
+    /// the same reason as UDP: `VclStream` cleanup in its Drop impl
+    /// synchronously calls into `vcl_session_cleanup`, which blocks
+    /// the main thread under recursor load (see
+    /// project_dnsd_vcl_threading.md note 5).
     pub async fn query_one_tcp(
         &self,
         peer: SocketAddr,
@@ -232,54 +250,21 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        // VCL TCP connect: a fresh session per query is simple and
-        // correct. Pooling + keepalive to heavily-used upstreams is
-        // a follow-up. Timeout wraps the entire connect → send →
-        // recv → shutdown dance; on timeout the stream is dropped
-        // which closes the VCL session.
-        let fut = async {
-            let mut stream = VclStream::connect(
-                peer,
-                None,
-                self.timeout,
-                self.reactor.clone(),
-            )
-            .await
-            .with_context(|| format!("TCP connect to upstream {peer}"))?;
-
-            let mut framed = Vec::with_capacity(2 + query.len());
-            framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-            framed.extend_from_slice(query);
-            stream
-                .write_all(&framed)
-                .await
-                .with_context(|| format!("TCP write to upstream {peer}"))?;
-            stream.flush().await.ok();
-
-            let mut lenbuf = [0u8; 2];
-            stream
-                .read_exact(&mut lenbuf)
-                .await
-                .with_context(|| format!("TCP length read from {peer}"))?;
-            let len = u16::from_be_bytes(lenbuf) as usize;
-            if len == 0 || len > MAX_TCP_MESSAGE {
-                return Err(anyhow!("invalid upstream TCP DNS length {len}"));
-            }
-
-            let mut resp = vec![0u8; len];
-            stream
-                .read_exact(&mut resp)
-                .await
-                .with_context(|| format!("TCP body read from {peer}"))?;
-            Ok::<_, anyhow::Error>(resp)
-        };
-
-        let resp = tokio::time::timeout(self.timeout, fut)
-            .await
-            .map_err(|_| anyhow!("upstream TCP {peer} timeout"))??;
+        let peer_addr = peer;
+        let query_vec = query.to_vec();
+        let timeout = self.timeout;
+        let resp = tokio::task::spawn_blocking(move || {
+            query_tcp_dns_sync(peer_addr, &query_vec, timeout)
+        })
+        .await
+        .with_context(|| format!("blocking-pool join for TCP upstream {peer}"))?
+        .with_context(|| format!("upstream TCP {peer}"))?;
 
         if resp.len() < 12 {
             return Err(anyhow!("short upstream TCP response ({} bytes)", resp.len()));
+        }
+        if resp.len() > MAX_TCP_MESSAGE {
+            return Err(anyhow!("oversized upstream TCP response ({} bytes)", resp.len()));
         }
         let rx_txid = u16::from_be_bytes([resp[0], resp[1]]);
         if rx_txid != expected_txid {
@@ -334,5 +319,18 @@ mod tests {
     fn non_matching_returns_none() {
         let f = Forwarders::new(&[fwd("jdt.io", &["10.42.128.19"])]).unwrap();
         assert!(f.lookup(&Name::from_ascii("example.com.").unwrap()).is_none());
+    }
+
+    #[test]
+    fn config_without_trailing_dot_matches_fqdn_query() {
+        // Operator configs usually drop the trailing dot (`iana.org`,
+        // not `iana.org.`); query names from the wire always have it.
+        // Forwarders::new normalises the config side to FQDN so
+        // `zone_of` works across that boundary.
+        let f = Forwarders::new(&[fwd("iana.org", &["1.1.1.1"])]).unwrap();
+        let hit = f
+            .lookup(&Name::from_ascii("www.iana.org.").unwrap())
+            .unwrap();
+        assert_eq!(hit, &["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]);
     }
 }

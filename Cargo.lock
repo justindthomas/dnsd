@@ -565,6 +565,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "data-encoding",
  "futures",
  "governor",
  "hickory-proto",
@@ -2588,6 +2589,7 @@ name = "vcl-rs"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rand 0.8.6",
  "thiserror",
  "tokio",
  "tracing",
