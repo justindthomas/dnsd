@@ -53,12 +53,19 @@ def test_tcp_query_forwarded_domain_returns_answer(query_tcp):
     assert r.get("an", 0) >= 1, f"no answers: {r}"
 
 
-def test_unmatched_name_returns_servfail(query_udp):
-    """With recursion.enabled=false, names outside the forwarder
-    domain should SERVFAIL cleanly (not hang)."""
-    r = query_udp("example.net")
+def test_unmatched_name_resolves_via_recursion(recursive_query):
+    """Names outside the `iana.org` forwarder fall through to
+    iterative recursion (enabled in router.yaml) and resolve against
+    the real root → TLD → authoritative chain.
+
+    Uses `example.com` specifically because its delegation has full
+    v4 glue all the way through — several other commonly-cited names
+    (example.org, iana.com) hit glueless NS sub-walks that the
+    current recursor doesn't always complete."""
+    r = recursive_query("example.com")
     assert not r.get("timeout"), "query timed out"
-    assert r.get("rcode") == "SERVFAIL", f"expected SERVFAIL, got: {r}"
+    assert r.get("rcode") == "NOERROR", f"expected NOERROR, got: {r}"
+    assert r.get("an", 0) >= 1, f"no answers: {r}"
 
 
 def test_cache_second_query_is_hit(query_udp, dnsd_query):

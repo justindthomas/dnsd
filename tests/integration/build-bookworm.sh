@@ -16,6 +16,19 @@ DNSD_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORK="${DNSD_TEST_WORK:-$SCRIPT_DIR/.work}"
 mkdir -p "$WORK"
 
+# If a sibling vcl-rs checkout exists, prefer mounting it into the
+# container over cloning fresh from GitHub — lets local vcl-rs changes
+# flow through to the build without needing to push first. Override
+# with DNSD_VCL_RS_PATH if it lives somewhere else.
+VCL_RS_LOCAL="${DNSD_VCL_RS_PATH:-$DNSD_ROOT/../vcl-rs}"
+if [ -d "$VCL_RS_LOCAL" ] && [ -f "$VCL_RS_LOCAL/Cargo.toml" ]; then
+    VCL_RS_MOUNT=( -v "$VCL_RS_LOCAL:/vcl-rs-src:ro" )
+    USE_LOCAL_VCL=1
+else
+    VCL_RS_MOUNT=()
+    USE_LOCAL_VCL=0
+fi
+
 log() { echo "[build-bookworm] $*"; }
 
 if ! command -v podman &>/dev/null; then
@@ -36,6 +49,8 @@ log "compiling dnsd in bookworm container..."
 $CONTAINER_CMD run --rm \
     -v "$DNSD_ROOT:/src:ro" \
     -v "$WORK:/out" \
+    "${VCL_RS_MOUNT[@]}" \
+    -e USE_LOCAL_VCL="$USE_LOCAL_VCL" \
     -w /root \
     debian:bookworm bash -c '
         set -euo pipefail
@@ -74,10 +89,15 @@ EOF
         done
         ldconfig 2>/dev/null || true
 
-        # Clone vcl-rs next to dnsd-src so dnsds [patch] entry
-        # (vcl-rs = { path = "../vcl-rs" }) resolves inside the
-        # container.
-        git clone --quiet --depth 1 https://github.com/justindthomas/vcl-rs.git /root/vcl-rs
+        # dnsd has a [patch] entry pointing vcl-rs at ../vcl-rs, so a
+        # clone (or bind-mounted copy) must sit next to /root/dnsd-src
+        # at /root/vcl-rs. Prefer the host checkout if it was mounted
+        # — lets local vcl-rs changes flow through without pushing.
+        if [ "$USE_LOCAL_VCL" = "1" ]; then
+            cp -r /vcl-rs-src /root/vcl-rs
+        else
+            git clone --quiet --depth 1 https://github.com/justindthomas/vcl-rs.git /root/vcl-rs
+        fi
 
         cp -r /src /root/dnsd-src
         export CARGO_TARGET_DIR=/root/cargo-target

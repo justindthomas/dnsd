@@ -14,16 +14,31 @@ dns:
       interface: wan
       protocols: [udp, tcp]
       allow_from: ["2001:db8:99::/64"]
+      # Synthesise AAAA for v4-only names on this listener —
+      # exercises the DNS64 path end-to-end in the test rig.
+      dns64: true
   forwarders:
     # iana.org is a stable, well-known domain that returns both
-    # A and AAAA — good for smoke + DNS64 tests.
+    # A and AAAA — good for smoke + DNS64 tests. The VM has real
+    # internet access via run-tests.sh's NAT setup, so 1.1.1.1
+    # is reachable.
     - domain: iana.org
       servers: [1.1.1.1]
   recursion:
-    # No iterative recursion in the smoke environment — we test a
-    # pure forwarder path. Iterative-recursion tests need reliable
-    # outbound to the root servers.
-    enabled: false
+    # Iterative recursion enabled. Upstream UDP queries run on the
+    # tokio blocking pool (see forwarder.rs query_one_udp) so the
+    # libvppcom usleep in vppcom_session_listen doesn't freeze the
+    # single-threaded runtime.
+    enabled: true
+    # run-tests.sh now sets up v6 MASQUERADE on the build host and
+    # VPP has a default v6 route; v6 upstream queries work.
+    ipv6_upstream: true
+    # DNSSEC mode: `passthrough` (honor upstream AD), `strip`
+    # (always AD=0), `validate` (local chain walk against
+    # trust_anchor; AD=1 on Secure, SERVFAIL+EDE 6 on Bogus,
+    # unsigned delegations are Insecure / AD=0).
+    dnssec: validate
+    trust_anchor: /etc/dnsd/root.key
   cache:
     max_entries: 1000
     negative_ttl: 60

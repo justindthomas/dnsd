@@ -9,12 +9,13 @@ Type=simple
 # binds listeners through VPP's session layer via vcl-rs.
 # The binary is side-loaded by run-tests.sh after first boot;
 # on-failure restart lets the unit pick it up once the SCP lands.
-ExecStart=/usr/local/bin/dnsd --config /etc/dnsd/router.yaml
+ExecStart=/usr/local/bin/dnsd --config /etc/dnsd/router.yaml --data-dir /var/lib/dnsd
 Restart=on-failure
 RestartSec=3
 # Give VPP's app-namespace bind in vpp-test's ExecStartPost a
 # moment to settle before trying to bind listeners.
 ExecStartPre=/bin/sleep 2
+ExecStartPre=/bin/mkdir -p /var/lib/dnsd
 Environment=RUST_LOG=info,dnsd=debug
 Environment=VCL_CONFIG=/etc/vpp/vcl.conf
 

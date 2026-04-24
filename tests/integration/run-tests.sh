@@ -37,6 +37,12 @@ TAP="${DNSD_TEST_TAP:-tap-dnsdtest}"
 NET="${DNSD_TEST_NET:-10.99.0}"
 HOST_IP="${DNSD_TEST_HOST_IP:-${NET}.1}"
 VM_IP="${DNSD_TEST_VM_IP:-${NET}.2}"
+# IPv6 uses the RFC 3849 documentation prefix internally and NATs
+# out to the host's global default. Not routable off-host; fine for
+# tests that want to verify v6 listener + v6 upstream paths.
+NET6="${DNSD_TEST_NET6:-2001:db8:99::}"
+HOST_IP6="${DNSD_TEST_HOST_IP6:-${NET6}1}"
+VM_IP6="${DNSD_TEST_VM_IP6:-${NET6}2}"
 
 # 2290 collides with an unrelated FreeBSD VM on the current build
 # host; 2293 is outside every slim-suite range we've seen
@@ -83,11 +89,43 @@ if ! ip link show "$BRIDGE" &>/dev/null; then
     sudo ip link set "$BRIDGE" up
 fi
 sudo ip addr add "$HOST_IP/24" dev "$BRIDGE" 2>/dev/null || true
+sudo ip -6 addr add "$HOST_IP6/64" dev "$BRIDGE" 2>/dev/null || true
 
 if ! ip link show "$TAP" &>/dev/null; then
     sudo ip tuntap add "$TAP" mode tap
     sudo ip link set "$TAP" up
     sudo ip link set "$TAP" master "$BRIDGE"
+fi
+
+# 2b. Give the VM internet access so dnsd can forward to real
+# upstreams (1.1.1.1 etc) during tests. Enable IP forwarding and
+# MASQUERADE packets leaving the test bridge out whatever the
+# host's default route is. Both are reverted in teardown() unless
+# --no-teardown is passed. (`|| true` is intentional: the saved
+# sysctl may already be 1, and duplicate iptables rules aren't
+# fatal — we check-then-add below.)
+#
+# Same story for IPv6 via ip6tables + the 2001:db8:99::/64 test
+# prefix → MASQUERADE onto the host's global v6 default. Requires a
+# working v6 upstream on the host. If the host has no v6 default
+# route this still runs (the MASQUERADE rule is harmless without
+# traffic hitting it) but recursive v6 upstream tests won't work.
+ORIG_IP_FORWARD="$(cat /proc/sys/net/ipv4/ip_forward)"
+sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+if ! sudo iptables -t nat -C POSTROUTING -s "${NET}.0/24" -j MASQUERADE 2>/dev/null; then
+    sudo iptables -t nat -A POSTROUTING -s "${NET}.0/24" -j MASQUERADE
+    NAT_RULE_ADDED=1
+else
+    NAT_RULE_ADDED=0
+fi
+
+ORIG_IP6_FORWARD="$(cat /proc/sys/net/ipv6/conf/all/forwarding)"
+sudo sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+if ! sudo ip6tables -t nat -C POSTROUTING -s "${NET6}/64" -j MASQUERADE 2>/dev/null; then
+    sudo ip6tables -t nat -A POSTROUTING -s "${NET6}/64" -j MASQUERADE
+    NAT6_RULE_ADDED=1
+else
+    NAT6_RULE_ADDED=0
 fi
 
 # 3. Clone golden.
@@ -110,8 +148,24 @@ teardown() {
         kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
         rm -f "$PIDFILE"
     fi
+    # Remove the NAT pieces we added in step 2b — only if we're
+    # the ones that added them, so stacked test runs don't yank
+    # each other's rules. Restore the previous ip_forward value.
+    if [ "${NAT_RULE_ADDED:-0}" = "1" ]; then
+        sudo iptables -t nat -D POSTROUTING -s "${NET}.0/24" -j MASQUERADE 2>/dev/null || true
+    fi
+    if [ "${NAT6_RULE_ADDED:-0}" = "1" ]; then
+        sudo ip6tables -t nat -D POSTROUTING -s "${NET6}/64" -j MASQUERADE 2>/dev/null || true
+    fi
+    if [ -n "${ORIG_IP_FORWARD:-}" ]; then
+        sudo sysctl -w "net.ipv4.ip_forward=${ORIG_IP_FORWARD}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${ORIG_IP6_FORWARD:-}" ]; then
+        sudo sysctl -w "net.ipv6.conf.all.forwarding=${ORIG_IP6_FORWARD}" >/dev/null 2>&1 || true
+    fi
     sudo ip link del "$TAP" 2>/dev/null || true
     sudo ip addr del "$HOST_IP/24" dev "$BRIDGE" 2>/dev/null || true
+    sudo ip -6 addr del "$HOST_IP6/64" dev "$BRIDGE" 2>/dev/null || true
     sudo ip link del "$BRIDGE" 2>/dev/null || true
 }
 trap teardown EXIT
@@ -184,7 +238,7 @@ fi
 # files / router.yaml without rebuilding the golden image.
 _ASSET_TAR="$WORK/assets-sideload.tar"
 ( cd "$ASSETS" && tar cf "$_ASSET_TAR" \
-    startup.conf vcl.conf commands.txt router.yaml \
+    startup.conf vcl.conf commands.txt router.yaml root.key \
     configure-vpp.sh vpp-test.service dnsd.service )
 $SCPX "$_ASSET_TAR" root@localhost:/tmp/assets-sideload.tar
 rm -f "$_ASSET_TAR"
@@ -199,6 +253,7 @@ install -m 644 /tmp/assets-sideload/startup.conf     /etc/vpp/startup.conf
 install -m 644 /tmp/assets-sideload/vcl.conf         /etc/vpp/vcl.conf
 install -m 644 /tmp/assets-sideload/commands.txt     /etc/vpp/commands.txt
 install -m 644 /tmp/assets-sideload/router.yaml      /etc/dnsd/router.yaml
+install -m 644 /tmp/assets-sideload/root.key         /etc/dnsd/root.key
 install -m 755 /tmp/assets-sideload/configure-vpp.sh /usr/local/bin/configure-vpp.sh
 install -m 644 /tmp/assets-sideload/vpp-test.service /etc/systemd/system/vpp-test.service
 install -m 644 /tmp/assets-sideload/dnsd.service     /etc/systemd/system/dnsd.service
@@ -240,6 +295,8 @@ done
 export DNSD_TEST_SSH_PORT="$SSH_PORT"
 export DNSD_TEST_VM_IP="$VM_IP"
 export DNSD_TEST_HOST_IP="$HOST_IP"
+export DNSD_TEST_VM_IP6="$VM_IP6"
+export DNSD_TEST_HOST_IP6="$HOST_IP6"
 export DNSD_TEST_SSH_KEY="$SSH_KEY"
 
 PYTEST_ARGS=("$SCRIPT_DIR/pytests")

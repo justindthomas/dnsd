@@ -19,10 +19,17 @@ HOST = "localhost"
 SSH_PORT = int(os.environ.get("DNSD_TEST_SSH_PORT", "2290"))
 VM_IP = os.environ.get("DNSD_TEST_VM_IP", "10.99.0.2")
 HOST_IP = os.environ.get("DNSD_TEST_HOST_IP", "10.99.0.1")
+VM_IP6 = os.environ.get("DNSD_TEST_VM_IP6", "2001:db8:99::2")
+HOST_IP6 = os.environ.get("DNSD_TEST_HOST_IP6", "2001:db8:99::1")
 SSH_KEY = os.environ.get(
     "DNSD_TEST_SSH_KEY",
     str(Path(__file__).resolve().parent.parent / ".work" / "ssh-key"),
 )
+
+
+def _socket_family(target: str):
+    """v4 literal → AF_INET, v6 literal → AF_INET6. No DNS lookup."""
+    return socket.AF_INET6 if ":" in target else socket.AF_INET
 
 
 def _ssh(cmd: str, *, input_text: str | None = None, timeout: int = 30) -> tuple[int, str, str]:
@@ -71,6 +78,55 @@ def dnsd_query(ssh):
     return _q
 
 
+@pytest.fixture(scope="session")
+def recursive_query(query_udp):
+    """Retry wrapper around `query_udp` for recursive-resolution tests.
+    The iterative recursor has transient failure modes under real-
+    internet conditions (upstream rate-limits, momentary timeouts,
+    glueless sub-walks that partially fail). Up to `attempts` tries
+    before a test sees the failure — keeps the suite stable without
+    masking real regressions. One success is enough."""
+    import time
+
+    def _q(name: str, *, rtype: int = 1, timeout: float = 10.0,
+           target=None, attempts: int = 3):
+        kwargs = {"rtype": rtype, "timeout": timeout}
+        if target is not None:
+            kwargs["target"] = target
+        last = None
+        for i in range(attempts):
+            r = query_udp(name, **kwargs)
+            if r.get("rcode") in ("NOERROR", "NXDOMAIN"):
+                return r
+            last = r
+            time.sleep(0.3)  # brief pause before retry
+        return last or {"error": "no response"}
+
+    return _q
+
+
+@pytest.fixture(scope="session")
+def wait_for_cache_entries(dnsd_query):
+    """Poll `cache --op stats` until `entries` reaches `min_entries`
+    or the deadline passes. moka's insert is async inside dnsd, so
+    a query returning a response doesn't guarantee the cache has
+    that entry yet — callers that need to assert on cache contents
+    should wait on this instead of a fixed sleep."""
+    import time
+
+    def _wait(min_entries: int = 1, timeout: float = 2.0) -> dict:
+        deadline = time.time() + timeout
+        last = {}
+        while time.time() < deadline:
+            last = dnsd_query("cache", "--op", "stats")
+            if last.get("entries", 0) >= min_entries:
+                return last
+            time.sleep(0.05)
+        return last
+
+    return _wait
+
+
 def _encode_name(name: str) -> bytes:
     parts = name.rstrip(".").split(".")
     return b"".join(bytes([len(p)]) + p.encode() for p in parts) + b"\x00"
@@ -92,14 +148,15 @@ def _parse_rcode(flags: int) -> str:
 @pytest.fixture(scope="session")
 def query_udp():
     """Fire a single DNS query from the build host at the VM's VPP
-    IP via UDP. Returns a dict with rcode + answer count."""
+    IP via UDP. Returns a dict with rcode + answer count. `target`
+    can be an IPv4 or IPv6 literal — socket family is inferred."""
     def _q(name: str, rtype: int = 1, timeout: float = 3.0, target: str = VM_IP):
         msg = (
             struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
             + _encode_name(name)
             + struct.pack(">HH", rtype, 1)
         )
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = socket.socket(_socket_family(target), socket.SOCK_DGRAM)
         s.settimeout(timeout)
         s.sendto(msg, (target, 53))
         try:
@@ -130,7 +187,7 @@ def query_tcp():
             + _encode_name(name)
             + struct.pack(">HH", rtype, 1)
         )
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = socket.socket(_socket_family(target), socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
             s.connect((target, 53))

@@ -42,6 +42,17 @@ $VPPCTL set interface state wan up
 $VPPCTL set interface ip address wan 10.99.0.2/24
 $VPPCTL set interface ip address wan 2001:db8:99::2/64
 
+# Default route → the host side of the test bridge. run-tests.sh
+# enables IP forwarding + MASQUERADE on the host, so this lets
+# dnsd's forwarder reach the real internet (1.1.1.1, etc.) via
+# VPP → tap → br-dnsdtest → host's default NIC.
+$VPPCTL ip route add 0.0.0.0/0 via 10.99.0.1
+
+# Same for IPv6 — default via the host's v6 address on the bridge.
+# run-tests.sh enables v6 forwarding + MASQUERADE through ip6tables
+# nat, so dnsd's recursor can reach AAAA root servers over v6.
+$VPPCTL ip route add ::/0 via 2001:db8:99::1
+
 # App-namespace binding — vcl-rs apps in the default namespace
 # can only see traffic on interfaces registered with the ns.
 idx=$($VPPCTL show interface wan 2>/dev/null | awk '/^wan/ {print $2}')
