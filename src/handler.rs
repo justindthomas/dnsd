@@ -50,9 +50,10 @@ pub trait DnsHandler: Send + Sync + 'static {
 }
 
 /// Stub handler: parses the query, mirrors the TXID + question section
-/// into a response with RCODE=REFUSED. Replaced by the real recursor
-/// in task #8. Until then imp-dnsd is a well-behaved sink — it answers
-/// (so clients don't retry indefinitely) without leaking anything.
+/// into a response with RCODE=REFUSED. Used by tests and as the
+/// disabled-mode handler when the operator turns recursion off — a
+/// well-behaved sink that answers (so clients don't retry indefinitely)
+/// without leaking anything.
 pub struct RefusedHandler;
 
 #[async_trait]
@@ -83,6 +84,55 @@ impl DnsHandler for RefusedHandler {
 
 /// Convenience: make any `Arc<T: DnsHandler>` work as `Arc<dyn DnsHandler>`.
 pub type SharedHandler = Arc<dyn DnsHandler>;
+
+/// Hot-swappable handler wrapper. Listener tasks hold an
+/// `Arc<LiveHandler>` (which IS a `DnsHandler` itself). On reload,
+/// `swap()` atomically replaces the inner handler — in-flight
+/// queries finish on the old handler, new queries go to the new
+/// one. Lock-free reads via `arc-swap`.
+///
+/// The inner `T` is parameterised so tests can put a `RefusedHandler`
+/// here without dragging in the full recursor.
+pub struct LiveHandler<T: DnsHandler> {
+    inner: arc_swap::ArcSwap<T>,
+}
+
+impl<T: DnsHandler> LiveHandler<T> {
+    pub fn new(initial: T) -> Self {
+        Self {
+            inner: arc_swap::ArcSwap::from_pointee(initial),
+        }
+    }
+
+    /// Atomically replace the inner handler. In-flight queries on
+    /// the old handler finish normally; new queries see the new
+    /// handler on their next `handle_bytes` call.
+    pub fn swap(&self, new: T) {
+        self.inner.store(Arc::new(new));
+    }
+
+    /// Snapshot of the current inner handler. Used in places that
+    /// want a temporary stable reference (e.g. for logging).
+    pub fn current(&self) -> Arc<T> {
+        self.inner.load_full()
+    }
+}
+
+#[async_trait]
+impl<T: DnsHandler> DnsHandler for LiveHandler<T> {
+    async fn handle_bytes(
+        &self,
+        query: &[u8],
+        peer: IpAddr,
+        ctx: &ListenerContext,
+    ) -> Option<Vec<u8>> {
+        // Snapshot the inner Arc so the dispatch is stable for the
+        // duration of this query, even if a concurrent reload swaps
+        // mid-call.
+        let h = self.inner.load_full();
+        h.handle_bytes(query, peer, ctx).await
+    }
+}
 
 #[cfg(test)]
 mod tests {

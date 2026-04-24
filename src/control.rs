@@ -77,12 +77,15 @@ pub struct ForwarderInfo {
 }
 
 /// Read-only view of state the control socket needs. Built once by
-/// `main.rs` after the RecursorHandler is constructed.
+/// `main.rs`. The forwarders pointer is wrapped in `ArcSwap` so a
+/// SIGHUP-triggered reload can publish a fresh forwarder table
+/// without coordinating with the control server thread — every
+/// `dnsd-query forwarders` snapshot reads the current Arc.
 #[derive(Clone)]
 pub struct ControlState {
     pub metrics: Arc<Metrics>,
     pub cache: Arc<DnsCache>,
-    pub forwarders: Arc<Forwarders>,
+    pub forwarders: Arc<arc_swap::ArcSwap<Forwarders>>,
 }
 
 pub struct ControlServer {
@@ -179,8 +182,11 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
             }
         }
         ControlRequest::Forwarders => {
+            // Snapshot the live forwarder table — reload swaps the
+            // inner Arc on SIGHUP, so we read each call fresh.
             let forwarders = state
                 .forwarders
+                .load()
                 .snapshot()
                 .into_iter()
                 .map(|(domain, servers)| ForwarderInfo {
