@@ -184,77 +184,132 @@ async fn async_main(args: Args, cfg: DnsConfig, _vcl_app: VclApp) -> Result<()> 
     // cert_source is 'acme' (not yet wired) or no TLS listeners.
     let tls_config = acme::server_config_from_dns(&cfg).context("loading TLS config")?;
 
-    let mut listener_tasks = Vec::new();
+    // Listener-bind retry loop. VPP can take a moment to finish
+    // wiring up the wan interface's FIB after dnsd starts (the
+    // address binding goes through `set interface ip address` in
+    // configure-vpp.sh which runs as VPP's ExecStartPost). Until
+    // then VCL bind returns SESSION_E_INVALID_NS because the local
+    // address isn't in any FIB. Retry every 200ms for up to 20s
+    // before giving up — by then either VPP is up or something is
+    // genuinely wrong and the operator should look. Each protocol
+    // is tracked independently so already-bound listeners aren't
+    // re-attempted.
+    use std::time::{Duration, Instant};
+    let bind_deadline = Instant::now() + Duration::from_secs(20);
+    let bind_backoff = Duration::from_millis(200);
+
+    let mut pending: Vec<(dnsd::config::Listener, &'static str)> = Vec::new();
     for listener_cfg in &cfg.listeners {
-        let name = listener_cfg.name.clone();
-        if listener_cfg.has_protocol("udp") {
-            match UdpListener::spawn(
-                listener_cfg.clone(),
-                reactor.clone(),
-                handler.clone(),
-                metrics.clone(),
-            )
-            .await
-            {
-                Ok(h) => listener_tasks.push(h),
-                Err(e) => tracing::error!(listener = %name, "UDP bind failed: {e}"),
-            }
-        }
-        if listener_cfg.has_protocol("tcp") {
-            match TcpListener::spawn(
-                listener_cfg.clone(),
-                reactor.clone(),
-                handler.clone(),
-                metrics.clone(),
-            )
-            .await
-            {
-                Ok(h) => listener_tasks.push(h),
-                Err(e) => tracing::error!(listener = %name, "TCP bind failed: {e}"),
-            }
-        }
-        if listener_cfg.has_protocol("dot") {
-            match tls_config.as_ref() {
-                Some(tls) => match DotListener::spawn(
-                    listener_cfg.clone(),
-                    reactor.clone(),
-                    handler.clone(),
-                    metrics.clone(),
-                    tls.clone(),
-                )
-                .await
-                {
-                    Ok(h) => listener_tasks.push(h),
-                    Err(e) => tracing::error!(listener = %name, "DoT bind failed: {e}"),
-                },
-                None => tracing::warn!(listener = %name, "DoT requested but no TLS config available"),
-            }
-        }
-        if listener_cfg.has_protocol("doh") {
-            match tls_config.as_ref() {
-                Some(tls) => match DohListener::spawn(
-                    listener_cfg.clone(),
-                    reactor.clone(),
-                    handler.clone(),
-                    metrics.clone(),
-                    tls.clone(),
-                )
-                .await
-                {
-                    Ok(h) => listener_tasks.push(h),
-                    Err(e) => tracing::error!(listener = %name, "DoH bind failed: {e}"),
-                },
-                None => tracing::warn!(listener = %name, "DoH requested but no TLS config available"),
+        for proto in ["udp", "tcp", "dot", "doh"] {
+            if listener_cfg.has_protocol(proto) {
+                pending.push((listener_cfg.clone(), proto));
             }
         }
     }
 
+    let mut listener_tasks = Vec::new();
+    let mut attempt: u32 = 0;
+    while !pending.is_empty() {
+        attempt += 1;
+        let mut still_pending = Vec::new();
+        for (lc, proto) in pending.drain(..) {
+            let name = lc.name.clone();
+            let result = match proto {
+                "udp" => UdpListener::spawn(
+                    lc.clone(),
+                    reactor.clone(),
+                    handler.clone(),
+                    metrics.clone(),
+                )
+                .await
+                .map(Some),
+                "tcp" => TcpListener::spawn(
+                    lc.clone(),
+                    reactor.clone(),
+                    handler.clone(),
+                    metrics.clone(),
+                )
+                .await
+                .map(Some),
+                "dot" => match tls_config.as_ref() {
+                    Some(tls) => DotListener::spawn(
+                        lc.clone(),
+                        reactor.clone(),
+                        handler.clone(),
+                        metrics.clone(),
+                        tls.clone(),
+                    )
+                    .await
+                    .map(Some),
+                    None => {
+                        tracing::warn!(
+                            listener = %name,
+                            "DoT requested but no TLS config available"
+                        );
+                        Ok(None) // give up on this protocol — TLS isn't a transient
+                    }
+                },
+                "doh" => match tls_config.as_ref() {
+                    Some(tls) => DohListener::spawn(
+                        lc.clone(),
+                        reactor.clone(),
+                        handler.clone(),
+                        metrics.clone(),
+                        tls.clone(),
+                    )
+                    .await
+                    .map(Some),
+                    None => {
+                        tracing::warn!(
+                            listener = %name,
+                            "DoH requested but no TLS config available"
+                        );
+                        Ok(None)
+                    }
+                },
+                _ => Ok(None),
+            };
+            match result {
+                Ok(Some(handle)) => listener_tasks.push(handle),
+                Ok(None) => {} // skipped (e.g. DoT/DoH without TLS)
+                Err(e) => {
+                    tracing::debug!(
+                        listener = %name,
+                        proto,
+                        attempt,
+                        "bind failed (will retry): {e}"
+                    );
+                    still_pending.push((lc, proto));
+                }
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() {
+            break;
+        }
+        if Instant::now() >= bind_deadline {
+            for (lc, proto) in &pending {
+                tracing::error!(
+                    listener = %lc.name,
+                    proto,
+                    "bind giving up after retry deadline — control socket stays up so operators can inspect"
+                );
+            }
+            break;
+        }
+        tokio::time::sleep(bind_backoff).await;
+    }
+
     if listener_tasks.is_empty() {
         tracing::warn!(
-            "dns.enabled=true but no listeners came up — check listener config"
+            "dns.enabled=true but no listeners came up — check VPP / FIB state"
         );
     } else {
-        tracing::info!(n = listener_tasks.len(), "listeners bound");
+        tracing::info!(
+            n = listener_tasks.len(),
+            attempts = attempt,
+            "listeners bound"
+        );
     }
 
     wait_for_exit(&args.control_socket).await;
