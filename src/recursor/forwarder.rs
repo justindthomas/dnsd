@@ -220,9 +220,17 @@ impl UpstreamClient {
             udp_resp
         };
 
-        // Restore the client's TXID before returning.
-        let mut resp = final_resp;
-        resp[0..2].copy_from_slice(&client_txid.to_be_bytes());
+        // Parse, lowercase every owner name (kills the 0x20-randomised
+        // case leak from upstream into the client response), restore
+        // the client's TXID, re-serialise. The case-leak fix matches
+        // BIND/Unbound; see `normalize` for the rationale.
+        let mut parsed = Message::from_bytes(&final_resp)
+            .context("parse upstream response for normalisation")?;
+        super::normalize::lowercase_response_names(&mut parsed);
+        parsed.set_id(client_txid);
+        let resp = parsed
+            .to_vec()
+            .context("re-encode normalised forwarder response")?;
         Ok(resp)
     }
 

@@ -40,7 +40,7 @@ use hickory_proto::rr::dnssec::rdata::{DNSSECRData, RRSIG};
 
 use anyhow::{anyhow, Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::rdata::{A, AAAA, NS};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 
@@ -242,8 +242,14 @@ impl IterativeResolver {
             response.add_name_server(r.clone());
         }
 
+        // Lowercase every RR owner name before caching/serialising —
+        // upstream's 0x20-randomised echo otherwise leaks all the way
+        // to the client. See `normalize` for the rationale.
+        super::normalize::lowercase_response_names(&mut response);
         let bytes = response.to_vec().context("encode iterative response")?;
-        // Cache under the original question (lowercased).
+        // Cache under the original question (lowercased). The
+        // response bytes themselves are now also lowercased so cache
+        // replays don't re-leak.
         let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
         self.cache.put(key, &response, bytes.clone()).await;
         Ok((bytes, chain))
@@ -269,13 +275,19 @@ impl IterativeResolver {
     ) -> Result<Message> {
         budget.referral()?;
 
-        // Current working set of name-server IPs to query. Start
-        // at the roots; each referral replaces this. Snapshot the
-        // live root set under the RwLock so a concurrent re-prime
-        // doesn't tear the Vec mid-walk.
-        let mut ns_ips: Vec<IpAddr> = self.roots.read().unwrap().clone();
-        // Current zone we're talking to. Starts at the root ".".
-        let mut current_zone = Name::root();
+        // Current working set of name-server IPs to query. We try to
+        // start at the closest *cached* zone whose NS set we know —
+        // for `cnn.com` that's typically `com.` once we've talked to
+        // any other .com domain in the recent past. Falls back to the
+        // root when nothing's cached. Each referral replaces both.
+        let (mut current_zone, mut ns_ips) = self
+            .closest_cached_zone(qname, qclass)
+            .await
+            .unwrap_or_else(|| {
+                // Snapshot the live root set under the RwLock so a
+                // concurrent re-prime doesn't tear the Vec mid-walk.
+                (Name::root(), self.roots.read().unwrap().clone())
+            });
 
         loop {
             // Send the query to one of the current NS IPs. The
@@ -336,6 +348,15 @@ impl IterativeResolver {
                     // delegation) can use these addresses without
                     // re-traversing from the root.
                     self.cache_glue(&glue).await;
+
+                    // Cache the NS record set for the new zone so a
+                    // subsequent walk for any name under that zone can
+                    // skip the root + parent referrals and start
+                    // directly from this delegation. Without this,
+                    // every cold query re-walks from `.` even when
+                    // its parent zone's NS records are well-known
+                    // and freshly cached. BIND/Unbound do the same.
+                    self.cache_zone_ns(&current_zone, &ns_records).await;
 
                     // Extract DS records + their RRSIGs from the
                     // authority section — the validator needs them
@@ -539,6 +560,81 @@ impl IterativeResolver {
             }
         }
         out
+    }
+
+    /// Cache a freshly-received NS record set for a zone, so the
+    /// next walk for any name under that zone can short-circuit to
+    /// the closest cached delegation. Called from the referral arm
+    /// of `walk()`. The cached message is synthetic — it carries the
+    /// NS records in the answer section under (`zone`, NS, IN), and
+    /// inherits the minimum NS-record TTL so cache eviction follows
+    /// what the parent zone signalled.
+    async fn cache_zone_ns(&self, zone: &Name, ns_records: &[Record]) {
+        let owners_match: Vec<&Record> = ns_records
+            .iter()
+            .filter(|r| r.record_type() == RecordType::NS && r.name() == zone)
+            .collect();
+        if owners_match.is_empty() {
+            return;
+        }
+        let mut msg = Message::new();
+        msg.set_id(0);
+        msg.set_message_type(MessageType::Response);
+        msg.set_op_code(OpCode::Query);
+        msg.set_response_code(ResponseCode::NoError);
+        let mut q = Query::query(zone.clone(), RecordType::NS);
+        q.set_query_class(DNSClass::IN);
+        msg.add_query(q);
+        for r in &owners_match {
+            msg.add_answer((*r).clone());
+        }
+        let Ok(bytes) = msg.to_vec() else { return };
+        let key = CacheKey::new(zone, RecordType::NS, DNSClass::IN);
+        self.cache.put(key, &msg, bytes).await;
+    }
+
+    /// Find the closest ancestor zone of `qname` whose NS record set
+    /// AND at least one NS-target IP are still in cache. Lets a fresh
+    /// walk skip the root + parent referrals. Returns `None` when
+    /// nothing's cached — caller falls back to the root.
+    ///
+    /// This is the dnsd analogue of BIND's "closest known delegation"
+    /// optimisation. It only takes effect once the cache has warmed
+    /// up; cold start still walks from `.`.
+    async fn closest_cached_zone(
+        &self,
+        qname: &Name,
+        qclass: DNSClass,
+    ) -> Option<(Name, Vec<IpAddr>)> {
+        let mut zone = qname.clone();
+        // Walk up label-by-label. Stop above root (a 0-label parent
+        // of root would underflow). Also skip the qname itself —
+        // querying its own NS would be circular for unresolved names.
+        if zone.num_labels() > 0 {
+            zone = zone.base_name();
+        }
+        loop {
+            let key = CacheKey::new(&zone, RecordType::NS, qclass);
+            if let Some(bytes) = self.cache.get(&key).await {
+                if let Ok(msg) = Message::from_bytes(&bytes) {
+                    let mut ips = Vec::new();
+                    for ans in msg.answers() {
+                        if let Some(RData::NS(NS(target))) = ans.data() {
+                            ips.extend(self.cached_ns_ips(target).await);
+                        }
+                    }
+                    ips.sort();
+                    ips.dedup();
+                    if !ips.is_empty() {
+                        return Some((zone, ips));
+                    }
+                }
+            }
+            if zone.is_root() {
+                return None;
+            }
+            zone = zone.base_name();
+        }
     }
 
     /// Fetch an authoritative root NS set — query `./NS` at one of

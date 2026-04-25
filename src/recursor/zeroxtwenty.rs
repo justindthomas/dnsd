@@ -11,11 +11,11 @@
 //! gets ~1024× the spoofer's work on top of the TXID + source-port
 //! defences already in place.
 //!
-//! We do NOT normalise the response back to lowercase before handing
-//! it to the client. DNS name comparison is case-insensitive, and
-//! every non-broken client handles the mixed case fine; re-writing
-//! would require recomputing compression pointers which doesn't buy
-//! us anything.
+//! Response normalisation back to lowercase before handing to the
+//! client lives in `normalize::lowercase_response_names` — applied
+//! by both the iterative and forwarder paths once the response is
+//! verified. Match what BIND/Unbound/Knot do, so users see clean
+//! `cnn.com.` instead of whatever case the upstream echoed.
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
@@ -39,16 +39,37 @@ pub fn encode(query: &mut [u8]) -> Result<Vec<u8>> {
     Ok(query[range].to_vec())
 }
 
-/// Verify the question name in `response` echoes the `expected` case
-/// pattern exactly. Returns Ok on match, Err otherwise.
+/// Verify the question name in `response` echoes the `expected`
+/// pattern. Letter bytes must match `expected` *case-insensitively* —
+/// some authoritatives (and middleboxes) lowercase the qname before
+/// echoing, which wouldn't be a spoof but the strict check would
+/// reject. Length bytes (label-length prefixes) and non-letter bytes
+/// must still match exactly. The off-path attacker still has to know
+/// the layout + content, just not the random case of letters; we keep
+/// the entropy from TXID + source-port randomisation, which together
+/// remain plenty against off-path injection.
 pub fn verify(response: &[u8], expected: &[u8]) -> Result<()> {
     let range = qname_byte_range(response)?;
     let got = &response[range];
-    if got == expected {
+    if got.len() != expected.len() {
+        return Err(anyhow!(
+            "0x20 length mismatch: sent {} bytes, got {} bytes",
+            expected.len(),
+            got.len()
+        ));
+    }
+    let ok = got.iter().zip(expected.iter()).all(|(g, e)| {
+        if e.is_ascii_alphabetic() {
+            g.eq_ignore_ascii_case(e)
+        } else {
+            g == e
+        }
+    });
+    if ok {
         Ok(())
     } else {
         Err(anyhow!(
-            "0x20 case mismatch (possible spoof): sent {:?}, got {:?}",
+            "0x20 mismatch (possible spoof): sent {:?}, got {:?}",
             String::from_utf8_lossy(expected),
             String::from_utf8_lossy(got),
         ))
@@ -122,18 +143,52 @@ mod tests {
     }
 
     #[test]
-    fn verify_detects_case_mismatch() {
+    fn verify_passes_on_byte_exact_echo() {
         let mut q = build_query("example.com.");
         let sent = encode(&mut q).unwrap();
-
-        // Construct a "response" that just echoes the query
-        // question section — identical bytes mean verify passes.
         assert!(verify(&q, &sent).is_ok());
+    }
 
-        // Flip one letter's case in the "response" → verify fails.
+    #[test]
+    fn verify_passes_on_case_only_mutation() {
+        // An authoritative that lowercases (or otherwise re-cases)
+        // before echoing should NOT be treated as a spoof. The byte
+        // length stays the same; only ASCII letter case differs.
+        let mut q = build_query("example.com.");
+        let sent = encode(&mut q).unwrap();
+        let mut lowered = q.clone();
+        let letter_pos = 12 + 1;
+        lowered[letter_pos] = lowered[letter_pos].to_ascii_lowercase();
+        // sent had random case; lowered now diverges in case from sent.
+        assert!(verify(&lowered, &sent).is_ok());
+    }
+
+    #[test]
+    fn verify_detects_label_length_mutation() {
+        // Length bytes (label-length prefixes) must still match
+        // exactly — a label-length change is structural, not just
+        // cosmetic, and a spoof attempt would have to guess them too.
+        let mut q = build_query("example.com.");
+        let sent = encode(&mut q).unwrap();
         let mut tampered = q.clone();
-        let letter_pos = 12 + 1; // first byte after the length 0x07
-        tampered[letter_pos] ^= 0x20;
+        tampered[12] = tampered[12].wrapping_add(1); // mutate length
+        assert!(verify(&tampered, &sent).is_err());
+    }
+
+    #[test]
+    fn verify_detects_non_letter_mutation() {
+        // Mutating a non-letter byte (e.g. a digit) inside a label is
+        // also detected — only ASCII letters are allowed to differ.
+        let mut q = build_query("ex2mple.com.");
+        let sent = encode(&mut q).unwrap();
+        let mut tampered = q.clone();
+        // Find the '2' in "ex2mple" and bump it to '3'.
+        for b in tampered.iter_mut() {
+            if *b == b'2' {
+                *b = b'3';
+                break;
+            }
+        }
         assert!(verify(&tampered, &sent).is_err());
     }
 

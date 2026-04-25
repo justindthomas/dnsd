@@ -26,6 +26,7 @@ pub mod forwarder;
 pub mod dns64;
 pub mod dnssec;
 pub mod iterative;
+pub mod normalize;
 pub mod rrl;
 pub mod zeroxtwenty;
 
