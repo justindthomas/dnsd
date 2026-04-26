@@ -24,21 +24,38 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
-// VclStream has its own `async fn read_exact` / `async fn write_all`
-// on `&self` that Rust picks before any trait impl; AsyncWriteExt is
-// pulled in only so we can call `.flush()` (no inherent flush on
-// VclStream since VCL has no userspace buffer).
+use tokio::sync::oneshot;
 use vcl_rs::{query_tcp_dns_sync, query_udp_sync, VclReactor};
-
-// `VclReactor` is kept in the `new()` signature for API stability —
-// dnsd's RecursorHandler still hands one in — but the sync upstream
-// paths don't need it. `#[allow(dead_code)]` keeps the field around
-// for future use without compiler noise.
 
 use crate::config::Forwarder as ForwarderCfg;
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
 const MAX_TCP_MESSAGE: usize = 65535;
+
+/// Size of the dedicated VCL worker thread pool. Each worker is a
+/// long-lived `std::thread` that calls `vppcom_worker_register` once
+/// at start, then loops on the command channel. libvppcom 25.10's
+/// session/worker model requires every session op (create, bind,
+/// sendto, recvfrom, close) to run on the OS thread that owns the
+/// worker context. Tokio's blocking pool reuses threads across tasks
+/// in a way that violates that — `vppcom_session_create` GP-faults on
+/// `__vcl_worker_index` arithmetic when threads aren't registered
+/// against a live worker. We bypass tokio's pool entirely for upstream
+/// queries.
+///
+/// Sized to fit under libvppcom's per-app worker cap (defaults to 16
+/// in 25.10, with worker-0 already taken by `VclApp::init` on the
+/// main thread). 12 here leaves headroom for the listener side's
+/// reactor + a couple of TLS handshake workers if/when we add a DoT/
+/// DoH server-side path that uses VCL transport. The worker that
+/// can't register simply exits; the effective pool shrinks but the
+/// process keeps running.
+const UPSTREAM_WORKERS: usize = 12;
+
+/// Bound on the in-flight command queue. Each command is small (a few
+/// hundred bytes for the wire query plus addresses); 256 is plenty
+/// for a home-router workload and caps memory in pathological cases.
+const UPSTREAM_QUEUE_DEPTH: usize = 256;
 
 #[derive(Clone)]
 pub struct Forwarders {
@@ -109,9 +126,33 @@ fn is_suffix(name: &Name, suffix: &Name) -> bool {
     suffix.zone_of(name)
 }
 
+/// One unit of work for a worker thread. The worker calls
+/// `query_udp_sync` / `query_tcp_dns_sync` from vcl-rs and sends the
+/// result back via `reply`. The query bytes / source / timeout are
+/// owned values so the worker thread doesn't need to borrow from the
+/// async caller.
+enum UpstreamCmd {
+    Udp {
+        peer: SocketAddr,
+        source: Option<std::net::IpAddr>,
+        query: Vec<u8>,
+        timeout: Duration,
+        reply: oneshot::Sender<vcl_rs::error::Result<(Vec<u8>, SocketAddr)>>,
+    },
+    Tcp {
+        peer: SocketAddr,
+        source: Option<std::net::IpAddr>,
+        query: Vec<u8>,
+        timeout: Duration,
+        reply: oneshot::Sender<vcl_rs::error::Result<Vec<u8>>>,
+    },
+}
+
 pub struct UpstreamClient {
-    #[allow(dead_code)]
-    reactor: VclReactor,
+    /// Sender side of the work queue. Cheap to clone (Arc internally
+    /// in async-channel); we keep one and pass it around. Workers
+    /// hold the matching Receiver clones.
+    cmd_tx: async_channel::Sender<UpstreamCmd>,
     timeout: Duration,
     /// Explicit source IP for outgoing v4 upstream queries. When
     /// None, vcl-rs binds 0.0.0.0:<random> and relies on VPP's
@@ -123,6 +164,54 @@ pub struct UpstreamClient {
     source_v4: Option<std::net::Ipv4Addr>,
     /// Same idea for v6 upstream queries.
     source_v6: Option<std::net::Ipv6Addr>,
+    /// Held to keep the type API stable (callers still construct
+    /// with a reactor) and to keep VPP's session layer alive for the
+    /// listener side via reference counting; the upstream path
+    /// itself doesn't go through this reactor.
+    #[allow(dead_code)]
+    reactor: VclReactor,
+}
+
+/// Long-lived worker thread body. Registers as a VCL worker once at
+/// startup, then loops on the command channel until the channel is
+/// closed (i.e. UpstreamClient is dropped on shutdown). All VCL
+/// session ops for upstream queries happen here; the thread is
+/// dedicated and never migrates work to another OS thread, so
+/// libvppcom's worker-per-thread invariant holds.
+fn upstream_worker(rx: async_channel::Receiver<UpstreamCmd>, worker_no: usize) {
+    vcl_rs::register_worker_thread();
+    // libvppcom 25.10 caps workers per app — past that,
+    // vppcom_worker_register returns -17 and leaves __vcl_worker_index
+    // at -1. A thread in that state would GP-fault inside
+    // vppcom_session_create on the very first command, taking down
+    // the whole process. Bail this thread out instead — the effective
+    // pool is just smaller. The remaining workers still drain the
+    // queue.
+    let vcl_idx = unsafe { vcl_rs::ffi::vppcom_worker_index() };
+    if vcl_idx < 0 {
+        tracing::warn!(
+            worker_no,
+            "upstream worker registration failed — exiting (effective pool shrinks by one)"
+        );
+        return;
+    }
+    tracing::debug!(worker_no, vcl_idx, "upstream worker thread started");
+    while let Ok(cmd) = rx.recv_blocking() {
+        match cmd {
+            UpstreamCmd::Udp { peer, source, query, timeout, reply } => {
+                let res = query_udp_sync(peer, source, &query, timeout);
+                let _ = reply.send(res);
+            }
+            UpstreamCmd::Tcp { peer, source, query, timeout, reply } => {
+                let res = query_tcp_dns_sync(peer, source, &query, timeout);
+                let _ = reply.send(res);
+            }
+        }
+    }
+    tracing::debug!(worker_no, "upstream worker thread exiting");
+    unsafe {
+        vcl_rs::ffi::vppcom_worker_unregister();
+    }
 }
 
 impl UpstreamClient {
@@ -130,7 +219,21 @@ impl UpstreamClient {
         let timeout = Duration::from_millis(
             timeout_ms.map(|t| t as u64).unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         );
+        let (cmd_tx, cmd_rx) =
+            async_channel::bounded::<UpstreamCmd>(UPSTREAM_QUEUE_DEPTH);
+        for i in 0..UPSTREAM_WORKERS {
+            let rx = cmd_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("dnsd-up-{i:02}"))
+                .spawn(move || upstream_worker(rx, i))
+                .expect("spawn upstream worker thread");
+        }
+        // Drop our local Receiver so the worker clones are the only
+        // consumers. Channel will close cleanly when cmd_tx is dropped
+        // (i.e. when UpstreamClient drops at shutdown).
+        drop(cmd_rx);
         Self {
+            cmd_tx,
             reactor,
             timeout,
             source_v4: None,
@@ -241,24 +344,28 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        // Upstream UDP queries run on the tokio blocking pool via
-        // `query_udp_sync` — VCL's `vppcom_session_listen` blocks the
-        // calling thread in a usleep loop (see
-        // project_dnsd_vcl_threading.md note 5), which would freeze the
-        // single-threaded runtime under recursor load. Offloading to a
-        // blocking thread keeps the reactor + listener tasks
-        // responsive, and each spawn_blocking thread is already VCL-
-        // registered via `on_thread_start` in main.rs.
-        let peer_addr = peer;
-        let query_vec = query.to_vec();
-        let timeout = self.timeout;
-        let source = self.source_for(peer);
-        let (resp, from) = tokio::task::spawn_blocking(move || {
-            query_udp_sync(peer_addr, source, &query_vec, timeout)
-        })
-        .await
-        .with_context(|| format!("blocking-pool join for upstream {peer}"))?
-        .with_context(|| format!("upstream UDP {peer}"))?;
+        // Upstream UDP queries dispatch to a dedicated VCL worker
+        // thread via the command channel. See `UPSTREAM_WORKERS` for
+        // why we don't use tokio's blocking pool: libvppcom 25.10
+        // requires every session op to run on the OS thread that
+        // owns the worker context, and tokio's blocking pool makes
+        // that invariant hard to keep.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = UpstreamCmd::Udp {
+            peer,
+            source: self.source_for(peer),
+            query: query.to_vec(),
+            timeout: self.timeout,
+            reply: reply_tx,
+        };
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| anyhow!("upstream worker pool channel closed"))?;
+        let (resp, from) = reply_rx
+            .await
+            .map_err(|_| anyhow!("upstream worker dropped reply channel for {peer}"))?
+            .with_context(|| format!("upstream UDP {peer}"))?;
 
         if from.ip() != peer.ip() {
             return Err(anyhow!(
@@ -282,13 +389,8 @@ impl UpstreamClient {
 
     /// Send one query to `peer` over TCP (RFC 1035 §4.2.2 2-byte
     /// length framing). Used both for TC-fallback and for forwarders
-    /// configured as TCP-only upstreams.
-    ///
-    /// Runs on the tokio blocking pool via `query_tcp_dns_sync` for
-    /// the same reason as UDP: `VclStream` cleanup in its Drop impl
-    /// synchronously calls into `vcl_session_cleanup`, which blocks
-    /// the main thread under recursor load (see
-    /// project_dnsd_vcl_threading.md note 5).
+    /// configured as TCP-only upstreams. Dispatches to the same
+    /// dedicated VCL worker pool as UDP — see `UPSTREAM_WORKERS`.
     pub async fn query_one_tcp(
         &self,
         peer: SocketAddr,
@@ -296,16 +398,24 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        let peer_addr = peer;
-        let query_vec = query.to_vec();
-        let timeout = self.timeout;
-        let source = self.source_for(peer);
-        let resp = tokio::task::spawn_blocking(move || {
-            query_tcp_dns_sync(peer_addr, source, &query_vec, timeout)
-        })
-        .await
-        .with_context(|| format!("blocking-pool join for TCP upstream {peer}"))?
-        .with_context(|| format!("upstream TCP {peer}"))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = UpstreamCmd::Tcp {
+            peer,
+            source: self.source_for(peer),
+            query: query.to_vec(),
+            timeout: self.timeout,
+            reply: reply_tx,
+        };
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| anyhow!("upstream worker pool channel closed"))?;
+        let resp = reply_rx
+            .await
+            .map_err(|_| {
+                anyhow!("upstream worker dropped reply channel for TCP {peer}")
+            })?
+            .with_context(|| format!("upstream TCP {peer}"))?;
 
         if resp.len() < 12 {
             return Err(anyhow!("short upstream TCP response ({} bytes)", resp.len()));

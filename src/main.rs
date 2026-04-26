@@ -30,7 +30,20 @@ use dnsd::handler::{AclSwap, CtxSwap, ListenerContext, LiveHandler, SharedHandle
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
 use dnsd::recursor::{DnsCache, Forwarders, RecursorHandler};
-use vcl_rs::{register_worker_thread, VclApp, VclReactor};
+use vcl_rs::{VclApp, VclReactor};
+
+// VCL ops do NOT go through tokio's blocking pool. libvppcom 25.10
+// pins each session to the OS thread that registered the worker
+// context, and tokio's blocking pool reuses threads in a way that
+// breaks that pin (`vppcom_session_create` GP-faults on
+// `__vcl_worker_index` arithmetic when the calling thread isn't
+// registered against a live worker). Upstream UDP/TCP queries
+// dispatch to a dedicated long-lived `std::thread` worker pool
+// inside `UpstreamClient`; the listener side runs on the main
+// runtime thread (worker-0, registered by `VclApp::init`). No
+// `on_thread_start` registration callback here — if you find
+// yourself wanting to add `spawn_blocking` for VCL work, use the
+// upstream worker pool pattern instead.
 
 /// Identity of a single bound listener — what the diff-on-reload
 /// path uses to decide "same listener, leave alone" vs "addr/port/
@@ -124,27 +137,34 @@ fn main() -> Result<()> {
     // worker's `on_thread_start` needs to call `vppcom_worker_register`
     // which itself requires `vppcom_app_create` (i.e. VclApp::init) to
     // have run. Registering a worker before app-create SEGVs libvppcom.
+    // Drop order at function exit is reverse declaration order.
+    // We need the runtime (and everything it owns — listener tasks,
+    // RecursorHandler, UpstreamClient, the cmd channel feeding the
+    // dedicated worker threads) to drop BEFORE `vcl_app` so that
+    // `vppcom_app_destroy` runs after every VCL session is already
+    // closed. If we did it the other way, the worker threads would
+    // still be in their recv loop holding sessions when libvppcom
+    // tears the app down — and the SIGTERM-triggered shutdown wedges.
+    // Hence: declare `vcl_app` first (drops last), then `runtime`.
     let vcl_app = VclApp::init("dnsd")
         .with_context(|| "VclApp::init — is VPP up and vcl.conf readable?")?;
 
-    // VCL has a worker-per-thread model: every session is owned by the
-    // thread that created it, and cross-thread operations on that
-    // session return VPPCOM_EBADFD (-77). Tokio's default multi-thread
-    // runtime work-steals tasks between workers, which breaks that
-    // invariant. For the v1 standalone path we use a single-threaded
-    // runtime so the main thread (already registered as VCL worker-0
-    // by VclApp::init) owns every listener and every spawned task.
-    //
-    // `spawn_blocking` tasks still land on a pool thread; those re-
-    // register via `on_thread_start`. But no VCL session ever crosses
-    // the boundary — the blocking pool is only used for CPU work and
-    // synchronous file I/O, not for VCL session access.
+    // Single-threaded runtime so the main thread (worker-0,
+    // registered implicitly by VclApp::init above) owns the listener
+    // and control-socket tasks for the whole process. Upstream
+    // queries don't run on this runtime's thread — see
+    // UpstreamClient's worker pool.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .on_thread_start(register_worker_thread)
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(async_main(args, cfg, vcl_app))
+    let result = runtime.block_on(async_main(args, cfg));
+    // Explicit drops to make the order obvious to a future reader
+    // and to guarantee it even if something later inserts another
+    // local between `vcl_app` and `runtime`.
+    drop(runtime);
+    drop(vcl_app);
+    result
 }
 
 async fn run_control_only(args: Args, cfg: DnsConfig) -> Result<()> {
@@ -175,7 +195,7 @@ async fn run_control_only(args: Args, cfg: DnsConfig) -> Result<()> {
     Ok(())
 }
 
-async fn async_main(args: Args, cfg: DnsConfig, _vcl_app: VclApp) -> Result<()> {
+async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
     let metrics = Arc::new(Metrics::default());
 
     // Ensure the persistent data dir exists — the iterative recursor

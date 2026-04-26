@@ -42,6 +42,12 @@ moka = { version = "0.12", features = ["future"] }
 governor = "0.7"
 nonzero_ext = "0.3"
 
+# MPMC channel for the upstream-query worker pool. The pool is a fixed
+# set of std::thread workers (libvppcom's worker model is one VCL
+# worker per OS thread, lifetime-bound — tokio's blocking pool reuses
+# threads and miscarries that), so the work queue lives outside tokio.
+async-channel = "2"
+
 # Config + IO
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

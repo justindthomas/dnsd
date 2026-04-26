@@ -51,8 +51,21 @@ use crate::recursor::forwarder::UpstreamClient;
 /// Default per-query budget. Sized to resolve even worst-case
 /// glueless chains without running away.
 pub const DEFAULT_MAX_DEPTH: u32 = 16;
-pub const DEFAULT_MAX_QUERIES: u32 = 100;
+/// 256 instead of the older 100 because `query_ns_set` now races
+/// up to `MAX_PARALLEL_NS_QUERIES` IPs per delegation step (each
+/// counts against the budget), and a deep glueless chain can fan
+/// that out across many sub-walks. 100 was tuned for the old
+/// serial-with-timeout walk and ran out on real names like
+/// `slashdot.org`.
+pub const DEFAULT_MAX_QUERIES: u32 = 256;
 pub const DEFAULT_MAX_CNAME: u32 = 8;
+
+/// Maximum NS IPs raced in parallel per delegation step. The whole
+/// point of racing is to converge on the fastest responder; past
+/// 2-3 in flight you just burn upstream bandwidth and budget for
+/// negligible latency wins. BIND and Unbound both target ~2-3
+/// concurrent NS queries per step.
+const MAX_PARALLEL_NS_QUERIES: usize = 3;
 
 /// A single delegation step seen during a walk, in enough detail
 /// for a DNSSEC validator to reconstruct the chain of trust afterwards.
@@ -424,6 +437,10 @@ impl IterativeResolver {
         // load distributed when the in-flight set is small.
         use rand::seq::SliceRandom;
         order.shuffle(&mut rand::thread_rng());
+        // Cap the in-flight set. Racing every NS IP fans out 13+
+        // queries at the root, 6+ at the TLD, etc. — the budget runs
+        // out on legitimate names. BIND/Unbound hold ~2-3 concurrent.
+        order.truncate(MAX_PARALLEL_NS_QUERIES);
 
         let wire = build_query(qname, qtype, qclass, self.dnssec_ok)?;
 
