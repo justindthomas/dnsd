@@ -397,8 +397,18 @@ impl IterativeResolver {
         }
     }
 
-    /// Try each NS IP in `ns_ips` in a shuffled order until one
-    /// responds. Increments budget per query; bails on exhaustion.
+    /// Race queries to every NS IP in `ns_ips` in parallel and take
+    /// the first valid response. Matches what BIND/Unbound do:
+    /// serial-with-timeout (the previous behaviour) burns
+    /// `upstream_timeout_ms` per slow NS before falling through, so
+    /// a single high-latency root or TLD server would cause the
+    /// whole walk to miss the client's dig timeout. Parallel races
+    /// converge on the *fastest* responder instead.
+    ///
+    /// Budget cost: one per NS IP we actually queried. The 2.5s
+    /// per-query timeout is still in effect inside the UpstreamClient
+    /// — it bounds how long an unresponsive server can hold a slot
+    /// before giving up.
     async fn query_ns_set(
         &self,
         ns_ips: &[IpAddr],
@@ -407,25 +417,40 @@ impl IterativeResolver {
         qclass: DNSClass,
         budget: &mut Budget,
     ) -> Result<Message> {
-        use rand::seq::SliceRandom;
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         let mut order: Vec<IpAddr> = ns_ips.to_vec();
+        // Shuffle so we don't always hammer the same first NS — keeps
+        // load distributed when the in-flight set is small.
+        use rand::seq::SliceRandom;
         order.shuffle(&mut rand::thread_rng());
 
         let wire = build_query(qname, qtype, qclass, self.dnssec_ok)?;
 
-        let mut last_err = None;
-        for ip in order {
+        let mut in_flight = FuturesUnordered::new();
+        for ip in &order {
+            // Budget guard outside the future so we never spin up a
+            // task we can't account for.
             budget.query()?;
-            match self.upstream.query(&[ip], &wire).await {
-                Ok(resp_bytes) => {
-                    match Message::from_bytes(&resp_bytes) {
-                        Ok(m) => return Ok(m),
-                        Err(e) => {
-                            tracing::debug!(%ip, "iterative parse: {e}");
-                            last_err = Some(anyhow!(e));
-                        }
+            let upstream = self.upstream.clone();
+            let wire = wire.clone();
+            let ip = *ip;
+            in_flight.push(async move {
+                let res = upstream.query(&[ip], &wire).await;
+                (ip, res)
+            });
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        while let Some((ip, res)) = in_flight.next().await {
+            match res {
+                Ok(resp_bytes) => match Message::from_bytes(&resp_bytes) {
+                    Ok(m) => return Ok(m),
+                    Err(e) => {
+                        tracing::debug!(%ip, "iterative parse: {e}");
+                        last_err = Some(anyhow!(e));
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!(%ip, "iterative upstream: {e}");
                     last_err = Some(e);
