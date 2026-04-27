@@ -40,9 +40,11 @@
 //! maps to `dnssec: validate`) for backward compat with pre-v1
 //! router.yaml.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::RwLock;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context as _, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -58,6 +60,103 @@ use crate::recursor::iterative::WalkChain;
 /// Clock-skew tolerance for RRSIG validity-window checks. Matches
 /// common recursor defaults (BIND/Unbound both ~300 s).
 const CLOCK_SKEW: Duration = Duration::from_secs(300);
+
+/// Per-zone DNSKEY cache. Validated keys are reused across queries
+/// until min(DNSKEY TTL, MAX_POSITIVE_TTL) so a single .com query
+/// doesn't re-fetch root + .com DNSKEYs each time. The negative
+/// half marks zones whose DNSKEY fetch failed (timeout / transport
+/// error) as "treat as Insecure for NEGATIVE_TTL", so a zone like
+/// arin.net (whose NSes RRL→TC=1 + our VPP TCP fallback is broken)
+/// stops eating a 5-second deadline on every single query.
+const POSITIVE_CACHE_CAP: usize = 256;
+const NEGATIVE_CACHE_CAP: usize = 256;
+const NEGATIVE_TTL: Duration = Duration::from_secs(300);
+const MIN_POSITIVE_TTL: Duration = Duration::from_secs(60);
+const MAX_POSITIVE_TTL: Duration = Duration::from_secs(86_400);
+
+#[derive(Clone)]
+struct PositiveEntry {
+    keys: Vec<DNSKEY>,
+    expiry: Instant,
+}
+
+pub struct DnskeyCache {
+    positive: RwLock<HashMap<Name, PositiveEntry>>,
+    negative: RwLock<HashMap<Name, Instant>>,
+}
+
+impl DnskeyCache {
+    pub fn new() -> Self {
+        Self {
+            positive: RwLock::new(HashMap::new()),
+            negative: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_positive(&self, zone: &Name) -> Option<Vec<DNSKEY>> {
+        let map = self.positive.read().unwrap();
+        let entry = map.get(zone)?;
+        if entry.expiry > Instant::now() {
+            Some(entry.keys.clone())
+        } else {
+            None
+        }
+    }
+
+    fn put_positive(&self, zone: Name, keys: Vec<DNSKEY>, ttl: Duration) {
+        let ttl = ttl.clamp(MIN_POSITIVE_TTL, MAX_POSITIVE_TTL);
+        let expiry = Instant::now() + ttl;
+        let mut map = self.positive.write().unwrap();
+        if map.len() >= POSITIVE_CACHE_CAP && !map.contains_key(&zone) {
+            evict(&mut *map, |e: &PositiveEntry| e.expiry);
+        }
+        map.insert(zone, PositiveEntry { keys, expiry });
+    }
+
+    fn invalidate_positive(&self, zone: &Name) {
+        self.positive.write().unwrap().remove(zone);
+    }
+
+    fn has_negative(&self, zone: &Name) -> bool {
+        let map = self.negative.read().unwrap();
+        map.get(zone).map(|e| *e > Instant::now()).unwrap_or(false)
+    }
+
+    fn put_negative(&self, zone: Name) {
+        let expiry = Instant::now() + NEGATIVE_TTL;
+        let mut map = self.negative.write().unwrap();
+        if map.len() >= NEGATIVE_CACHE_CAP && !map.contains_key(&zone) {
+            evict(&mut *map, |e: &Instant| *e);
+        }
+        map.insert(zone, expiry);
+    }
+}
+
+impl Default for DnskeyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Drop expired entries first; if every entry is still live, drop
+/// one arbitrary entry to make room. Tiny hot-path code so we
+/// don't bother with LRU bookkeeping.
+fn evict<V>(map: &mut HashMap<Name, V>, expiry_of: impl Fn(&V) -> Instant) {
+    let now = Instant::now();
+    let stale: Vec<Name> = map
+        .iter()
+        .filter_map(|(k, v)| if expiry_of(v) <= now { Some(k.clone()) } else { None })
+        .collect();
+    if stale.is_empty() {
+        if let Some(k) = map.keys().next().cloned() {
+            map.remove(&k);
+        }
+    } else {
+        for k in stale {
+            map.remove(&k);
+        }
+    }
+}
 
 /// EDNS Extended DNS Error codes relevant to DNSSEC responses.
 pub const EDE_DNSSEC_BOGUS: u16 = 6;
@@ -379,6 +478,10 @@ pub struct Validator {
     /// only signs DNSKEY; the root ZSK that signs TLD DS records
     /// isn't in the anchor file).
     pub roots: Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
+    /// Validated DNSKEYs cached by zone — avoids re-fetching keys
+    /// for hot zones (root, TLDs, popular SLDs) on every query, and
+    /// short-circuits zones whose fetch keeps timing out.
+    pub cache: Arc<DnskeyCache>,
 }
 
 impl Validator {
@@ -391,6 +494,7 @@ impl Validator {
             anchors,
             upstream,
             roots,
+            cache: Arc::new(DnskeyCache::new()),
         }
     }
 
@@ -534,6 +638,38 @@ impl Validator {
                 ));
             }
 
+            // Cache check: skip the fetch + verify if we have
+            // already-validated keys for this zone whose DS hash
+            // matches the parent's DS RRset on this query. Key
+            // rollover invalidates the entry naturally — the new DS
+            // won't cover the old key, so we re-fetch.
+            let zone_key = step.zone.to_lowercase();
+            if let Some(cached_keys) = self.cache.get_positive(&zone_key) {
+                let ds_values: Vec<&DS> = step
+                    .ds
+                    .iter()
+                    .filter_map(|r| match r.data() {
+                        Some(RData::DNSSEC(DNSSECRData::DS(d))) => Some(d),
+                        _ => None,
+                    })
+                    .collect();
+                let ds_match = cached_keys.iter().any(|k| {
+                    ds_values
+                        .iter()
+                        .any(|d| d.covers(&step.zone, k).unwrap_or(false))
+                });
+                if ds_match {
+                    tracing::debug!(zone = %step.zone, "DNSKEY cache hit (positive)");
+                    chain_keys.push((step.zone.clone(), cached_keys));
+                    continue;
+                }
+                self.cache.invalidate_positive(&zone_key);
+            }
+            if self.cache.has_negative(&zone_key) {
+                tracing::debug!(zone = %step.zone, "DNSKEY cache hit (negative) — Insecure");
+                return ValidationStatus::Insecure;
+            }
+
             // Fetch DNSKEY RRset from the child zone itself —
             // returns the full Records (TTL intact) + their covering
             // RRSIG + an unwrapped DNSKEY vec for convenience.
@@ -567,6 +703,7 @@ impl Validator {
                             zone = %step.zone,
                             "DNSKEY fetch failed, treating as Insecure: {e:#}"
                         );
+                        self.cache.put_negative(zone_key);
                         return ValidationStatus::Insecure;
                     }
                     Err(_) => {
@@ -575,6 +712,7 @@ impl Validator {
                             ?fetch_deadline,
                             "DNSKEY fetch timed out, treating as Insecure"
                         );
+                        self.cache.put_negative(zone_key);
                         return ValidationStatus::Insecure;
                     }
                 };
@@ -633,6 +771,14 @@ impl Validator {
                 ));
             }
 
+            let ttl = Duration::from_secs(
+                dnskey_records
+                    .iter()
+                    .map(|r| r.ttl() as u64)
+                    .min()
+                    .unwrap_or(MIN_POSITIVE_TTL.as_secs()),
+            );
+            self.cache.put_positive(zone_key, dnskeys.clone(), ttl);
             chain_keys.push((step.zone.clone(), dnskeys));
         }
 
@@ -671,6 +817,14 @@ impl Validator {
         zone: &Name,
         ns_ips: &[std::net::IpAddr],
     ) -> Result<()> {
+        let zone_key = zone.to_lowercase();
+        if let Some(cached_keys) = self.cache.get_positive(&zone_key) {
+            tracing::debug!(zone = %zone, "DNSKEY cache hit for splice");
+            chain_keys.retain(|(n, _)| n != zone);
+            chain_keys.push((zone.clone(), cached_keys));
+            return Ok(());
+        }
+
         let (records, keys, sig) = self
             .fetch_dnskey_rrset(zone, ns_ips)
             .await
@@ -695,6 +849,15 @@ impl Validator {
                 "{zone} DNSKEY RRSIG did not verify under any existing trusted key"
             );
         }
+
+        let ttl = Duration::from_secs(
+            records
+                .iter()
+                .map(|r| r.ttl() as u64)
+                .min()
+                .unwrap_or(MIN_POSITIVE_TTL.as_secs()),
+        );
+        self.cache.put_positive(zone_key, keys.clone(), ttl);
 
         // Replace the chain entry for `zone` with the full set of
         // DNSKEYs — keeps both KSK and ZSK so subsequent RRSIGs
