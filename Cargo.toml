@@ -48,6 +48,13 @@ nonzero_ext = "0.3"
 # threads and miscarries that), so the work queue lives outside tokio.
 async-channel = "2"
 
+# VPP binary API for interface address enumeration. dnsd uses it once
+# at startup to discover a globally-routable IPv6 source for upstream
+# queries (the VCL API doesn't expose VPP's FIB-derived source, and
+# binding `::` causes packets to leave with src=:: which the wire
+# drops).
+vpp-api = { git = "https://github.com/justindthomas/vpp-api" }
+
 # Config + IO
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -90,3 +97,6 @@ path = "src/bin/dnsd-query.rs"
 # local copy (needed during vcl-rs UDP development).
 [patch."https://github.com/justindthomas/vcl-rs"]
 vcl-rs = { path = "../vcl-rs" }
+
+[patch."https://github.com/justindthomas/vpp-api"]
+vpp-api = { path = "../vpp-api" }

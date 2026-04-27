@@ -29,6 +29,17 @@ else
     USE_LOCAL_VCL=0
 fi
 
+# Same pattern for vpp-api — dnsd uses it for VPP interface
+# enumeration (auto-detecting the v6 source IP for upstream queries).
+VPP_API_LOCAL="${DNSD_VPP_API_PATH:-$DNSD_ROOT/../vpp-api}"
+if [ -d "$VPP_API_LOCAL" ] && [ -f "$VPP_API_LOCAL/Cargo.toml" ]; then
+    VPP_API_MOUNT=( -v "$VPP_API_LOCAL:/vpp-api-src:ro" )
+    USE_LOCAL_VPP_API=1
+else
+    VPP_API_MOUNT=()
+    USE_LOCAL_VPP_API=0
+fi
+
 log() { echo "[build-bookworm] $*"; }
 
 if ! command -v podman &>/dev/null; then
@@ -50,7 +61,9 @@ $CONTAINER_CMD run --rm \
     -v "$DNSD_ROOT:/src:ro" \
     -v "$WORK:/out" \
     "${VCL_RS_MOUNT[@]}" \
+    "${VPP_API_MOUNT[@]}" \
     -e USE_LOCAL_VCL="$USE_LOCAL_VCL" \
+    -e USE_LOCAL_VPP_API="$USE_LOCAL_VPP_API" \
     -w /root \
     debian:bookworm bash -c '
         set -euo pipefail
@@ -89,14 +102,20 @@ EOF
         done
         ldconfig 2>/dev/null || true
 
-        # dnsd has a [patch] entry pointing vcl-rs at ../vcl-rs, so a
-        # clone (or bind-mounted copy) must sit next to /root/dnsd-src
-        # at /root/vcl-rs. Prefer the host checkout if it was mounted
-        # — lets local vcl-rs changes flow through without pushing.
+        # dnsd has [patch] entries pointing vcl-rs and vpp-api at
+        # ../vcl-rs and ../vpp-api respectively, so clones (or bind-
+        # mounted copies) must sit next to /root/dnsd-src at
+        # /root/vcl-rs and /root/vpp-api. Prefer host checkouts when
+        # mounted — lets local changes flow through without pushing.
         if [ "$USE_LOCAL_VCL" = "1" ]; then
             cp -r /vcl-rs-src /root/vcl-rs
         else
             git clone --quiet --depth 1 https://github.com/justindthomas/vcl-rs.git /root/vcl-rs
+        fi
+        if [ "$USE_LOCAL_VPP_API" = "1" ]; then
+            cp -r /vpp-api-src /root/vpp-api
+        else
+            git clone --quiet --depth 1 https://github.com/justindthomas/vpp-api.git /root/vpp-api
         fi
 
         cp -r /src /root/dnsd-src

@@ -607,6 +607,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vcl-rs",
+ "vpp-api",
 ]
 
 [[package]]
@@ -2601,6 +2602,15 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rand 0.8.6",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "vpp-api"
+version = "0.1.0"
+dependencies = [
  "thiserror",
  "tokio",
  "tracing",

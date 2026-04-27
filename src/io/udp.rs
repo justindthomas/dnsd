@@ -61,6 +61,15 @@ async fn serve_loop(
     let sock = Arc::new(sock);
     let mut buf = vec![0u8; UDP_BUF_SIZE];
     loop {
+        // Backpressure for upstream queries lives in the
+        // UpstreamClient's bounded async-channel (worker queue):
+        // walks awaiting a slow worker pile up there, not as
+        // unbounded tokio tasks. The old tokio-spawn-per-query
+        // OOM exposure required a separate semaphore here only
+        // because the legacy upstream path created a fresh VCL
+        // session per query and leaked 128MB of shared FIFO each
+        // time. With persistent per-worker sockets that whole class
+        // of leaks is gone, so the listener can spawn freely.
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {

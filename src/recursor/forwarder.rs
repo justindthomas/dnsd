@@ -25,7 +25,7 @@ use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
 use tokio::sync::oneshot;
-use vcl_rs::{query_tcp_dns_sync, query_udp_sync, VclReactor};
+use vcl_rs::{query_tcp_dns_sync, VclReactor, VclUdpSyncSocket};
 
 use crate::config::Forwarder as ForwarderCfg;
 
@@ -43,14 +43,15 @@ const MAX_TCP_MESSAGE: usize = 65535;
 /// against a live worker. We bypass tokio's pool entirely for upstream
 /// queries.
 ///
-/// Sized to fit under libvppcom's per-app worker cap (defaults to 16
-/// in 25.10, with worker-0 already taken by `VclApp::init` on the
-/// main thread). 12 here leaves headroom for the listener side's
-/// reactor + a couple of TLS handshake workers if/when we add a DoT/
-/// DoH server-side path that uses VCL transport. The worker that
-/// can't register simply exits; the effective pool shrinks but the
-/// process keeps running.
-const UPSTREAM_WORKERS: usize = 12;
+/// Sized conservatively because libvppcom 25.10's per-app worker cap
+/// is variable in practice (we've observed it as low as 3 on a busy
+/// VPP after several restart cycles). Workers that can't register
+/// exit cleanly; the effective pool shrinks. 4 keeps the steady-
+/// state under the worst observed cap while still giving usable
+/// throughput — each worker holds a long-lived UDP socket per
+/// address family, so per-query overhead is just a sendto +
+/// recvfrom rather than a full session create/close cycle.
+const UPSTREAM_WORKERS: usize = 4;
 
 /// Bound on the in-flight command queue. Each command is small (a few
 /// hundred bytes for the wire query plus addresses); 256 is plenty
@@ -126,15 +127,13 @@ fn is_suffix(name: &Name, suffix: &Name) -> bool {
     suffix.zone_of(name)
 }
 
-/// One unit of work for a worker thread. The worker calls
-/// `query_udp_sync` / `query_tcp_dns_sync` from vcl-rs and sends the
-/// result back via `reply`. The query bytes / source / timeout are
-/// owned values so the worker thread doesn't need to borrow from the
-/// async caller.
+/// One unit of work for a worker thread. The source IP is fixed per
+/// worker (each worker holds long-lived sockets bound to the
+/// configured source IPs at startup), so it's not part of the
+/// command — only peer + payload + reply channel.
 enum UpstreamCmd {
     Udp {
         peer: SocketAddr,
-        source: Option<std::net::IpAddr>,
         query: Vec<u8>,
         timeout: Duration,
         reply: oneshot::Sender<vcl_rs::error::Result<(Vec<u8>, SocketAddr)>>,
@@ -172,21 +171,28 @@ pub struct UpstreamClient {
     reactor: VclReactor,
 }
 
-/// Long-lived worker thread body. Registers as a VCL worker once at
-/// startup, then loops on the command channel until the channel is
-/// closed (i.e. UpstreamClient is dropped on shutdown). All VCL
-/// session ops for upstream queries happen here; the thread is
-/// dedicated and never migrates work to another OS thread, so
-/// libvppcom's worker-per-thread invariant holds.
-fn upstream_worker(rx: async_channel::Receiver<UpstreamCmd>, worker_no: usize) {
+/// Long-lived worker thread body. Registers as a VCL worker, opens
+/// one persistent UDP socket per address family, then loops on the
+/// command channel until shutdown.
+///
+/// Why long-lived sockets: every `vppcom_session_create` allocates a
+/// 128 MB shared-memory FIFO segment from VPP's session layer that
+/// is NOT reclaimed on `vppcom_session_close`. Creating a fresh
+/// session per upstream query OOMed the host within ~130 queries on
+/// jt-router. With one v4 + one v6 socket per worker, per-query
+/// cost is just a sendto + busy-poll recvfrom on an existing
+/// session — no leak.
+fn upstream_worker(
+    rx: async_channel::Receiver<UpstreamCmd>,
+    worker_no: usize,
+    source_v4: Option<std::net::Ipv4Addr>,
+    source_v6: Option<std::net::Ipv6Addr>,
+) {
     vcl_rs::register_worker_thread();
-    // libvppcom 25.10 caps workers per app — past that,
-    // vppcom_worker_register returns -17 and leaves __vcl_worker_index
-    // at -1. A thread in that state would GP-fault inside
-    // vppcom_session_create on the very first command, taking down
-    // the whole process. Bail this thread out instead — the effective
-    // pool is just smaller. The remaining workers still drain the
-    // queue.
+    // libvppcom 25.10 caps workers per app and the cap is lower than
+    // the official 16 in practice (we've seen as few as 3 on a busy
+    // VPP). A thread that fails to register would GP-fault inside
+    // vppcom_session_create on first use; bail it out instead.
     let vcl_idx = unsafe { vcl_rs::ffi::vppcom_worker_index() };
     if vcl_idx < 0 {
         tracing::warn!(
@@ -195,37 +201,174 @@ fn upstream_worker(rx: async_channel::Receiver<UpstreamCmd>, worker_no: usize) {
         );
         return;
     }
-    tracing::debug!(worker_no, vcl_idx, "upstream worker thread started");
+
+    // Create persistent v4 + v6 sockets. Failure on either side
+    // doesn't fail the worker — queries to that family will return
+    // an error that bubbles up to the recursor's NS-set fallback.
+    let v4_sock = match VclUdpSyncSocket::bind(source_v4.map(std::net::IpAddr::V4), false) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(worker_no, "v4 upstream socket bind failed: {e}");
+            None
+        }
+    };
+    let v6_sock = match VclUdpSyncSocket::bind(source_v6.map(std::net::IpAddr::V6), true) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(worker_no, "v6 upstream socket bind failed: {e}");
+            None
+        }
+    };
+    tracing::debug!(
+        worker_no,
+        vcl_idx,
+        v4 = v4_sock.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.to_string()),
+        v6 = v6_sock.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.to_string()),
+        "upstream worker thread started"
+    );
+
     while let Ok(cmd) = rx.recv_blocking() {
         match cmd {
-            UpstreamCmd::Udp { peer, source, query, timeout, reply } => {
-                let res = query_udp_sync(peer, source, &query, timeout);
+            UpstreamCmd::Udp { peer, query, timeout, reply } => {
+                let sock = if peer.is_ipv4() { &v4_sock } else { &v6_sock };
+                let res = match sock {
+                    Some(s) => s.query(peer, &query, timeout),
+                    None => Err(vcl_rs::error::VclError::Api(
+                        format!("no upstream socket for family of {peer}"),
+                        -1,
+                    )),
+                };
                 let _ = reply.send(res);
             }
             UpstreamCmd::Tcp { peer, source, query, timeout, reply } => {
+                // TCP still uses the ephemeral path via
+                // query_tcp_dns_sync — TCP volume is much lower
+                // (only TC=1 fallback in normal operation), so
+                // the per-session leak hasn't surfaced. Reuse
+                // pattern can be applied here too if we ever see
+                // it bite.
                 let res = query_tcp_dns_sync(peer, source, &query, timeout);
                 let _ = reply.send(res);
             }
         }
     }
     tracing::debug!(worker_no, "upstream worker thread exiting");
+    drop(v4_sock);
+    drop(v6_sock);
     unsafe {
         vcl_rs::ffi::vppcom_worker_unregister();
     }
 }
 
+/// Default VPP binary-API socket path. Operators can override per
+/// instance if their VPP is bound to a non-default socket; today
+/// nothing else in dnsd needs to touch VPP, so we just hardcode.
+pub const DEFAULT_VPP_API_SOCKET: &str = "/run/vpp/core-api.sock";
+
+/// Walk every VPP interface and return the first globally-routable
+/// IPv6 address found. "Globally routable" excludes link-local
+/// (fe80::/10), unique-local (fc00::/7), loopback, multicast,
+/// IPv4-mapped, and the unspecified address — anything that
+/// shouldn't appear as a public source. Returns None when no usable
+/// address exists (e.g. v6-less router).
+///
+/// Used to auto-populate `source_v6` so dnsd doesn't need an explicit
+/// config knob for the common case. The VCL API can't tell us VPP's
+/// FIB-derived source, so we go around it via the binary API.
+pub async fn discover_v6_source(
+    vpp_api_socket: &str,
+) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+    use vpp_api::generated::interface::{SwInterfaceDetails, SwInterfaceDump};
+    use vpp_api::generated::ip::{AddressFamily, IpAddressDetails, IpAddressDump};
+    use vpp_api::VppClient;
+
+    let vpp = VppClient::connect(vpp_api_socket)
+        .await
+        .with_context(|| format!("connect VPP API socket {vpp_api_socket}"))?;
+
+    let ifaces: Vec<SwInterfaceDetails> = vpp
+        .dump::<SwInterfaceDump, SwInterfaceDetails>(SwInterfaceDump::default())
+        .await
+        .map_err(|e| anyhow!("sw_interface_dump: {e}"))?;
+
+    for vi in &ifaces {
+        if !vi.flags.is_admin_up() {
+            continue;
+        }
+        let v6_addrs: Vec<IpAddressDetails> = vpp
+            .dump::<IpAddressDump, IpAddressDetails>(IpAddressDump {
+                sw_if_index: vi.sw_if_index,
+                is_ipv6: true,
+            })
+            .await
+            .unwrap_or_default();
+        for d in v6_addrs {
+            if d.prefix.af != AddressFamily::Ipv6 {
+                continue;
+            }
+            let v6 = std::net::Ipv6Addr::from(d.prefix.address);
+            if is_globally_routable_v6(&v6) {
+                let name = vi.interface_name.trim_end_matches('\0');
+                tracing::info!(
+                    iface = name,
+                    sw_if_index = vi.sw_if_index,
+                    source_v6 = %v6,
+                    "discovered v6 source from VPP"
+                );
+                return Ok(Some(v6));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_globally_routable_v6(v6: &std::net::Ipv6Addr) -> bool {
+    if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
+        return false;
+    }
+    let s = v6.segments();
+    let high = s[0];
+    // fe80::/10 link-local
+    if (high & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // fc00::/7 unique-local
+    if (high & 0xfe00) == 0xfc00 {
+        return false;
+    }
+    // ::ffff:0:0/96 IPv4-mapped
+    if v6.to_ipv4_mapped().is_some() {
+        return false;
+    }
+    true
+}
+
 impl UpstreamClient {
-    pub fn new(reactor: VclReactor, timeout_ms: Option<u32>) -> Self {
+    pub fn new(
+        reactor: VclReactor,
+        timeout_ms: Option<u32>,
+        source_v4: Option<std::net::Ipv4Addr>,
+        source_v6: Option<std::net::Ipv6Addr>,
+    ) -> Self {
         let timeout = Duration::from_millis(
             timeout_ms.map(|t| t as u64).unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         );
+
+        if source_v6.is_none() {
+            tracing::warn!(
+                "no source_v6 — IPv6 upstream queries will time out. Set \
+                 `dns.recursion.source_v6` to a globally-routable v6 on a \
+                 VPP interface (typically the wan v6) to enable them."
+            );
+        }
+
         let (cmd_tx, cmd_rx) =
             async_channel::bounded::<UpstreamCmd>(UPSTREAM_QUEUE_DEPTH);
         for i in 0..UPSTREAM_WORKERS {
             let rx = cmd_rx.clone();
             std::thread::Builder::new()
                 .name(format!("dnsd-up-{i:02}"))
-                .spawn(move || upstream_worker(rx, i))
+                .spawn(move || upstream_worker(rx, i, source_v4, source_v6))
                 .expect("spawn upstream worker thread");
         }
         // Drop our local Receiver so the worker clones are the only
@@ -236,24 +379,9 @@ impl UpstreamClient {
             cmd_tx,
             reactor,
             timeout,
-            source_v4: None,
-            source_v6: None,
+            source_v4,
+            source_v6,
         }
-    }
-
-    /// Set the source IPs used for upstream queries. Called by
-    /// `RecursorHandler::from_parts` after listener config is parsed
-    /// so we can prefer "the address dnsd is bound to" as the
-    /// source — that's an interface VPP definitely has a route
-    /// for, and it makes packets attributable to dnsd in upstream
-    /// captures.
-    pub fn set_source_ips(
-        &mut self,
-        v4: Option<std::net::Ipv4Addr>,
-        v6: Option<std::net::Ipv6Addr>,
-    ) {
-        self.source_v4 = v4;
-        self.source_v6 = v6;
     }
 
     fn source_for(&self, peer: SocketAddr) -> Option<std::net::IpAddr> {
@@ -353,7 +481,6 @@ impl UpstreamClient {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = UpstreamCmd::Udp {
             peer,
-            source: self.source_for(peer),
             query: query.to_vec(),
             timeout: self.timeout,
             reply: reply_tx,

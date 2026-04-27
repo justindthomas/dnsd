@@ -26,6 +26,7 @@ pub mod forwarder;
 pub mod dns64;
 pub mod dnssec;
 pub mod iterative;
+pub mod local_zones;
 pub mod normalize;
 pub mod rrl;
 pub mod zeroxtwenty;
@@ -104,7 +105,7 @@ impl RecursorHandler {
     ) -> anyhow::Result<Self> {
         let cache = Self::build_cache_from_config(cfg);
         let forwarders = Self::build_forwarders_from_config(cfg)?;
-        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None)
+        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None, None)
     }
 
     /// Build a RecursorHandler using a pre-constructed cache +
@@ -119,33 +120,46 @@ impl RecursorHandler {
         cache: Arc<DnsCache>,
         forwarders: Arc<Forwarders>,
         root_hints_path: Option<std::path::PathBuf>,
+        discovered_v6_source: Option<std::net::Ipv6Addr>,
     ) -> anyhow::Result<Self> {
         let upstream_timeout_ms = cfg
             .recursion
             .as_ref()
             .and_then(|r| r.upstream_timeout_ms);
-        // Pick source IPs for outgoing upstream queries: the first
-        // listener address per family. VPP's auto-source-selection
-        // works on simple setups but emits packets with src=0.0.0.0
-        // on others (multi-interface, no default-route-to-peer).
-        // Binding the source IP at the recursor side is robust
-        // regardless of VPP's FIB shape.
+        // Source-IP selection for outbound upstream queries.
+        //
+        // v4: pick the first v4 listener address. NAT44 translates
+        // it to the wan IP on egress, and the LAN-side bind keeps
+        // dnsd's ephemeral ports out of conflict with NAT's pool.
+        //
+        // v6: priority order is explicit config > v6 listener address
+        // > VPP-discovered global v6. There's no NAT for v6, so the
+        // source has to be globally routable; binding `::` causes
+        // packets to leave with src=:: and the wire drops them. The
+        // VCL API can't tell us VPP's FIB-derived source (only echoes
+        // the bound address), so the discovery happens via VPP's
+        // binary API in `async_main` and gets passed here.
         let mut source_v4: Option<std::net::Ipv4Addr> = None;
-        let mut source_v6: Option<std::net::Ipv6Addr> = None;
+        let mut listener_v6: Option<std::net::Ipv6Addr> = None;
         for l in &cfg.listeners {
             match l.address {
                 std::net::IpAddr::V4(v4) if source_v4.is_none() => {
                     source_v4 = Some(v4);
                 }
-                std::net::IpAddr::V6(v6) if source_v6.is_none() => {
-                    source_v6 = Some(v6);
+                std::net::IpAddr::V6(v6) if listener_v6.is_none() => {
+                    listener_v6 = Some(v6);
                 }
                 _ => {}
             }
         }
-        let mut upstream_inner = UpstreamClient::new(reactor, upstream_timeout_ms);
-        upstream_inner.set_source_ips(source_v4, source_v6);
-        let upstream = Arc::new(upstream_inner);
+        let configured_v6 = cfg.recursion.as_ref().and_then(|r| r.source_v6);
+        let source_v6 = configured_v6.or(listener_v6).or(discovered_v6_source);
+        let upstream = Arc::new(UpstreamClient::new(
+            reactor,
+            upstream_timeout_ms,
+            source_v4,
+            source_v6,
+        ));
 
         // Build a DNS64 policy if any listener has dns64 enabled,
         // OR if the operator wrote an explicit `dns.dns64:` block
@@ -489,7 +503,7 @@ impl DnsHandler for RecursorHandler {
                             Some(bytes)
                         }
                         Err(e) => {
-                            tracing::warn!(qname = %q.name(), "iterative resolve failed: {e}");
+                            tracing::warn!(qname = %q.name(), "iterative resolve failed: {e:#}");
                             Some(servfail(&msg))
                         }
                     },

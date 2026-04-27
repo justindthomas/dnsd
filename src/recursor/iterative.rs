@@ -60,12 +60,15 @@ pub const DEFAULT_MAX_DEPTH: u32 = 16;
 pub const DEFAULT_MAX_QUERIES: u32 = 256;
 pub const DEFAULT_MAX_CNAME: u32 = 8;
 
-/// Maximum NS IPs raced in parallel per delegation step. The whole
-/// point of racing is to converge on the fastest responder; past
-/// 2-3 in flight you just burn upstream bandwidth and budget for
-/// negligible latency wins. BIND and Unbound both target ~2-3
-/// concurrent NS queries per step.
-const MAX_PARALLEL_NS_QUERIES: usize = 3;
+/// Per-delegation-step NS attempts. Serial-with-timeout (each
+/// attempt blocks for up to `upstream_timeout_ms` then falls
+/// through), the BIND/Unbound default. Each attempt holds one
+/// slot in the dedicated VCL worker pool, so capping it keeps
+/// pathologically large NS sets from monopolising workers.
+/// 4 strikes a balance: covers the common case where the first
+/// random NS is slow/down, doesn't burn the whole pool on a
+/// referral with 15 NSes that are all unresponsive.
+const MAX_NS_ATTEMPTS: usize = 4;
 
 /// A single delegation step seen during a walk, in enough detail
 /// for a DNSSEC validator to reconstruct the chain of trust afterwards.
@@ -223,6 +226,20 @@ impl IterativeResolver {
             .clone();
 
         self.metrics.recursion_walked.fetch_add(1, Ordering::Relaxed);
+
+        // RFC 6303: synthesize NXDOMAIN locally for in-addr.arpa /
+        // ip6.arpa zones that cover address space which should never
+        // be reverse-resolved against the public DNS (RFC 1918,
+        // link-local, ULA, etc.). Without this, mDNS/Bonjour clients
+        // on the LAN spam queries like
+        // `*._dns-sd._udp.0.20.168.192.in-addr.arpa.` which hit the
+        // AS112 anycast servers (192.175.48.0/24); those drop ~17% of
+        // queries on the floor (10s timeout × MAX_NS_ATTEMPTS) and
+        // pin our worker pool. BIND/Unbound/Knot all do this by
+        // default. Cached so repeats are ~free.
+        if super::local_zones::is_private_reverse(q.name()) {
+            return synthesize_local_nxdomain(client_query, &q, &self.cache).await;
+        }
 
         let mut budget = Budget::new(self.max_depth, self.max_queries, self.max_cname);
         let mut chain = WalkChain::default();
@@ -410,18 +427,24 @@ impl IterativeResolver {
         }
     }
 
-    /// Race queries to every NS IP in `ns_ips` in parallel and take
-    /// the first valid response. Matches what BIND/Unbound do:
-    /// serial-with-timeout (the previous behaviour) burns
-    /// `upstream_timeout_ms` per slow NS before falling through, so
-    /// a single high-latency root or TLD server would cause the
-    /// whole walk to miss the client's dig timeout. Parallel races
-    /// converge on the *fastest* responder instead.
+    /// Try NS IPs serially up to `MAX_NS_ATTEMPTS`. Returns on the
+    /// first valid response; falls through on parse error / upstream
+    /// failure (timeout, ICMP unreachable, etc). Each attempt holds
+    /// one VCL worker slot for up to `upstream_timeout_ms` (2500ms),
+    /// so a slow first NS bounds the worst case to ~10s for the
+    /// whole step.
     ///
-    /// Budget cost: one per NS IP we actually queried. The 2.5s
-    /// per-query timeout is still in effect inside the UpstreamClient
-    /// — it bounds how long an unresponsive server can hold a slot
-    /// before giving up.
+    /// Earlier versions raced 3 NS IPs in parallel via
+    /// `FuturesUnordered` to converge on the fastest responder.
+    /// That hurt throughput more than it helped: each walk used
+    /// 3 of 4 workers in the dedicated pool, two concurrent client
+    /// queries oversubscribed it, and the listener started dropping
+    /// new traffic. Serial-with-fallback restores classic BIND
+    /// behavior — slow NS is rare in steady-state, the per-IP
+    /// timeout caps the worst case, and the worker pool serves
+    /// many concurrent walks instead of one with high parallelism.
+    ///
+    /// Budget cost: one per NS IP we actually queried.
     async fn query_ns_set(
         &self,
         ns_ips: &[IpAddr],
@@ -430,37 +453,23 @@ impl IterativeResolver {
         qclass: DNSClass,
         budget: &mut Budget,
     ) -> Result<Message> {
-        use futures::stream::{FuturesUnordered, StreamExt};
-
         let mut order: Vec<IpAddr> = ns_ips.to_vec();
         // Shuffle so we don't always hammer the same first NS — keeps
-        // load distributed when the in-flight set is small.
+        // load distributed.
         use rand::seq::SliceRandom;
         order.shuffle(&mut rand::thread_rng());
-        // Cap the in-flight set. Racing every NS IP fans out 13+
-        // queries at the root, 6+ at the TLD, etc. — the budget runs
-        // out on legitimate names. BIND/Unbound hold ~2-3 concurrent.
-        order.truncate(MAX_PARALLEL_NS_QUERIES);
+        // Cap total NS attempts per delegation step. Each NS we try
+        // takes a worker slot for up to `upstream_timeout_ms`, and
+        // pathological referrals (15+ NS records) would otherwise
+        // chew through the budget on a single bad zone.
+        order.truncate(MAX_NS_ATTEMPTS);
 
         let wire = build_query(qname, qtype, qclass, self.dnssec_ok)?;
 
-        let mut in_flight = FuturesUnordered::new();
-        for ip in &order {
-            // Budget guard outside the future so we never spin up a
-            // task we can't account for.
-            budget.query()?;
-            let upstream = self.upstream.clone();
-            let wire = wire.clone();
-            let ip = *ip;
-            in_flight.push(async move {
-                let res = upstream.query(&[ip], &wire).await;
-                (ip, res)
-            });
-        }
-
         let mut last_err: Option<anyhow::Error> = None;
-        while let Some((ip, res)) = in_flight.next().await {
-            match res {
+        for ip in &order {
+            budget.query()?;
+            match self.upstream.query(&[*ip], &wire).await {
                 Ok(resp_bytes) => match Message::from_bytes(&resp_bytes) {
                     Ok(m) => return Ok(m),
                     Err(e) => {
@@ -944,6 +953,33 @@ enum Classification {
 /// delegated-zone name; this is what the DNSSEC validator consumes
 /// to anchor the child zone's DNSKEY under the parent's chain.
 ///
+/// Build a synthetic NXDOMAIN response for an RFC 6303 local zone
+/// (private-IP reverse, ULA, link-local, etc.). Caches under the
+/// query key so subsequent matches hit cache instantly. The TTL on
+/// negative answers comes from the cache's `negative_ttl` setting.
+async fn synthesize_local_nxdomain(
+    client_query: &Message,
+    q: &Query,
+    cache: &Arc<DnsCache>,
+) -> Result<(Vec<u8>, WalkChain)> {
+    let mut response = Message::new();
+    response.set_id(client_query.id());
+    response.set_message_type(MessageType::Response);
+    response.set_op_code(OpCode::Query);
+    response.set_recursion_desired(client_query.recursion_desired());
+    response.set_recursion_available(true);
+    response.set_authoritative(true);
+    response.set_response_code(ResponseCode::NXDomain);
+    for orig_q in client_query.queries() {
+        response.add_query(orig_q.clone());
+    }
+    super::normalize::lowercase_response_names(&mut response);
+    let bytes = response.to_vec().context("encode local-zone NXDOMAIN")?;
+    let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
+    cache.put(key, &response, bytes.clone()).await;
+    Ok((bytes, WalkChain::default()))
+}
+
 /// Returns full Records (not unwrapped DS rdata) so the validator
 /// can feed them to `verify_rrsig` with their original TTL — that
 /// TTL is part of the canonical form RFC 4034 §6.2 signatures cover.

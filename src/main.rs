@@ -242,6 +242,25 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
 
     let reactor = VclReactor::new().with_context(|| "VclReactor::new")?;
 
+    // Ask VPP for a globally-routable v6 source IP. Used as the
+    // outbound source for IPv6 upstream queries when neither
+    // `recursion.source_v6` nor a v6 listener provides one. The VCL
+    // API can't tell us VPP's FIB-derived source, so we go around
+    // it via the binary API (vpp-api crate). Discovery failure is
+    // non-fatal — dnsd just won't have a v6 source and v6 NS
+    // queries will time out.
+    let discovered_v6 = match dnsd::recursor::forwarder::discover_v6_source(
+        dnsd::recursor::forwarder::DEFAULT_VPP_API_SOCKET,
+    )
+    .await
+    {
+        Ok(v6) => v6,
+        Err(e) => {
+            tracing::warn!("v6 source auto-discovery failed: {e:#}");
+            None
+        }
+    };
+
     // Build the initial recursor and wrap it for hot-swap on SIGHUP.
     // Listener tasks hold the LiveHandler — they keep working across
     // reloads because LiveHandler dispatches through an ArcSwap that
@@ -253,6 +272,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
         cache.clone(),
         forwarders_initial,
         Some(root_hints_path.clone()),
+        discovered_v6,
     )
     .context("RecursorHandler init")?;
     let live: Arc<LiveHandler<RecursorHandler>> = Arc::new(LiveHandler::new(initial_recursor));
@@ -293,6 +313,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             live,
             tls_config,
             forwarders_swap,
+            discovered_v6_source: discovered_v6,
         },
         listeners,
     )
@@ -506,6 +527,12 @@ struct WaitArgs {
     /// fresh Forwarders here so `dnsd-query forwarders` sees the
     /// new table immediately.
     forwarders_swap: Arc<arc_swap::ArcSwap<Forwarders>>,
+    /// VPP-discovered global v6 source IP, captured once at startup.
+    /// Re-used across SIGHUP reloads so the same source binds across
+    /// the whole process lifetime — interface addresses don't
+    /// typically change between SIGHUPs, and re-querying VPP on
+    /// every reload would slow it down for no benefit.
+    discovered_v6_source: Option<std::net::Ipv6Addr>,
 }
 
 /// Re-read router.yaml, build a fresh RecursorHandler, atomically
@@ -553,6 +580,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
         args.cache.clone(),
         new_forwarders,
         Some(args.root_hints_path.clone()),
+        args.discovered_v6_source,
     ) {
         Ok(r) => r,
         Err(e) => {

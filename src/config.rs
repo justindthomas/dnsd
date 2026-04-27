@@ -116,6 +116,25 @@ pub struct Recursion {
     /// — the v6 bind/send fails cost time and VCL sessions per
     /// query. Has no effect on downstream listeners.
     pub ipv6_upstream: bool,
+    /// Explicit source IP for outbound IPv6 upstream queries.
+    ///
+    /// IPv4 source selection is automatic: dnsd binds to the first
+    /// listener address that matches the family and lets VPP/NAT
+    /// handle translation to the egress interface. That works because
+    /// NAT44 is in the picture and the LAN-side bind avoids ephemeral
+    /// port conflicts with the NAT pool.
+    ///
+    /// IPv6 has no NAT, so the bound source has to be a globally-
+    /// routable address VPP knows about. dnsd has no way to ask VPP
+    /// "what would your FIB pick as the source for outbound v6?" via
+    /// the VCL API (`vppcom_session_attr GET_LCL_ADDR` only echoes
+    /// the bound address, not the FIB-derived one), so this needs to
+    /// be set explicitly when the operator wants v6 upstream queries.
+    /// Typically the wan interface's global v6, e.g. `2602:f90e::100`.
+    ///
+    /// When unset and no v6 listener provides a source, the iterative
+    /// recursor logs a startup warning and v6 NS queries time out.
+    pub source_v6: Option<std::net::Ipv6Addr>,
 }
 
 impl Recursion {
@@ -145,6 +164,7 @@ impl Default for Recursion {
             upstream_timeout_ms: None,
             max_cname_depth: None,
             ipv6_upstream: true,
+            source_v6: None,
         }
     }
 }
