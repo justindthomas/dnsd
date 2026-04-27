@@ -277,11 +277,18 @@ impl IterativeResolver {
         // to the client. See `normalize` for the rationale.
         super::normalize::lowercase_response_names(&mut response);
         let bytes = response.to_vec().context("encode iterative response")?;
-        // Cache under the original question (lowercased). The
-        // response bytes themselves are now also lowercased so cache
-        // replays don't re-leak.
-        let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
-        self.cache.put(key, &response, bytes.clone()).await;
+        // Cache under the original question (lowercased). When DNSSEC
+        // validation is on, we DON'T cache here — validation runs in
+        // `RecursorHandler::handle_bytes` after this returns, and a
+        // Bogus result there would otherwise leave a perfectly valid-
+        // looking entry in cache that future hits would replay
+        // without ever re-running the validator. handle_bytes
+        // re-caches the post-validation bytes itself for the
+        // Validate path. For PassThrough/Strip we still cache here.
+        if !self.dnssec_ok {
+            let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
+            self.cache.put(key, &response, bytes.clone()).await;
+        }
         Ok((bytes, chain))
     }
 

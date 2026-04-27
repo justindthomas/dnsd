@@ -537,14 +537,45 @@ impl Validator {
             // Fetch DNSKEY RRset from the child zone itself —
             // returns the full Records (TTL intact) + their covering
             // RRSIG + an unwrapped DNSKEY vec for convenience.
+            //
+            // Transport failures here (timeout, connection refused,
+            // TC=1 with no usable TCP fallback) downgrade to
+            // Insecure rather than Bogus. Strict RFC 4035 reading
+            // would say Bogus, but in practice we can't distinguish
+            // "attacker is blocking DNSKEY to downgrade" from "the
+            // zone's NSes RRL'd us into TCP fallback that VPP can't
+            // navigate" — and SERVFAILing every query to such a zone
+            // (e.g. arin.net, whose NSes always TC=1 to force TCP)
+            // hurts users more than the theoretical downgrade risk.
+            // BIND/Unbound's `harden-dnssec-stripped` knob defaults
+            // to permissive for similar reasons.
+            // Bound the total DNSKEY fetch wall time. `upstream.query`
+            // iterates every NS in the set and each can burn the full
+            // `upstream_timeout_ms` (2.5s) on UDP+TCP, so a fully-bad
+            // zone (e.g. one whose NSes all RRL→TC=1 + our VPP TCP
+            // can't navigate) would otherwise stretch a single user
+            // query into 20+ seconds before degrading. 5s is enough
+            // for any responsive NS set; past that we accept Insecure
+            // and move on so the client gets an answer in time.
+            let fetch = self.fetch_dnskey_rrset(&step.zone, &step.ns_ips);
+            let fetch_deadline = Duration::from_secs(5);
             let (dnskey_records, dnskeys, dnskey_rrsig) =
-                match self.fetch_dnskey_rrset(&step.zone, &step.ns_ips).await {
-                    Ok(tuple) => tuple,
-                    Err(e) => {
-                        return ValidationStatus::Bogus(format!(
-                            "fetching DNSKEY for {}: {e:#}",
-                            step.zone
-                        ));
+                match tokio::time::timeout(fetch_deadline, fetch).await {
+                    Ok(Ok(tuple)) => tuple,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            zone = %step.zone,
+                            "DNSKEY fetch failed, treating as Insecure: {e:#}"
+                        );
+                        return ValidationStatus::Insecure;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            zone = %step.zone,
+                            ?fetch_deadline,
+                            "DNSKEY fetch timed out, treating as Insecure"
+                        );
+                        return ValidationStatus::Insecure;
                     }
                 };
             if dnskeys.is_empty() {
@@ -686,6 +717,11 @@ impl Validator {
         if ns_ips.is_empty() {
             return Err(anyhow!("no NS addresses to query for {zone} DNSKEY"));
         }
+        tracing::debug!(
+            zone = %zone,
+            ns_count = ns_ips.len(),
+            "fetching DNSKEY"
+        );
         let wire = build_dnskey_query(zone)?;
         let resp_bytes = self
             .upstream
