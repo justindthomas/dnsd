@@ -324,6 +324,75 @@ pub async fn discover_v6_source(
     Ok(None)
 }
 
+/// Mirror of `discover_v6_source` for v4: walks VPP's interface
+/// list, picks the first globally-routable v4 address. Without
+/// this, TCP outbound (which can't reliably FIB-pick a source the
+/// way UDP does — VPP's TCP handshake state lookup doesn't match
+/// when the SYN/ACK arrives if the session was unbound at connect
+/// time) sits in NotConnected forever and times out.
+pub async fn discover_v4_source(
+    vpp_api_socket: &str,
+) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    use vpp_api::generated::interface::{SwInterfaceDetails, SwInterfaceDump};
+    use vpp_api::generated::ip::{AddressFamily, IpAddressDetails, IpAddressDump};
+    use vpp_api::VppClient;
+
+    let vpp = VppClient::connect(vpp_api_socket)
+        .await
+        .with_context(|| format!("connect VPP API socket {vpp_api_socket}"))?;
+
+    let ifaces: Vec<SwInterfaceDetails> = vpp
+        .dump::<SwInterfaceDump, SwInterfaceDetails>(SwInterfaceDump::default())
+        .await
+        .map_err(|e| anyhow!("sw_interface_dump: {e}"))?;
+
+    for vi in &ifaces {
+        if !vi.flags.is_admin_up() {
+            continue;
+        }
+        let v4_addrs: Vec<IpAddressDetails> = vpp
+            .dump::<IpAddressDump, IpAddressDetails>(IpAddressDump {
+                sw_if_index: vi.sw_if_index,
+                is_ipv6: false,
+            })
+            .await
+            .unwrap_or_default();
+        for d in v4_addrs {
+            if d.prefix.af != AddressFamily::Ipv4 {
+                continue;
+            }
+            // VPP's `address` field is 16 bytes; for v4 the first
+            // four are the address.
+            let bytes = d.prefix.address;
+            let v4 = std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+            if is_globally_routable_v4(&v4) {
+                let name = vi.interface_name.trim_end_matches('\0');
+                tracing::info!(
+                    iface = name,
+                    sw_if_index = vi.sw_if_index,
+                    source_v4 = %v4,
+                    "discovered v4 source from VPP"
+                );
+                return Ok(Some(v4));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_globally_routable_v4(v4: &std::net::Ipv4Addr) -> bool {
+    if v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_broadcast() {
+        return false;
+    }
+    if v4.is_link_local() {
+        return false;
+    }
+    if v4.is_private() {
+        return false;
+    }
+    true
+}
+
 fn is_globally_routable_v6(v6: &std::net::Ipv6Addr) -> bool {
     if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
         return false;

@@ -260,6 +260,21 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             None
         }
     };
+    // Same for v4. Required for outbound TCP — VPP's TCP stack
+    // doesn't reliably match the SYN/ACK back to a session whose
+    // source was picked by FIB at SYN-emit time. With an explicit
+    // bind the session-lookup just works.
+    let discovered_v4 = match dnsd::recursor::forwarder::discover_v4_source(
+        dnsd::recursor::forwarder::DEFAULT_VPP_API_SOCKET,
+    )
+    .await
+    {
+        Ok(v4) => v4,
+        Err(e) => {
+            tracing::warn!("v4 source auto-discovery failed: {e:#}");
+            None
+        }
+    };
 
     // Build the initial recursor and wrap it for hot-swap on SIGHUP.
     // Listener tasks hold the LiveHandler — they keep working across
@@ -273,6 +288,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
         forwarders_initial,
         Some(root_hints_path.clone()),
         discovered_v6,
+        discovered_v4,
     )
     .context("RecursorHandler init")?;
     initial_recursor.spawn_dnssec_prewarm();
@@ -315,6 +331,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             tls_config,
             forwarders_swap,
             discovered_v6_source: discovered_v6,
+            discovered_v4_source: discovered_v4,
         },
         listeners,
     )
@@ -534,6 +551,8 @@ struct WaitArgs {
     /// typically change between SIGHUPs, and re-querying VPP on
     /// every reload would slow it down for no benefit.
     discovered_v6_source: Option<std::net::Ipv6Addr>,
+    /// VPP-discovered v4 source IP. Same rationale as v6.
+    discovered_v4_source: Option<std::net::Ipv4Addr>,
 }
 
 /// Re-read router.yaml, build a fresh RecursorHandler, atomically
@@ -582,6 +601,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
         new_forwarders,
         Some(args.root_hints_path.clone()),
         args.discovered_v6_source,
+        args.discovered_v4_source,
     ) {
         Ok(r) => r,
         Err(e) => {

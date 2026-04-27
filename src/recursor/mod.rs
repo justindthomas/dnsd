@@ -305,7 +305,7 @@ impl RecursorHandler {
     ) -> anyhow::Result<Self> {
         let cache = Self::build_cache_from_config(cfg);
         let forwarders = Self::build_forwarders_from_config(cfg)?;
-        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None, None)
+        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None, None, None)
     }
 
     /// Build a RecursorHandler using a pre-constructed cache +
@@ -321,6 +321,7 @@ impl RecursorHandler {
         forwarders: Arc<Forwarders>,
         root_hints_path: Option<std::path::PathBuf>,
         discovered_v6_source: Option<std::net::Ipv6Addr>,
+        discovered_v4_source: Option<std::net::Ipv4Addr>,
     ) -> anyhow::Result<Self> {
         let upstream_timeout_ms = cfg
             .recursion
@@ -328,9 +329,14 @@ impl RecursorHandler {
             .and_then(|r| r.upstream_timeout_ms);
         // Source-IP selection for outbound upstream queries.
         //
-        // v4: pick the first v4 listener address. NAT44 translates
-        // it to the wan IP on egress, and the LAN-side bind keeps
-        // dnsd's ephemeral ports out of conflict with NAT's pool.
+        // v4: prefer VPP-discovered globally-routable v4 (wan IP) over
+        // the listener address. The earlier "listener-IP + NAT44"
+        // pattern works for UDP but breaks outbound TCP — VPP's TCP
+        // session table is keyed on the bound source IP, while the
+        // SYN/ACK arrives with the post-NAT dst IP, so the session
+        // lookup misses and the handshake never completes (the SYN/
+        // ACK gets punted to Linux). Binding directly to the wan IP
+        // sidesteps NAT entirely; UDP works the same way.
         //
         // v6: priority order is explicit config > v6 listener address
         // > VPP-discovered global v6. There's no NAT for v6, so the
@@ -339,12 +345,12 @@ impl RecursorHandler {
         // VCL API can't tell us VPP's FIB-derived source (only echoes
         // the bound address), so the discovery happens via VPP's
         // binary API in `async_main` and gets passed here.
-        let mut source_v4: Option<std::net::Ipv4Addr> = None;
+        let mut listener_v4: Option<std::net::Ipv4Addr> = None;
         let mut listener_v6: Option<std::net::Ipv6Addr> = None;
         for l in &cfg.listeners {
             match l.address {
-                std::net::IpAddr::V4(v4) if source_v4.is_none() => {
-                    source_v4 = Some(v4);
+                std::net::IpAddr::V4(v4) if listener_v4.is_none() => {
+                    listener_v4 = Some(v4);
                 }
                 std::net::IpAddr::V6(v6) if listener_v6.is_none() => {
                     listener_v6 = Some(v6);
@@ -354,6 +360,7 @@ impl RecursorHandler {
         }
         let configured_v6 = cfg.recursion.as_ref().and_then(|r| r.source_v6);
         let source_v6 = configured_v6.or(listener_v6).or(discovered_v6_source);
+        let source_v4 = discovered_v4_source.or(listener_v4);
         let upstream = Arc::new(UpstreamClient::new(
             reactor,
             upstream_timeout_ms,
