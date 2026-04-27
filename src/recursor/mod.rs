@@ -509,6 +509,39 @@ impl DnsHandler for RecursorHandler {
         peer: IpAddr,
         ctx: &ListenerContext,
     ) -> Option<Vec<u8>> {
+        // Per-query latency log. Drop runs at every return point and
+        // emits a single line per query. Logged at info for queries
+        // ≥ 50 ms (slow path: walks, coalescer waits, validation),
+        // debug otherwise. Grep journal for `qtiming` to see the
+        // user-visible end-to-end latency from ingestion to the
+        // moment we hand the response back to the listener.
+        struct QTiming {
+            t0: Instant,
+            qname: String,
+            qtype: RecordType,
+        }
+        impl Drop for QTiming {
+            fn drop(&mut self) {
+                let ms = self.t0.elapsed().as_millis() as u64;
+                if ms >= 50 {
+                    tracing::info!(
+                        qname = %self.qname,
+                        qtype = ?self.qtype,
+                        elapsed_ms = ms,
+                        "qtiming"
+                    );
+                } else {
+                    tracing::debug!(
+                        qname = %self.qname,
+                        qtype = ?self.qtype,
+                        elapsed_ms = ms,
+                        "qtiming"
+                    );
+                }
+            }
+        }
+        let t0 = Instant::now();
+
         // (1) Parse.
         let msg = match Message::from_bytes(query) {
             Ok(m) => m,
@@ -518,6 +551,11 @@ impl DnsHandler for RecursorHandler {
             }
         };
         let q = msg.queries().first()?.clone();
+        let _qtiming = QTiming {
+            t0,
+            qname: q.name().to_string(),
+            qtype: q.query_type(),
+        };
 
         // (2) RRL — silent drop.
         if let Some(rrl) = &self.rrl {
