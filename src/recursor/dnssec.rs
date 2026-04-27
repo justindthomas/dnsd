@@ -880,41 +880,61 @@ impl Validator {
         if ns_ips.is_empty() {
             return Err(anyhow!("no NS addresses to query for {zone} DNSKEY"));
         }
-        tracing::debug!(
-            zone = %zone,
-            ns_count = ns_ips.len(),
-            "fetching DNSKEY"
-        );
         let wire = build_dnskey_query(zone)?;
-        let resp_bytes = self
-            .upstream
-            .query(ns_ips, &wire)
-            .await
-            .with_context(|| format!("fetching DNSKEY for {zone}"))?;
-        let resp = Message::from_bytes(&resp_bytes)
-            .with_context(|| format!("parsing DNSKEY response for {zone}"))?;
-        let mut records = Vec::new();
-        let mut keys = Vec::new();
-        let mut sig: Option<RRSIG> = None;
-        let zone_lower = zone.to_lowercase();
-        for r in resp.answers() {
-            if r.name().to_lowercase() != zone_lower {
-                continue;
-            }
-            match r.data() {
-                Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => {
-                    records.push(r.clone());
-                    keys.push(k.clone());
+        // Iterate NSes ourselves rather than calling upstream.query
+        // wholesale, so we can log per-NS timing and the actual
+        // failure mode. Otherwise a generic timeout is all we see,
+        // which made diagnosing the persistent arin.net DNSKEY
+        // timeout require redeploys.
+        let mut last_err: Option<anyhow::Error> = None;
+        for ip in ns_ips {
+            let ns_t0 = std::time::Instant::now();
+            match self.upstream.query(&[*ip], &wire).await {
+                Ok(bytes) => {
+                    tracing::info!(
+                        zone = %zone,
+                        ns = %ip,
+                        elapsed_ms = ns_t0.elapsed().as_millis() as u64,
+                        size = bytes.len(),
+                        "DNSKEY fetch ok"
+                    );
+                    let resp = Message::from_bytes(&bytes)
+                        .with_context(|| format!("parsing DNSKEY response for {zone}"))?;
+                    let mut records = Vec::new();
+                    let mut keys = Vec::new();
+                    let mut sig: Option<RRSIG> = None;
+                    let zone_lower = zone.to_lowercase();
+                    for r in resp.answers() {
+                        if r.name().to_lowercase() != zone_lower {
+                            continue;
+                        }
+                        match r.data() {
+                            Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => {
+                                records.push(r.clone());
+                                keys.push(k.clone());
+                            }
+                            Some(RData::DNSSEC(DNSSECRData::RRSIG(s)))
+                                if s.type_covered() == RecordType::DNSKEY =>
+                            {
+                                sig = Some(s.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Ok((records, keys, sig));
                 }
-                Some(RData::DNSSEC(DNSSECRData::RRSIG(s)))
-                    if s.type_covered() == RecordType::DNSKEY =>
-                {
-                    sig = Some(s.clone());
+                Err(e) => {
+                    tracing::info!(
+                        zone = %zone,
+                        ns = %ip,
+                        elapsed_ms = ns_t0.elapsed().as_millis() as u64,
+                        "DNSKEY fetch attempt failed: {e:#}"
+                    );
+                    last_err = Some(e);
                 }
-                _ => {}
             }
         }
-        Ok((records, keys, sig))
+        Err(last_err.unwrap_or_else(|| anyhow!("all NSes failed for {zone} DNSKEY")))
     }
 }
 
