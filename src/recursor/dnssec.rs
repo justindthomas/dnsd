@@ -61,6 +61,26 @@ use crate::recursor::iterative::WalkChain;
 /// common recursor defaults (BIND/Unbound both ~300 s).
 const CLOCK_SKEW: Duration = Duration::from_secs(300);
 
+/// State of a single delegation step's DNSKEYs after the parallel
+/// pre-flight in `validate_walk`. Replaces the inline fetch the
+/// loop used to do — the loop now just consumes one of these per
+/// step.
+#[derive(Clone)]
+enum StepDnskeyState {
+    /// Cache hit and one of the cached keys hashes to a DS in this
+    /// query's referral. Loop pushes onto chain_keys and continues
+    /// without a network round-trip or signature verification.
+    Cached(Vec<DNSKEY>),
+    /// Negative cache hit (a recent fetch failed). Loop returns
+    /// ValidationStatus::Insecure.
+    Insecure,
+    /// Live fetch result. On success carries the records + keys +
+    /// covering RRSIG; on failure carries a stringified error
+    /// (anyhow::Error isn't Clone, so we render it once at fetch
+    /// time). The negative cache is already populated on failure.
+    Fetched(std::result::Result<(Vec<Record>, Vec<DNSKEY>, Option<RRSIG>), String>),
+}
+
 /// Per-zone DNSKEY cache. Validated keys are reused across queries
 /// until min(DNSKEY TTL, MAX_POSITIVE_TTL) so a single .com query
 /// doesn't re-fetch root + .com DNSKEYs each time. The negative
@@ -559,9 +579,19 @@ impl Validator {
             return ValidationStatus::Bogus(format!("root DNSKEY bootstrap: {e}"));
         }
 
+        // Pre-flight: kick off all per-step DNSKEY fetches in
+        // parallel. Cache hits + negative-cache hits are resolved
+        // synchronously; everything else fires concurrently. The
+        // sequential verify loop below then has each step's DNSKEYs
+        // ready when it gets there — turning N serial RTTs into one
+        // parallel batch (paid during the wall time of the slowest
+        // fetch). For a 5-deep signed chain that's typically ~5x
+        // less wall-clock cost on cold queries.
+        let prefetched = self.prefetch_step_dnskeys(walk).await;
+
         // Walk each delegation step, promoting the chain as we go.
         let mut insecure_from: Option<Name> = None;
-        for step in &walk.steps {
+        for (idx, step) in walk.steps.iter().enumerate() {
             if insecure_from.is_some() {
                 // Already entered insecure territory.
                 break;
@@ -638,81 +668,41 @@ impl Validator {
                 ));
             }
 
-            // Cache check: skip the fetch + verify if we have
-            // already-validated keys for this zone whose DS hash
-            // matches the parent's DS RRset on this query. Key
-            // rollover invalidates the entry naturally — the new DS
-            // won't cover the old key, so we re-fetch.
+            // Pull the prefetched DNSKEY state for this step. Three
+            // outcomes from prefetch:
+            //   * Cached: cache had keys whose DS covered one of the
+            //     parent's DS records. Reuse and skip the rest of
+            //     this step's verify (already validated last time).
+            //   * Insecure: negative-cached zone (the prefetch saw
+            //     it; or the prefetch itself failed and put it in
+            //     the negative cache). Stop walking, return Insecure.
+            //   * Fetched: the parallel fetch completed; downstream
+            //     verification continues with the returned keys.
             let zone_key = step.zone.to_lowercase();
-            if let Some(cached_keys) = self.cache.get_positive(&zone_key) {
-                let ds_values: Vec<&DS> = step
-                    .ds
-                    .iter()
-                    .filter_map(|r| match r.data() {
-                        Some(RData::DNSSEC(DNSSECRData::DS(d))) => Some(d),
-                        _ => None,
-                    })
-                    .collect();
-                let ds_match = cached_keys.iter().any(|k| {
-                    ds_values
-                        .iter()
-                        .any(|d| d.covers(&step.zone, k).unwrap_or(false))
-                });
-                if ds_match {
-                    tracing::debug!(zone = %step.zone, "DNSKEY cache hit (positive)");
-                    chain_keys.push((step.zone.clone(), cached_keys));
-                    continue;
-                }
-                self.cache.invalidate_positive(&zone_key);
-            }
-            if self.cache.has_negative(&zone_key) {
-                tracing::debug!(zone = %step.zone, "DNSKEY cache hit (negative) — Insecure");
-                return ValidationStatus::Insecure;
-            }
-
-            // Fetch DNSKEY RRset from the child zone itself —
-            // returns the full Records (TTL intact) + their covering
-            // RRSIG + an unwrapped DNSKEY vec for convenience.
-            //
-            // Transport failures here (timeout, connection refused,
-            // TC=1 with no usable TCP fallback) downgrade to
-            // Insecure rather than Bogus. Strict RFC 4035 reading
-            // would say Bogus, but in practice we can't distinguish
-            // "attacker is blocking DNSKEY to downgrade" from "the
-            // zone's NSes RRL'd us into TCP fallback that VPP can't
-            // navigate" — and SERVFAILing every query to such a zone
-            // (e.g. arin.net, whose NSes always TC=1 to force TCP)
-            // hurts users more than the theoretical downgrade risk.
-            // BIND/Unbound's `harden-dnssec-stripped` knob defaults
-            // to permissive for similar reasons.
-            // Bound the total DNSKEY fetch wall time. `upstream.query`
-            // iterates every NS in the set and each can burn the full
-            // `upstream_timeout_ms` (2.5s) on UDP+TCP, so a fully-bad
-            // zone (e.g. one whose NSes all RRL→TC=1 + our VPP TCP
-            // can't navigate) would otherwise stretch a single user
-            // query into 20+ seconds before degrading. 5s is enough
-            // for any responsive NS set; past that we accept Insecure
-            // and move on so the client gets an answer in time.
-            let fetch = self.fetch_dnskey_rrset(&step.zone, &step.ns_ips);
-            let fetch_deadline = Duration::from_secs(5);
             let (dnskey_records, dnskeys, dnskey_rrsig) =
-                match tokio::time::timeout(fetch_deadline, fetch).await {
-                    Ok(Ok(tuple)) => tuple,
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            zone = %step.zone,
-                            "DNSKEY fetch failed, treating as Insecure: {e:#}"
-                        );
-                        self.cache.put_negative(zone_key);
+                match prefetched.get(idx).cloned() {
+                    Some(StepDnskeyState::Cached(cached_keys)) => {
+                        tracing::debug!(zone = %step.zone, "DNSKEY cache hit (positive)");
+                        chain_keys.push((step.zone.clone(), cached_keys));
+                        continue;
+                    }
+                    Some(StepDnskeyState::Insecure) => {
+                        tracing::debug!(zone = %step.zone, "DNSKEY cache hit (negative) — Insecure");
                         return ValidationStatus::Insecure;
                     }
-                    Err(_) => {
+                    Some(StepDnskeyState::Fetched(Ok(tuple))) => tuple,
+                    Some(StepDnskeyState::Fetched(Err(msg))) => {
                         tracing::warn!(
                             zone = %step.zone,
-                            ?fetch_deadline,
-                            "DNSKEY fetch timed out, treating as Insecure"
+                            "DNSKEY fetch failed, treating as Insecure: {msg}"
                         );
-                        self.cache.put_negative(zone_key);
+                        return ValidationStatus::Insecure;
+                    }
+                    None => {
+                        // Shouldn't happen: prefetched is sized to
+                        // walk.steps. Treat as Insecure rather than
+                        // panicking.
+                        tracing::error!(zone = %step.zone, "prefetch state missing for step");
                         return ValidationStatus::Insecure;
                     }
                 };
@@ -872,6 +862,73 @@ impl Validator {
     /// their signed TTLs so `verify_rrsig` can reconstruct the
     /// canonical form; the rdata vec is a convenience for hash
     /// comparisons against the parent's DS.
+    /// Pre-flight per-step DNSKEY fetches: cache+neg-cache lookups
+    /// run synchronously, fetches fan out concurrently. The result
+    /// vector is indexed by walk step. Failed fetches put the zone
+    /// in the negative cache here (so a re-entry while these are
+    /// still in flight short-circuits immediately).
+    async fn prefetch_step_dnskeys(&self, walk: &WalkChain) -> Vec<StepDnskeyState> {
+        let pending = walk.steps.iter().map(|step| {
+            let zone = step.zone.clone();
+            let zone_lower = zone.to_lowercase();
+            let ns_ips = step.ns_ips.clone();
+            let ds = step.ds.clone();
+            async move {
+                if let Some(cached_keys) = self.cache.get_positive(&zone_lower) {
+                    let ds_values: Vec<&DS> = ds
+                        .iter()
+                        .filter_map(|r| match r.data() {
+                            Some(RData::DNSSEC(DNSSECRData::DS(d))) => Some(d),
+                            _ => None,
+                        })
+                        .collect();
+                    let ds_match = cached_keys.iter().any(|k| {
+                        ds_values
+                            .iter()
+                            .any(|d| d.covers(&zone, k).unwrap_or(false))
+                    });
+                    if ds_match {
+                        return StepDnskeyState::Cached(cached_keys);
+                    }
+                    self.cache.invalidate_positive(&zone_lower);
+                }
+                if self.cache.has_negative(&zone_lower) {
+                    return StepDnskeyState::Insecure;
+                }
+                // Fan out — every uncached step's fetch starts here
+                // and runs concurrently with all the others (they
+                // share the worker pool, but each is just waiting on
+                // a UDP/TCP round-trip).
+                let fetch = self.fetch_dnskey_rrset(&zone, &ns_ips);
+                let fetch_deadline = Duration::from_secs(5);
+                match tokio::time::timeout(fetch_deadline, fetch).await {
+                    Ok(Ok(tuple)) => StepDnskeyState::Fetched(Ok(tuple)),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            zone = %zone,
+                            "DNSKEY fetch failed: {e:#}"
+                        );
+                        self.cache.put_negative(zone_lower);
+                        StepDnskeyState::Fetched(Err(format!("{e:#}")))
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            zone = %zone,
+                            ?fetch_deadline,
+                            "DNSKEY fetch timed out"
+                        );
+                        self.cache.put_negative(zone_lower);
+                        StepDnskeyState::Fetched(Err(format!(
+                            "DNSKEY fetch timed out ({:?})",
+                            fetch_deadline
+                        )))
+                    }
+                }
+            }
+        });
+        futures::future::join_all(pending).await
+    }
+
     async fn fetch_dnskey_rrset(
         &self,
         zone: &Name,
