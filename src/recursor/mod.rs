@@ -88,11 +88,24 @@ impl RecursorHandler {
             Some(v) => v.clone(),
             None => return,
         };
-        // Names chosen to cover the top three signed gTLDs without
-        // hitting NSes that we know are pathological (e.g. arin.net,
-        // whose RRL→TC=1 + broken VPP TCP would burn the prewarm
-        // budget on a known-failing fetch).
-        const PREWARM_NAMES: &[&str] = &["iana.org.", "cloudflare.com.", "internic.net."];
+        // Names chosen to cover the top signed gTLDs + a handful of
+        // popular ccTLDs without hitting NSes that we know are
+        // pathological (e.g. arin.net, whose RRL→TC=1 + broken VPP
+        // TCP would burn the prewarm budget on a known-failing fetch).
+        // Each entry warms one TLD's DNSKEY plus root's; failures
+        // (registry-operated names that refuse our query, etc.) just
+        // log at debug and skip — the next user query for that TLD
+        // pays the cost normally.
+        const PREWARM_NAMES: &[&str] = &[
+            "iana.org.",        // .org
+            "cloudflare.com.",  // .com
+            "internic.net.",    // .net
+            "nominet.uk.",      // .uk
+            "denic.de.",        // .de
+            "nic.io.",          // .io
+            "google.dev.",      // .dev
+            "google.app.",      // .app
+        ];
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let mut joins = Vec::with_capacity(PREWARM_NAMES.len());

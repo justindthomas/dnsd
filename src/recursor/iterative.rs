@@ -60,15 +60,18 @@ pub const DEFAULT_MAX_DEPTH: u32 = 16;
 pub const DEFAULT_MAX_QUERIES: u32 = 256;
 pub const DEFAULT_MAX_CNAME: u32 = 8;
 
-/// Per-delegation-step NS attempts. Serial-with-timeout (each
-/// attempt blocks for up to `upstream_timeout_ms` then falls
-/// through), the BIND/Unbound default. Each attempt holds one
-/// slot in the dedicated VCL worker pool, so capping it keeps
-/// pathologically large NS sets from monopolising workers.
-/// 4 strikes a balance: covers the common case where the first
-/// random NS is slow/down, doesn't burn the whole pool on a
-/// referral with 15 NSes that are all unresponsive.
+/// Per-delegation-step NS attempts. Race-2 with fall-through: at
+/// most `NS_PARALLEL` queries are in flight at once and we keep
+/// feeding new IPs into the slot whenever one fails, until either
+/// one succeeds or we've exhausted `MAX_NS_ATTEMPTS`. This
+/// converges on the fastest responder without burning every worker
+/// slot for a single walk — the persistent VCL upstream sockets
+/// mean an in-flight query is just a Tokio future, not an
+/// allocation per query, so the cost of the loser is "one upstream
+/// timeout's worth of worker time" not "a leaked 128 MB FIFO
+/// segment" like in earlier iterations.
 const MAX_NS_ATTEMPTS: usize = 4;
+const NS_PARALLEL: usize = 2;
 
 /// A single delegation step seen during a walk, in enough detail
 /// for a DNSSEC validator to reconstruct the chain of trust afterwards.
@@ -445,24 +448,19 @@ impl IterativeResolver {
         }
     }
 
-    /// Try NS IPs serially up to `MAX_NS_ATTEMPTS`. Returns on the
-    /// first valid response; falls through on parse error / upstream
-    /// failure (timeout, ICMP unreachable, etc). Each attempt holds
-    /// one VCL worker slot for up to `upstream_timeout_ms` (2500ms),
-    /// so a slow first NS bounds the worst case to ~10s for the
-    /// whole step.
+    /// Race up to `NS_PARALLEL` NS IPs concurrently; whichever
+    /// returns first wins. Failed attempts are replaced from the
+    /// remaining shuffled order until either we get a valid response
+    /// or we've burned `MAX_NS_ATTEMPTS` queries. Pure-serial walks
+    /// were stalling user-facing queries when the random first NS
+    /// happened to be slow (~upstream_timeout_ms per dud); racing 2
+    /// converges on the fastest responder without monopolising the
+    /// worker pool — at most `NS_PARALLEL` slots in flight per walk,
+    /// and the persistent UDP sockets mean each in-flight query is
+    /// a cheap Tokio future, not a per-call VCL session create.
     ///
-    /// Earlier versions raced 3 NS IPs in parallel via
-    /// `FuturesUnordered` to converge on the fastest responder.
-    /// That hurt throughput more than it helped: each walk used
-    /// 3 of 4 workers in the dedicated pool, two concurrent client
-    /// queries oversubscribed it, and the listener started dropping
-    /// new traffic. Serial-with-fallback restores classic BIND
-    /// behavior — slow NS is rare in steady-state, the per-IP
-    /// timeout caps the worst case, and the worker pool serves
-    /// many concurrent walks instead of one with high parallelism.
-    ///
-    /// Budget cost: one per NS IP we actually queried.
+    /// Budget cost: one per NS IP we actually queried (winners and
+    /// losers both count, since both consumed worker time).
     async fn query_ns_set(
         &self,
         ns_ips: &[IpAddr],
@@ -471,23 +469,43 @@ impl IterativeResolver {
         qclass: DNSClass,
         budget: &mut Budget,
     ) -> Result<Message> {
-        let mut order: Vec<IpAddr> = ns_ips.to_vec();
-        // Shuffle so we don't always hammer the same first NS — keeps
-        // load distributed.
+        use futures::stream::{FuturesUnordered, StreamExt};
         use rand::seq::SliceRandom;
+
+        let mut order: Vec<IpAddr> = ns_ips.to_vec();
         order.shuffle(&mut rand::thread_rng());
-        // Cap total NS attempts per delegation step. Each NS we try
-        // takes a worker slot for up to `upstream_timeout_ms`, and
-        // pathological referrals (15+ NS records) would otherwise
-        // chew through the budget on a single bad zone.
         order.truncate(MAX_NS_ATTEMPTS);
 
         let wire = build_query(qname, qtype, qclass, self.dnssec_ok)?;
+        let wire = std::sync::Arc::new(wire);
+
+        // Box each future so FuturesUnordered can hold them in a
+        // single homogeneous container — async blocks have distinct
+        // anonymous types otherwise.
+        type QueryFut = std::pin::Pin<
+            Box<dyn std::future::Future<Output = (IpAddr, Result<Vec<u8>>)> + Send>,
+        >;
+        let upstream = self.upstream.clone();
+        let make_query = |ip: IpAddr| -> QueryFut {
+            let upstream = upstream.clone();
+            let wire = wire.clone();
+            Box::pin(async move {
+                let res = upstream.query(&[ip], &wire[..]).await;
+                (ip, res)
+            })
+        };
+
+        let mut iter = order.into_iter();
+        let mut in_flight: FuturesUnordered<QueryFut> = FuturesUnordered::new();
+        for _ in 0..NS_PARALLEL {
+            let Some(ip) = iter.next() else { break };
+            budget.query()?;
+            in_flight.push(make_query(ip));
+        }
 
         let mut last_err: Option<anyhow::Error> = None;
-        for ip in &order {
-            budget.query()?;
-            match self.upstream.query(&[*ip], &wire).await {
+        while let Some((ip, res)) = in_flight.next().await {
+            match res {
                 Ok(resp_bytes) => match Message::from_bytes(&resp_bytes) {
                     Ok(m) => return Ok(m),
                     Err(e) => {
@@ -499,6 +517,10 @@ impl IterativeResolver {
                     tracing::debug!(%ip, "iterative upstream: {e}");
                     last_err = Some(e);
                 }
+            }
+            if let Some(next_ip) = iter.next() {
+                budget.query()?;
+                in_flight.push(make_query(next_ip));
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("no NS responded")))
