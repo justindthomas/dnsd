@@ -48,16 +48,20 @@ use crate::metrics::Metrics;
 use crate::recursor::cache::{CacheKey, DnsCache};
 use crate::recursor::forwarder::UpstreamClient;
 
-/// Default per-query budget. Sized to resolve even worst-case
-/// glueless chains without running away.
-pub const DEFAULT_MAX_DEPTH: u32 = 16;
-/// 256 instead of the older 100 because `query_ns_set` now races
-/// up to `MAX_PARALLEL_NS_QUERIES` IPs per delegation step (each
-/// counts against the budget), and a deep glueless chain can fan
-/// that out across many sub-walks. 100 was tuned for the old
-/// serial-with-timeout walk and ran out on real names like
-/// `slashdot.org`.
-pub const DEFAULT_MAX_QUERIES: u32 = 256;
+/// Default per-query budget. The depth limit must accommodate the
+/// worst real-world delegation+CNAME chains: www.nytimes.com chains
+/// CNAME → edgekey.net → akamaiedge.net (each a fresh walk from
+/// root, ~5 referrals each), plus glueless NS sub-walks at each
+/// step that share the same budget. 16 was tight enough that
+/// nytimes.com hit "referral depth exceeded" and SERVFAIL'd
+/// outright. 32 is roomy without enabling pathological loops —
+/// the per-walk wall clock + max_queries still bound the cost.
+pub const DEFAULT_MAX_DEPTH: u32 = 32;
+/// `query_ns_set` races up to `NS_PARALLEL` IPs per delegation
+/// step (each counts against the budget), and a deep glueless
+/// chain can fan that out across many sub-walks. Sized for real
+/// names like `slashdot.org` and `www.nytimes.com`.
+pub const DEFAULT_MAX_QUERIES: u32 = 384;
 pub const DEFAULT_MAX_CNAME: u32 = 8;
 
 /// Per-delegation-step NS attempts. Race-2 with fall-through: at
