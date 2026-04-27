@@ -74,14 +74,75 @@ pub struct RecursorHandler {
     /// fresh full chain walk on every retry when the underlying
     /// resolution is broken — Mozilla's CNAME chain into
     /// `cloudops.mozgcp.net` whose Google-Cloud-DNS NSes our walker
-    /// can't reach. 15-second TTL keeps a transient outage from
+    /// can't reach. 60-second TTL keeps a transient outage from
     /// pinning into "permanently broken" while still suppressing
     /// the retry storm.
     neg_resolve_cache: Arc<NegResolveCache>,
+    /// Per-key mutex map for in-flight iterative walks. When N
+    /// parallel queries for the same (name, type) arrive together
+    /// (Microsoft's telemetry endpoint produces bursts of 5-7 in
+    /// one second), without coalescing they ALL pass the response-
+    /// cache + negative-cache checks together and ALL kick off
+    /// independent walks — burning N× worker time for an answer
+    /// only one walk actually needs to compute. With this map, the
+    /// first query takes the per-key lock and walks; followers
+    /// wait for the lock to release, then re-check the response
+    /// cache (which the leader populated) and serve the cached
+    /// bytes instead of walking themselves.
+    in_flight: Arc<InFlightMap>,
+}
+
+const IN_FLIGHT_CAP: usize = 4096;
+
+pub struct InFlightMap {
+    map: std::sync::Mutex<HashMap<(hickory_proto::rr::Name, RecordType), Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl InFlightMap {
+    fn new() -> Self {
+        Self {
+            map: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns a per-key mutex; multiple callers passing the same
+    /// (name, rtype) get the same Arc<Mutex>, so locking it
+    /// serialises them. The Arc is dropped from the map below
+    /// when nothing else holds it (we sweep entries with refcount
+    /// 1 on each insert) so the map doesn't grow without bound.
+    fn lock_for(&self, name: &hickory_proto::rr::Name, rtype: RecordType) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (name.to_lowercase(), rtype);
+        let mut map = self.map.lock().unwrap();
+        // Cheap sweep: any entry whose Arc is held only by the map
+        // itself is no longer needed. Bounded work per insert.
+        if map.len() >= IN_FLIGHT_CAP {
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+            if map.len() >= IN_FLIGHT_CAP {
+                if let Some(k) = map.keys().next().cloned() {
+                    map.remove(&k);
+                }
+            }
+        }
+        map.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+impl Default for InFlightMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 const NEG_RESOLVE_CAP: usize = 256;
-const NEG_RESOLVE_TTL: Duration = Duration::from_secs(15);
+/// 60 s rather than something tighter: the retry storms we're
+/// suppressing (Windows telemetry, Firefox captive-portal probe)
+/// re-fire about every 5-15 s. A 15-s TTL still let the storm
+/// land a fresh walk every gap; at 60 s we collapse multiple retry
+/// rounds into one walk-per-failed-name-per-minute, which is the
+/// right cost when the underlying chain genuinely doesn't resolve.
+const NEG_RESOLVE_TTL: Duration = Duration::from_secs(60);
 
 pub struct NegResolveCache {
     entries: RwLock<HashMap<(hickory_proto::rr::Name, RecordType), Instant>>,
@@ -435,6 +496,7 @@ impl RecursorHandler {
             rrl,
             iterative,
             neg_resolve_cache: Arc::new(NegResolveCache::new()),
+            in_flight: Arc::new(InFlightMap::new()),
         })
     }
 }
@@ -498,6 +560,8 @@ impl DnsHandler for RecursorHandler {
             return Some(servfail(&msg));
         }
         let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
+        // First, the fast unguarded path: if the cache is already
+        // warm we don't need to take the per-key lock.
         if let Some(mut cached) = self.cache.get(&key).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             cache::rewrite_txid(&mut cached, msg.id());
@@ -548,6 +612,28 @@ impl DnsHandler for RecursorHandler {
             }
         }
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+
+        // Coalesce concurrent walks for the same (name, type). The
+        // first arrival wins the per-key lock and runs the walk;
+        // followers wait, then the recheck below picks up the
+        // cached / negative-cached result instead of walking again.
+        let coalesce_lock = self.in_flight.lock_for(q.name(), q.query_type());
+        let _coalesce_guard = coalesce_lock.lock().await;
+        if let Some(mut cached) = self.cache.get(&key).await {
+            cache::rewrite_txid(&mut cached, msg.id());
+            if let Ok(mut parsed) = Message::from_bytes(&cached) {
+                if self.validator.is_none() {
+                    self.dnssec.apply_to_response(&mut parsed);
+                }
+                if let Ok(reencoded) = parsed.to_vec() {
+                    return Some(reencoded);
+                }
+            }
+            return Some(cached);
+        }
+        if self.neg_resolve_cache.hit(q.name(), q.query_type()) {
+            return Some(servfail(&msg));
+        }
 
         let servers = match self.forwarders.lookup(q.name()) {
             Some(s) => {
