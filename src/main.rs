@@ -154,8 +154,20 @@ fn main() -> Result<()> {
     // and control-socket tasks for the whole process. Upstream
     // queries don't run on this runtime's thread — see
     // UpstreamClient's worker pool.
+    //
+    // max_blocking_threads is capped to a small number so a
+    // misbehaving caller can't fan out hundreds of spawn_blocking
+    // tasks. We hit this in production when impd misbehaved and
+    // double-spawned dnsd: the second instance saw VPP-side
+    // "ip port pair already listened on" errors and entered some
+    // path that grew the blocking pool to 500 threads, every one
+    // of which then GP-faulted inside libvppcom because it wasn't
+    // VCL-registered. dnsd itself doesn't intentionally use
+    // spawn_blocking for VCL ops (see UPSTREAM_WORKERS), so 16 is
+    // enough headroom for tokio internals + tokio-rustls handshakes.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .max_blocking_threads(16)
         .build()
         .context("building tokio runtime")?;
     let result = runtime.block_on(async_main(args, cfg));
