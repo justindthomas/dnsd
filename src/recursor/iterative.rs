@@ -310,14 +310,25 @@ impl IterativeResolver {
         // for `cnn.com` that's typically `com.` once we've talked to
         // any other .com domain in the recent past. Falls back to the
         // root when nothing's cached. Each referral replaces both.
-        let (mut current_zone, mut ns_ips) = self
-            .closest_cached_zone(qname, qclass)
-            .await
-            .unwrap_or_else(|| {
-                // Snapshot the live root set under the RwLock so a
-                // concurrent re-prime doesn't tear the Vec mid-walk.
-                (Name::root(), self.roots.read().unwrap().clone())
-            });
+        //
+        // When DNSSEC validation is on, we MUST always start at the
+        // root: the validator builds the trust chain from the
+        // chain.steps the walk records, and a step is recorded ONLY
+        // for referrals we actually traversed. Starting from a
+        // cached intermediate (say `.net`) means the validator
+        // never validates `.net`'s DS/DNSKEY for the current walk
+        // and so has no `.net` keys when it tries to verify the
+        // child zone's DS RRSIG. Cold-start latency hit, but
+        // correctness wins.
+        let (mut current_zone, mut ns_ips) = if self.dnssec_ok {
+            (Name::root(), self.roots.read().unwrap().clone())
+        } else {
+            self.closest_cached_zone(qname, qclass)
+                .await
+                .unwrap_or_else(|| {
+                    (Name::root(), self.roots.read().unwrap().clone())
+                })
+        };
 
         loop {
             // Send the query to one of the current NS IPs. The

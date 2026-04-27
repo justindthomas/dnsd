@@ -498,19 +498,28 @@ impl Validator {
                 ));
             }
             let mut ds_verified = false;
+            tracing::debug!(
+                zone = %step.zone,
+                ds_records = step.ds.len(),
+                rrsig_signer = %ds_rrsig.signer_name(),
+                rrsig_key_tag = ds_rrsig.key_tag(),
+                rrsig_algo = ?ds_rrsig.algorithm(),
+                parent_key_count = parent_keys.len(),
+                "DS RRSIG validation: about to verify"
+            );
             for k in &parent_keys {
+                let key_tag = k.calculate_key_tag().unwrap_or(0);
                 match verify_rrset(&step.ds, ds_rrsig, k) {
                     Ok(()) => {
                         ds_verified = true;
+                        tracing::debug!(zone = %step.zone, key_tag, "DS RRSIG verified");
                         break;
                     }
                     Err(e) => {
                         tracing::debug!(
                             zone = %step.zone,
-                            signer = %ds_rrsig.signer_name(),
-                            key_tag = ds_rrsig.key_tag(),
-                            algo = ?ds_rrsig.algorithm(),
-                            ds_count = step.ds.len(),
+                            key_tag,
+                            algo = ?k.algorithm(),
                             "DS RRSIG verify attempt failed: {e}"
                         );
                     }
@@ -518,8 +527,10 @@ impl Validator {
             }
             if !ds_verified {
                 return ValidationStatus::Bogus(format!(
-                    "DS RRSIG for {} did not verify under parent keys",
-                    step.zone
+                    "DS RRSIG for {} did not verify under parent keys (rrsig key_tag={}, parent key_tags={:?})",
+                    step.zone,
+                    ds_rrsig.key_tag(),
+                    parent_keys.iter().filter_map(|k| k.calculate_key_tag().ok()).collect::<Vec<_>>(),
                 ));
             }
 
@@ -531,7 +542,7 @@ impl Validator {
                     Ok(tuple) => tuple,
                     Err(e) => {
                         return ValidationStatus::Bogus(format!(
-                            "fetching DNSKEY for {}: {e}",
+                            "fetching DNSKEY for {}: {e:#}",
                             step.zone
                         ));
                     }

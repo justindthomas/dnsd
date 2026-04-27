@@ -383,7 +383,16 @@ impl DnsHandler for RecursorHandler {
                         // will fire the A query itself.
                     }
                 } else {
-                    self.dnssec.apply_to_response(&mut parsed);
+                    // Apply the configured DNSSEC policy on cache
+                    // hit — UNLESS we're in Validate mode and the
+                    // cached bytes carry the validator's verdict
+                    // (AD bit was set by a prior `validate_walk`
+                    // succeeding, or explicitly cleared on Insecure).
+                    // Stripping AD here would lose the validator's
+                    // result on every cache replay.
+                    if self.validator.is_none() {
+                        self.dnssec.apply_to_response(&mut parsed);
+                    }
                     if let Ok(reencoded) = parsed.to_vec() {
                         return Some(reencoded);
                     }
@@ -499,6 +508,22 @@ impl DnsHandler for RecursorHandler {
                                 if let Ok(re) = parsed.to_vec() {
                                     bytes = re;
                                 }
+                            }
+                            // Re-cache the FINAL bytes (post-validator,
+                            // post-policy). The iterative recursor
+                            // already cached the pre-validation bytes
+                            // — overwrite with the version that has the
+                            // AD bit set as the validator decided so
+                            // cache hits replay the right authentication
+                            // status. For PassThrough/Strip modes this
+                            // is a no-op overwrite (no AD changes).
+                            let key = CacheKey::new(
+                                q.name(),
+                                q.query_type(),
+                                q.query_class(),
+                            );
+                            if let Ok(reparsed) = Message::from_bytes(&bytes) {
+                                self.cache.put(key, &reparsed, bytes.clone()).await;
                             }
                             Some(bytes)
                         }
