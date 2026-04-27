@@ -43,15 +43,17 @@ const MAX_TCP_MESSAGE: usize = 65535;
 /// against a live worker. We bypass tokio's pool entirely for upstream
 /// queries.
 ///
-/// Sized conservatively because libvppcom 25.10's per-app worker cap
-/// is variable in practice (we've observed it as low as 3 on a busy
-/// VPP after several restart cycles). Workers that can't register
-/// exit cleanly; the effective pool shrinks. 4 keeps the steady-
-/// state under the worst observed cap while still giving usable
-/// throughput — each worker holds a long-lived UDP socket per
-/// address family, so per-query overhead is just a sendto +
-/// recvfrom rather than a full session create/close cycle.
-const UPSTREAM_WORKERS: usize = 4;
+/// Each worker holds a long-lived UDP socket per address family,
+/// so per-query overhead is just a sendto + recvfrom rather than
+/// a full session create/close cycle. With persistent sockets the
+/// VPP-side memfd leak is gone (see project memory) so the
+/// per-app worker cap stays at libvppcom 25.10's design value
+/// rather than degrading over time. 8 leaves headroom for one
+/// pathologically slow walk to occupy a worker without starving
+/// concurrent client queries; workers that fail to register
+/// (libvppcom returns -17) just exit cleanly and the effective
+/// pool shrinks.
+const UPSTREAM_WORKERS: usize = 8;
 
 /// Bound on the in-flight command queue. Each command is small (a few
 /// hundred bytes for the wire query plus addresses); 256 is plenty

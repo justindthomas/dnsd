@@ -136,13 +136,17 @@ impl Default for InFlightMap {
 }
 
 const NEG_RESOLVE_CAP: usize = 256;
-/// 60 s rather than something tighter: the retry storms we're
-/// suppressing (Windows telemetry, Firefox captive-portal probe)
-/// re-fire about every 5-15 s. A 15-s TTL still let the storm
-/// land a fresh walk every gap; at 60 s we collapse multiple retry
-/// rounds into one walk-per-failed-name-per-minute, which is the
-/// right cost when the underlying chain genuinely doesn't resolve.
-const NEG_RESOLVE_TTL: Duration = Duration::from_secs(60);
+/// 5 minutes. The names that fall into this cache are aggressive
+/// retriers — Windows telemetry endpoints, Firefox captive-portal
+/// probes — that re-fire every few seconds and chain through CNAME
+/// hops to NSes our walker can't currently resolve. At 60 s the
+/// storm just fired one walk per minute per name; at 5 min we
+/// collapse it to ~1 walk per name per 5 min, which is roughly
+/// the right cost given that the underlying chain genuinely isn't
+/// resolving. If the upstream zone is fixed in the meantime, the
+/// affected name's clients will see a 5-min latency tail and then
+/// recover — acceptable for the kind of name that ends up here.
+const NEG_RESOLVE_TTL: Duration = Duration::from_secs(300);
 
 pub struct NegResolveCache {
     entries: RwLock<HashMap<(hickory_proto::rr::Name, RecordType), Instant>>,

@@ -528,7 +528,14 @@ impl IterativeResolver {
 
     /// Materialise NS-name → IP mappings for a referral. Any glue
     /// present in the Additional section wins; out-of-bailiwick
-    /// names without glue get a recursive sub-lookup.
+    /// names without glue get a recursive sub-lookup, bounded by
+    /// `RESOLVE_NS_IPS_DEADLINE` overall — pathological referrals
+    /// (4 broken NSes that each take ~2 s of upstream timeouts to
+    /// fail) would otherwise tie up a worker for tens of seconds.
+    /// 1.5 s is short enough that user-visible latency for the
+    /// queries waiting behind that worker stays reasonable, long
+    /// enough to cover one healthy sub-walk including its own
+    /// chain hops.
     async fn resolve_ns_ips(
         &self,
         ns_records: &[Record],
@@ -536,6 +543,9 @@ impl IterativeResolver {
         qclass: DNSClass,
         budget: &mut Budget,
     ) -> Result<Vec<IpAddr>> {
+        const RESOLVE_NS_IPS_DEADLINE: std::time::Duration =
+            std::time::Duration::from_millis(1500);
+        let started = std::time::Instant::now();
         let mut ips = Vec::new();
         for ns in ns_records {
             let Some(RData::NS(target)) = ns.data() else { continue };
@@ -560,6 +570,18 @@ impl IterativeResolver {
                 ips.extend(cached);
                 continue;
             }
+            // Once we've already gathered SOME IPs for this referral
+            // (from glue or earlier sub-walks), bail out as soon as
+            // the wall clock exceeds the deadline rather than spend
+            // more time on additional broken NSes — query_ns_set
+            // only needs one usable IP.
+            if !ips.is_empty() && started.elapsed() >= RESOLVE_NS_IPS_DEADLINE {
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "resolve_ns_ips deadline reached, stopping with partial set"
+                );
+                break;
+            }
             // No glue, no cache — recurse to find the NS's
             // address(es). We prefer A over AAAA to minimise further
             // iteration (the v6 path may itself need a glueless
@@ -573,19 +595,36 @@ impl IterativeResolver {
             // the main walk's `chain` only tracks the resolution
             // path we're actually delivering to the validator.
             let mut sub_chain = WalkChain::default();
-            match Box::pin(self.walk(
+            let remaining = RESOLVE_NS_IPS_DEADLINE.saturating_sub(started.elapsed());
+            // If there's no time left at all, give up on the
+            // remaining glueless NSes — better to return whatever
+            // ips we have (possibly empty) than burn another full
+            // sub-walk's worth of upstream time.
+            if remaining.is_zero() {
+                break;
+            }
+            let sub_walk = Box::pin(self.walk(
                 &target_name, RecordType::A, qclass, budget, &mut sub_chain,
-            ))
-            .await
-            {
-                Ok(resp) => {
+            ));
+            match tokio::time::timeout(remaining, sub_walk).await {
+                Ok(Ok(resp)) => {
                     for a in resp.answers() {
                         if let Some(RData::A(A(v4))) = a.data() {
                             ips.push(IpAddr::V4(*v4));
                         }
                     }
                 }
-                Err(e) => tracing::debug!(ns = %target_name, "glueless NS resolve: {e}"),
+                Ok(Err(e)) => {
+                    tracing::debug!(ns = %target_name, "glueless NS resolve: {e}");
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        ns = %target_name,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "glueless NS resolve timed out"
+                    );
+                    break;
+                }
             }
         }
         // Dedup.
