@@ -275,6 +275,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
         discovered_v6,
     )
     .context("RecursorHandler init")?;
+    initial_recursor.spawn_dnssec_prewarm();
     let live: Arc<LiveHandler<RecursorHandler>> = Arc::new(LiveHandler::new(initial_recursor));
     let handler: SharedHandler = live.clone();
 
@@ -591,6 +592,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
 
     // Atomic swap. In-flight queries finish on the old handler;
     // new ones see the new handler.
+    new_recursor.spawn_dnssec_prewarm();
     args.live.swap(new_recursor);
     tracing::info!("recursor handler swapped");
 

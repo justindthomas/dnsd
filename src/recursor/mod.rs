@@ -73,6 +73,65 @@ impl RecursorHandler {
         self.cache.clone()
     }
 
+    /// Background-prewarm the DNSSEC validator's DNSKEY cache by
+    /// self-querying a handful of popular signed names. Without this,
+    /// the first user query for a signed .com/.net/.org name after
+    /// startup pays 2-4 DNSKEY round-trips serially before the answer
+    /// can come back; afterward the cache stays warm. No-op when
+    /// validation is off or the iterative recursor isn't built.
+    pub fn spawn_dnssec_prewarm(&self) {
+        let iter = match self.iterative.as_ref() {
+            Some(i) => i.clone(),
+            None => return,
+        };
+        let validator = match self.validator.as_ref() {
+            Some(v) => v.clone(),
+            None => return,
+        };
+        // Names chosen to cover the top three signed gTLDs without
+        // hitting NSes that we know are pathological (e.g. arin.net,
+        // whose RRL→TC=1 + broken VPP TCP would burn the prewarm
+        // budget on a known-failing fetch).
+        const PREWARM_NAMES: &[&str] = &["iana.org.", "cloudflare.com.", "internic.net."];
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut joins = Vec::with_capacity(PREWARM_NAMES.len());
+            for name in PREWARM_NAMES {
+                let iter = iter.clone();
+                let validator = validator.clone();
+                joins.push(tokio::spawn(async move {
+                    let parsed = match hickory_proto::rr::Name::from_ascii(name) {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    let mut q = Message::new();
+                    q.set_message_type(MessageType::Query);
+                    q.set_op_code(OpCode::Query);
+                    q.set_recursion_desired(true);
+                    q.add_query(Query::query(parsed, RecordType::A));
+                    match iter.resolve_with_chain(&q).await {
+                        Ok((bytes, chain)) => {
+                            if let Ok(resp) = Message::from_bytes(&bytes) {
+                                let _ = validator.validate_walk(&chain, &resp).await;
+                                tracing::debug!(name = %name, "DNSKEY prewarm done");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(name = %name, "DNSKEY prewarm failed: {e:#}");
+                        }
+                    }
+                }));
+            }
+            for j in joins {
+                let _ = j.await;
+            }
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "DNSSEC cache prewarm complete"
+            );
+        });
+    }
+
     /// The forwarder table, for control-socket inspection.
     pub fn forwarders(&self) -> Arc<Forwarders> {
         self.forwarders.clone()
