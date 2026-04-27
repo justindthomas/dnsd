@@ -31,9 +31,12 @@ pub mod normalize;
 pub mod rrl;
 pub mod zeroxtwenty;
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -65,6 +68,66 @@ pub struct RecursorHandler {
     validator: Option<Arc<dnssec::Validator>>,
     rrl: Option<Arc<Rrl>>,
     iterative: Option<Arc<IterativeResolver>>,
+    /// Short-lived "this iterative walk just failed" cache. Without
+    /// it, a name like `detectportal.firefox.com` (which Firefox
+    /// retries every 1-2 s for the captive-portal probe) burns a
+    /// fresh full chain walk on every retry when the underlying
+    /// resolution is broken — Mozilla's CNAME chain into
+    /// `cloudops.mozgcp.net` whose Google-Cloud-DNS NSes our walker
+    /// can't reach. 15-second TTL keeps a transient outage from
+    /// pinning into "permanently broken" while still suppressing
+    /// the retry storm.
+    neg_resolve_cache: Arc<NegResolveCache>,
+}
+
+const NEG_RESOLVE_CAP: usize = 256;
+const NEG_RESOLVE_TTL: Duration = Duration::from_secs(15);
+
+pub struct NegResolveCache {
+    entries: RwLock<HashMap<(hickory_proto::rr::Name, RecordType), Instant>>,
+}
+
+impl NegResolveCache {
+    fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn hit(&self, name: &hickory_proto::rr::Name, rtype: RecordType) -> bool {
+        let key = (name.to_lowercase(), rtype);
+        let map = self.entries.read().unwrap();
+        map.get(&key).map(|e| *e > Instant::now()).unwrap_or(false)
+    }
+
+    fn insert(&self, name: hickory_proto::rr::Name, rtype: RecordType) {
+        let key = (name.to_lowercase(), rtype);
+        let expiry = Instant::now() + NEG_RESOLVE_TTL;
+        let mut map = self.entries.write().unwrap();
+        if map.len() >= NEG_RESOLVE_CAP && !map.contains_key(&key) {
+            let now = Instant::now();
+            let stale: Vec<_> = map
+                .iter()
+                .filter_map(|(k, v)| if *v <= now { Some(k.clone()) } else { None })
+                .collect();
+            if stale.is_empty() {
+                if let Some(k) = map.keys().next().cloned() {
+                    map.remove(&k);
+                }
+            } else {
+                for k in stale {
+                    map.remove(&k);
+                }
+            }
+        }
+        map.insert(key, expiry);
+    }
+}
+
+impl Default for NegResolveCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RecursorHandler {
@@ -371,6 +434,7 @@ impl RecursorHandler {
             validator,
             rrl,
             iterative,
+            neg_resolve_cache: Arc::new(NegResolveCache::new()),
         })
     }
 }
@@ -424,6 +488,15 @@ impl DnsHandler for RecursorHandler {
         }
 
         // (4) Normal cache + forwarder path.
+        // Recently-failed iterative resolves short-circuit to
+        // SERVFAIL — Firefox's captive-portal probe + Microsoft's
+        // telemetry CNAME chains both retry every 1-2 s when a
+        // sub-walk on their CNAME target zone breaks, and re-walking
+        // the chain each time burns sustained worker time on a
+        // request the user can't see anyway.
+        if self.neg_resolve_cache.hit(q.name(), q.query_type()) {
+            return Some(servfail(&msg));
+        }
         let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
         if let Some(mut cached) = self.cache.get(&key).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -601,6 +674,8 @@ impl DnsHandler for RecursorHandler {
                         }
                         Err(e) => {
                             tracing::warn!(qname = %q.name(), "iterative resolve failed: {e:#}");
+                            self.neg_resolve_cache
+                                .insert(q.name().clone(), q.query_type());
                             Some(servfail(&msg))
                         }
                     },
