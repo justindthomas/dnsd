@@ -156,7 +156,14 @@ impl Recursion {
 impl Default for Recursion {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // True so that `dns.recursion: { dnssec: validate }` (or
+            // any partial recursion block that omits `enabled`) does
+            // NOT silently disable iterative resolution — the
+            // operator clearly wants the recursor to keep running.
+            // Same default as when `dns.recursion` is absent
+            // entirely. To explicitly turn off the recursor, set
+            // `enabled: false`.
+            enabled: true,
             dnssec: DnssecMode::PassThrough,
             dnssec_validate: false,
             trust_anchor: None,
