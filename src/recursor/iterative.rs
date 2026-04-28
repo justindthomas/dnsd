@@ -532,14 +532,17 @@ impl IterativeResolver {
 
     /// Materialise NS-name → IP mappings for a referral. Any glue
     /// present in the Additional section wins; out-of-bailiwick
-    /// names without glue get a recursive sub-lookup, bounded by
-    /// `RESOLVE_NS_IPS_DEADLINE` overall — pathological referrals
-    /// (4 broken NSes that each take ~2 s of upstream timeouts to
-    /// fail) would otherwise tie up a worker for tens of seconds.
-    /// 1.5 s is short enough that user-visible latency for the
-    /// queries waiting behind that worker stays reasonable, long
-    /// enough to cover one healthy sub-walk including its own
-    /// chain hops.
+    /// names without glue get a recursive sub-lookup. The sub-walks
+    /// run *concurrently* via FuturesUnordered — cnn.com is the
+    /// motivating case: its NSes are spread across .com, .net,
+    /// .org, .co.uk so each NS-IP lookup is a fully cold walk
+    /// through a different TLD with no cache sharing between them.
+    /// Serialising those four sub-walks would run past the wall-
+    /// clock deadline; racing them lets the first one back unblock
+    /// the parent walk while the rest fill cache for next time.
+    /// Each sub-walk gets its own dedicated budget so a single bad
+    /// NS-zone can't burn the parent walk's quota, and a wall-clock
+    /// deadline still bounds total cost.
     async fn resolve_ns_ips(
         &self,
         ns_records: &[Record],
@@ -547,10 +550,17 @@ impl IterativeResolver {
         qclass: DNSClass,
         budget: &mut Budget,
     ) -> Result<Vec<IpAddr>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         const RESOLVE_NS_IPS_DEADLINE: std::time::Duration =
-            std::time::Duration::from_millis(1500);
+            std::time::Duration::from_millis(2500);
         let started = std::time::Instant::now();
         let mut ips = Vec::new();
+        let mut needs_subwalk: Vec<Name> = Vec::new();
+
+        // First pass: glue + cache lookups (sync, no I/O). Anything
+        // that needs a sub-walk gets queued; we race the queued set
+        // below.
         for ns in ns_records {
             let Some(RData::NS(target)) = ns.data() else { continue };
             let target_name = target.0.to_lowercase();
@@ -568,49 +578,60 @@ impl IterativeResolver {
             // to .net included glue for gtld-servers.net nameservers;
             // a later referral from .net to gtld-servers.net itself
             // does NOT include glue but we cached it above). Check
-            // the cache before kicking off a sub-walk.
+            // the cache before queueing a sub-walk.
             let cached = self.cached_ns_ips(&target_name).await;
             if !cached.is_empty() {
                 ips.extend(cached);
                 continue;
             }
-            // Once we've already gathered SOME IPs for this referral
-            // (from glue or earlier sub-walks), bail out as soon as
-            // the wall clock exceeds the deadline rather than spend
-            // more time on additional broken NSes — query_ns_set
-            // only needs one usable IP.
-            if !ips.is_empty() && started.elapsed() >= RESOLVE_NS_IPS_DEADLINE {
-                tracing::debug!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "resolve_ns_ips deadline reached, stopping with partial set"
-                );
-                break;
-            }
-            // No glue, no cache — recurse to find the NS's
-            // address(es). We prefer A over AAAA to minimise further
-            // iteration (the v6 path may itself need a glueless
-            // walk). Failures are not fatal; we skip this NS and try
-            // the next.
-            let sub_budget_ok = budget.can_substep();
-            if !sub_budget_ok {
+            if !budget.can_substep() {
                 continue;
             }
-            // Glueless-NS sub-walks get their own temporary chain —
-            // the main walk's `chain` only tracks the resolution
-            // path we're actually delivering to the validator.
-            let mut sub_chain = WalkChain::default();
-            let remaining = RESOLVE_NS_IPS_DEADLINE.saturating_sub(started.elapsed());
-            // If there's no time left at all, give up on the
-            // remaining glueless NSes — better to return whatever
-            // ips we have (possibly empty) than burn another full
-            // sub-walk's worth of upstream time.
-            if remaining.is_zero() {
-                break;
-            }
-            let sub_walk = Box::pin(self.walk(
-                &target_name, RecordType::A, qclass, budget, &mut sub_chain,
-            ));
-            match tokio::time::timeout(remaining, sub_walk).await {
+            needs_subwalk.push(target_name);
+        }
+
+        // If glue + cache already gave us at least one IP, skip the
+        // sub-walks entirely — query_ns_set only needs one usable
+        // IP. The remaining sub-walks would just warm the cache for
+        // next time, which is nice-to-have but not worth the wall-
+        // clock cost on every cold referral.
+        if !ips.is_empty() || needs_subwalk.is_empty() {
+            ips.sort();
+            ips.dedup();
+            return Ok(ips);
+        }
+
+        // Race the sub-walks. Each gets its own owned Budget so a
+        // bad zone can't deplete the parent walk's quota. A 2.5 s
+        // wall-clock deadline + 24-query / 8-depth per sub-walk
+        // bounds the worst case; in the happy path the fastest
+        // responder unblocks us in 200-500 ms.
+        let mut in_flight: FuturesUnordered<_> = needs_subwalk
+            .into_iter()
+            .map(|target_name| {
+                let remaining =
+                    RESOLVE_NS_IPS_DEADLINE.saturating_sub(started.elapsed());
+                async move {
+                    let mut sub_budget = Budget::new(8, 24, 4);
+                    let mut sub_chain = WalkChain::default();
+                    let res = tokio::time::timeout(
+                        remaining,
+                        Box::pin(self.walk(
+                            &target_name,
+                            RecordType::A,
+                            qclass,
+                            &mut sub_budget,
+                            &mut sub_chain,
+                        )),
+                    )
+                    .await;
+                    (target_name, res)
+                }
+            })
+            .collect();
+
+        while let Some((target_name, res)) = in_flight.next().await {
+            match res {
                 Ok(Ok(resp)) => {
                     for a in resp.answers() {
                         if let Some(RData::A(A(v4))) = a.data() {
@@ -627,11 +648,22 @@ impl IterativeResolver {
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "glueless NS resolve timed out"
                     );
-                    break;
                 }
             }
+            // Once we have one IP and the deadline has passed,
+            // stop awaiting the rest — query_ns_set just needs one.
+            // Lingering sub-walks are dropped (their futures cancel
+            // cleanly) so we don't keep workers tied up on sub-
+            // walks the parent doesn't need.
+            if !ips.is_empty() && started.elapsed() >= RESOLVE_NS_IPS_DEADLINE {
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    remaining_subwalks = in_flight.len(),
+                    "resolve_ns_ips deadline reached, stopping with partial set"
+                );
+                break;
+            }
         }
-        // Dedup.
         ips.sort();
         ips.dedup();
         Ok(ips)
