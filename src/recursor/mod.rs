@@ -3,17 +3,19 @@
 //! Resolution order:
 //!   1. Parse the query; extract its single question.
 //!   2. RRL check on the peer's /24 or /64 (silent drop on throttle).
-//!   3. Cache lookup → on hit, rewrite TXID and return.
-//!   4. Forwarder lookup:
+//!   3. Local short-circuits — answered without touching upstream:
+//!      * RFC 8880 ipv4only.arpa A/AAAA + 170/171.0.0.192.in-addr.arpa PTR.
+//!      * DNS64 PTR: ip6.arpa under the NAT64 prefix gets rewritten
+//!        to in-addr.arpa before continuing to the cache/forwarder.
+//!   4. Cache lookup → on hit, rewrite TXID and return.
+//!   5. Forwarder lookup:
 //!      * Longest-suffix match on the question name picks the
 //!        upstream list. Servers tried in order.
 //!      * DNS64 post-processing: if the listener opted in and the
 //!        upstream returned NODATA/NXDOMAIN for AAAA, re-query A and
 //!        synthesise AAAA per RFC 6147.
-//!      * DNS64 PTR: ip6.arpa question under the NAT64 prefix is
-//!        rewritten to in-addr.arpa before forwarding.
-//!   5. No forwarder matched → SERVFAIL (iterative recursion is
-//!      the next follow-up).
+//!   6. No forwarder matched → iterative recursion if enabled,
+//!      otherwise SERVFAIL.
 //!
 //! DNSSEC policy (`pass-through` | `strip` | `validate`) is applied
 //! to every outbound response. Full chain-of-trust validation needs
@@ -25,6 +27,7 @@ pub mod cookies;
 pub mod forwarder;
 pub mod dns64;
 pub mod dnssec;
+pub mod ipv4only;
 pub mod iterative;
 pub mod local_zones;
 pub mod normalize;
@@ -575,7 +578,17 @@ impl DnsHandler for RecursorHandler {
             }
         }
 
-        // (3) DNS64 PTR short-circuit: rewrite the question, send it
+        // (3a) RFC 8880 §7.2: answer ipv4only.arpa A/AAAA and the
+        // matching 170/171.0.0.192.in-addr.arpa PTRs locally without
+        // touching upstream. AAAA depends on whether this listener
+        // has DNS64 enabled — synthesised under our prefix when it
+        // is, NODATA when it isn't.
+        if ipv4only::is_local_question(q.name(), q.query_type()) {
+            let synth = ipv4only::synth_response(&msg, self.dns64.as_deref(), ctx.dns64);
+            return synth.to_vec().ok();
+        }
+
+        // (3b) DNS64 PTR short-circuit: rewrite the question, send it
         // off to in-addr.arpa via the normal forwarder/cache path, then
         // wrap the v4 PTR back into an ip6.arpa answer.
         if ctx.dns64 && q.query_type() == RecordType::PTR {

@@ -20,10 +20,10 @@
 //!
 //! Exclusions:
 //!
-//! * `ipv4only.arpa` — a DNS64 client uses this to discover whether
-//!   it's sitting behind a synthesiser; we must return the real AAAA
-//!   (RFC 7050) which upstream handles naturally.
-//! * Operator-configured FQDN suffixes.
+//! * Operator-configured FQDN suffixes. (`ipv4only.arpa` is NOT on
+//!   this list — RFC 8880 §7.2 has us answer it locally instead, see
+//!   `ipv4only.rs`. The local short-circuit fires before this module
+//!   ever runs for that name.)
 //!
 //! Prefix format: RFC 6052 defines embeddings for /32, /40, /48,
 //! /56, /64, /96 NAT64 prefixes. /96 (the WKP `64:ff9b::/96` default)
@@ -42,7 +42,10 @@ use ipnet::Ipv6Net;
 use crate::config::Dns64 as Dns64Cfg;
 
 pub const DEFAULT_PREFIX: &str = "64:ff9b::/96";
-pub const DEFAULT_EXCLUSIONS: &[&str] = &["ipv4only.arpa."];
+/// Currently empty. RFC 8880 made the historical `ipv4only.arpa`
+/// exclusion obsolete — that name now gets a local synthesised
+/// answer via `ipv4only.rs` and never reaches the synthesis path.
+pub const DEFAULT_EXCLUSIONS: &[&str] = &[];
 
 #[derive(Clone, Debug)]
 pub struct Dns64Policy {
@@ -394,11 +397,26 @@ mod tests {
     }
 
     #[test]
-    fn exclusions_cover_ipv4only_arpa() {
+    fn default_exclusions_empty() {
+        // RFC 8880 §7.2 made the old ipv4only.arpa exclusion
+        // obsolete — that name is now answered locally before
+        // this policy ever runs. The default exclusion list
+        // should therefore be empty.
         let policy = wkp();
-        assert!(policy.is_excluded(&Name::from_ascii("ipv4only.arpa.").unwrap()));
-        assert!(policy.is_excluded(&Name::from_ascii("sub.ipv4only.arpa.").unwrap()));
+        assert!(!policy.is_excluded(&Name::from_ascii("ipv4only.arpa.").unwrap()));
         assert!(!policy.is_excluded(&Name::from_ascii("example.com.").unwrap()));
+    }
+
+    #[test]
+    fn operator_exclusion_still_applies() {
+        let cfg = Dns64Cfg {
+            prefix: None,
+            exclusions: vec!["example.com".into()],
+        };
+        let policy = Dns64Policy::from_config(&cfg).unwrap();
+        assert!(policy.is_excluded(&Name::from_ascii("example.com.").unwrap()));
+        assert!(policy.is_excluded(&Name::from_ascii("sub.example.com.").unwrap()));
+        assert!(!policy.is_excluded(&Name::from_ascii("other.org.").unwrap()));
     }
 
     #[test]
@@ -456,11 +474,16 @@ mod tests {
             &resp
         ));
 
-        // Excluded name → never triggers.
+        // Operator-configured exclusion → never triggers.
+        let excl_cfg = Dns64Cfg {
+            prefix: None,
+            exclusions: vec!["corp.local".into()],
+        };
+        let excl_policy = Dns64Policy::from_config(&excl_cfg).unwrap();
         assert!(!should_synthesise(
-            Some(&policy),
+            Some(&excl_policy),
             true,
-            &Name::from_ascii("ipv4only.arpa.").unwrap(),
+            &Name::from_ascii("host.corp.local.").unwrap(),
             RecordType::AAAA,
             &resp
         ));
