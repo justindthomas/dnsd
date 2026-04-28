@@ -590,12 +590,19 @@ impl IterativeResolver {
             needs_subwalk.push(target_name);
         }
 
-        // If glue + cache already gave us at least one IP, skip the
-        // sub-walks entirely — query_ns_set only needs one usable
-        // IP. The remaining sub-walks would just warm the cache for
-        // next time, which is nice-to-have but not worth the wall-
-        // clock cost on every cold referral.
-        if !ips.is_empty() || needs_subwalk.is_empty() {
+        // If there's nothing to sub-walk, return whatever glue gave
+        // us. (Empty Vec is fine — query_ns_set will produce a
+        // meaningful error.) DON'T short-circuit when glue gave us
+        // IPs but glueless NSes remain: ipv6ready.me had glue for
+        // ns.ipv6ready.me (dead) and a glueless ns.hoge2.net (live).
+        // Skipping the sub-walk left only the dead IP in the set,
+        // and query_ns_set's retry loop (MAX_NS_ATTEMPTS=4 with
+        // race-2) had nothing to fall back to. Resolving glueless
+        // NSes alongside glue gives the retry loop alternatives —
+        // the user-visible cost on a healthy referral is bounded by
+        // the wall-clock deadline below (in practice ~500 ms for the
+        // first sub-walk to come back).
+        if needs_subwalk.is_empty() {
             ips.sort();
             ips.dedup();
             return Ok(ips);
