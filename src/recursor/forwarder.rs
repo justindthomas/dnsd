@@ -27,40 +27,21 @@ use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
 use tokio::sync::oneshot;
-use vcl_rs::{query_tcp_dns_sync, VclDgramSocket, VclReactor};
+use vcl_rs::{VclDgramSocket, VclReactor};
 
 use crate::config::Forwarder as ForwarderCfg;
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
 const MAX_TCP_MESSAGE: usize = 65535;
 
-/// Size of the dedicated VCL worker thread pool. Each worker is a
-/// long-lived `std::thread` that calls `vppcom_worker_register` once
-/// at start, then loops on the command channel. libvppcom 25.10's
-/// session/worker model requires every session op (create, bind,
-/// sendto, recvfrom, close) to run on the OS thread that owns the
-/// worker context. Tokio's blocking pool reuses threads across tasks
-/// in a way that violates that — `vppcom_session_create` GP-faults on
-/// `__vcl_worker_index` arithmetic when threads aren't registered
-/// against a live worker. We bypass tokio's pool entirely for upstream
-/// queries.
-///
-/// Worker pool size for the *TCP* upstream path. UDP queries no
-/// longer go through this pool — they multiplex across two
-/// persistent VclDgramSockets owned by `AsyncUdpUpstream` and run
-/// directly on the main Tokio thread (which is VCL worker-0,
-/// already registered). TCP fallback is rare (only when an
-/// upstream NS sets TC=1 to force TCP) so 4 workers is plenty.
-/// Each worker holds a long-lived UDP socket per family for
-/// fallback that-really-shouldn't-but-might-need-to share UDP, but
-/// in practice the TCP path doesn't touch the per-worker UDP
-/// sockets.
-const UPSTREAM_WORKERS: usize = 4;
-
-/// Bound on the in-flight command queue. Each command is small (a few
-/// hundred bytes for the wire query plus addresses); 256 is plenty
-/// for a home-router workload and caps memory in pathological cases.
-const UPSTREAM_QUEUE_DEPTH: usize = 256;
+// Both UDP and TCP upstream paths run async on the main Tokio
+// thread — no worker pool, no spawn_blocking. The thread is VCL
+// worker-0 (registered by VclApp::init), which satisfies VCL's
+// invariant that session ops happen on the worker that owns the
+// context. UDP multiplexes across persistent VclDgramSockets
+// (`AsyncUdpUpstream`); TCP uses VclStream::connect_async +
+// query_tcp_dns_async with non-blocking sessions and the reactor
+// for connect/read/write completion notifications.
 
 #[derive(Clone)]
 pub struct Forwarders {
@@ -129,22 +110,6 @@ fn is_suffix(name: &Name, suffix: &Name) -> bool {
         return false;
     }
     suffix.zone_of(name)
-}
-
-/// One unit of work for a worker thread. UDP queries used to live
-/// here too but moved to the async-multiplexer path
-/// (`AsyncUdpUpstream`) which doesn't need a worker pool. TCP
-/// stays here because TCP sessions are connection-oriented (can't
-/// multiplex on one socket the way UDP can) and libvppcom session
-/// ops still need a registered worker thread.
-enum UpstreamCmd {
-    Tcp {
-        peer: SocketAddr,
-        source: Option<std::net::IpAddr>,
-        query: Vec<u8>,
-        timeout: Duration,
-        reply: oneshot::Sender<vcl_rs::error::Result<Vec<u8>>>,
-    },
 }
 
 /// Per-pending-query routing entry. The recv-demux task uses
@@ -370,11 +335,6 @@ pub struct UpstreamClient {
     /// `(peer, txid)` demultiplexer. Concurrency limited only by
     /// in-flight pending entries, not thread count.
     udp: Arc<AsyncUdpUpstream>,
-    /// Sender side of the work queue. Cheap to clone (Arc internally
-    /// in async-channel); we keep one and pass it around. Workers
-    /// hold the matching Receiver clones. TCP-only now — UDP
-    /// doesn't dispatch through here anymore.
-    cmd_tx: async_channel::Sender<UpstreamCmd>,
     timeout: Duration,
     /// Explicit source IP for outgoing v4 upstream queries. When
     /// None, vcl-rs binds 0.0.0.0:<random> and relies on VPP's
@@ -394,51 +354,6 @@ pub struct UpstreamClient {
     reactor: VclReactor,
 }
 
-/// Long-lived worker thread body. Registers as a VCL worker, opens
-/// one persistent UDP socket per address family, then loops on the
-/// command channel until shutdown.
-///
-/// Why long-lived sockets: every `vppcom_session_create` allocates a
-/// 128 MB shared-memory FIFO segment from VPP's session layer that
-/// is NOT reclaimed on `vppcom_session_close`. Creating a fresh
-/// session per upstream query OOMed the host within ~130 queries on
-/// jt-router. With one v4 + one v6 socket per worker, per-query
-/// cost is just a sendto + busy-poll recvfrom on an existing
-/// session — no leak.
-fn upstream_worker(rx: async_channel::Receiver<UpstreamCmd>, worker_no: usize) {
-    vcl_rs::register_worker_thread();
-    // Workers that fail VCL registration would GP-fault inside
-    // vppcom_session_create on first use; bail out instead.
-    let vcl_idx = unsafe { vcl_rs::ffi::vppcom_worker_index() };
-    if vcl_idx < 0 {
-        tracing::warn!(
-            worker_no,
-            "upstream TCP worker registration failed — exiting (pool shrinks by one)"
-        );
-        return;
-    }
-    tracing::debug!(worker_no, vcl_idx, "upstream TCP worker thread started");
-
-    // No persistent sockets here — TCP fallback creates one
-    // ephemeral session per query inside query_tcp_dns_sync. UDP
-    // doesn't route through this pool at all (handled by
-    // AsyncUdpUpstream on the main Tokio thread). That keeps each
-    // worker's per-thread VPP FIFO footprint to whatever
-    // query_tcp_dns_sync allocates per query, not 256 MB sitting
-    // around bound to family-specific sockets.
-    while let Ok(cmd) = rx.recv_blocking() {
-        match cmd {
-            UpstreamCmd::Tcp { peer, source, query, timeout, reply } => {
-                let res = query_tcp_dns_sync(peer, source, &query, timeout);
-                let _ = reply.send(res);
-            }
-        }
-    }
-    tracing::debug!(worker_no, "upstream TCP worker thread exiting");
-    unsafe {
-        vcl_rs::ffi::vppcom_worker_unregister();
-    }
-}
 
 /// Default VPP binary-API socket path. Operators can override per
 /// instance if their VPP is bound to a non-default socket; today
@@ -619,27 +534,13 @@ impl UpstreamClient {
                 .context("AsyncUdpUpstream::new")?,
         );
 
-        // Worker pool now serves only TCP fallback queries —
-        // libvppcom requires those to run on a registered worker
-        // thread and TCP sessions are connection-oriented (can't
-        // multiplex like UDP). 4 workers is plenty for TC=1
-        // fallback in normal operation.
-        let (cmd_tx, cmd_rx) =
-            async_channel::bounded::<UpstreamCmd>(UPSTREAM_QUEUE_DEPTH);
-        for i in 0..UPSTREAM_WORKERS {
-            let rx = cmd_rx.clone();
-            std::thread::Builder::new()
-                .name(format!("dnsd-up-{i:02}"))
-                .spawn(move || upstream_worker(rx, i))
-                .expect("spawn upstream worker thread");
-        }
-        // Drop our local Receiver so the worker clones are the only
-        // consumers. Channel will close cleanly when cmd_tx is dropped
-        // (i.e. when UpstreamClient drops at shutdown).
-        drop(cmd_rx);
+        // No worker pool any more — both UDP and TCP upstream paths
+        // run async on the main Tokio thread (which is VCL worker-0,
+        // already registered). UDP via the multiplexer above; TCP
+        // via `vcl_rs::query_tcp_dns_async` using non-blocking VCL
+        // sessions + the reactor for connect/read/write completion.
         Ok(Self {
             udp,
-            cmd_tx,
             reactor,
             timeout,
             source_v4,
@@ -771,8 +672,10 @@ impl UpstreamClient {
 
     /// Send one query to `peer` over TCP (RFC 1035 §4.2.2 2-byte
     /// length framing). Used both for TC-fallback and for forwarders
-    /// configured as TCP-only upstreams. Dispatches to the same
-    /// dedicated VCL worker pool as UDP — see `UPSTREAM_WORKERS`.
+    /// configured as TCP-only upstreams. Runs on the calling Tokio
+    /// task — async all the way down via `query_tcp_dns_async`,
+    /// which uses non-blocking VCL TCP + the reactor for connect/
+    /// read/write. No worker pool, no `spawn_blocking`.
     pub async fn query_one_tcp(
         &self,
         peer: SocketAddr,
@@ -780,24 +683,15 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let cmd = UpstreamCmd::Tcp {
+        let resp = vcl_rs::query_tcp_dns_async(
             peer,
-            source: self.source_for(peer),
-            query: query.to_vec(),
-            timeout: self.timeout,
-            reply: reply_tx,
-        };
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| anyhow!("upstream worker pool channel closed"))?;
-        let resp = reply_rx
-            .await
-            .map_err(|_| {
-                anyhow!("upstream worker dropped reply channel for TCP {peer}")
-            })?
-            .with_context(|| format!("upstream TCP {peer}"))?;
+            self.source_for(peer),
+            query,
+            self.reactor.clone(),
+            self.timeout,
+        )
+        .await
+        .with_context(|| format!("upstream TCP {peer}"))?;
 
         if resp.len() < 12 {
             return Err(anyhow!("short upstream TCP response ({} bytes)", resp.len()));
