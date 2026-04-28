@@ -608,34 +608,43 @@ impl IterativeResolver {
             return Ok(ips);
         }
 
-        // Race the sub-walks. Each gets its own owned Budget so a
-        // bad zone can't deplete the parent walk's quota. A 2.5 s
-        // wall-clock deadline + 24-query / 8-depth per sub-walk
-        // bounds the worst case; in the happy path the fastest
-        // responder unblocks us in 200-500 ms.
-        let mut in_flight: FuturesUnordered<_> = needs_subwalk
-            .into_iter()
-            .map(|target_name| {
-                let remaining =
-                    RESOLVE_NS_IPS_DEADLINE.saturating_sub(started.elapsed());
-                async move {
-                    let mut sub_budget = Budget::new(8, 24, 4);
-                    let mut sub_chain = WalkChain::default();
-                    let res = tokio::time::timeout(
-                        remaining,
-                        Box::pin(self.walk(
-                            &target_name,
-                            RecordType::A,
-                            qclass,
-                            &mut sub_budget,
-                            &mut sub_chain,
-                        )),
-                    )
-                    .await;
-                    (target_name, res)
-                }
-            })
-            .collect();
+        // Race up to NS_PARALLEL sub-walks at a time — NOT all of
+        // them. When the NSes share a parent zone (ip.me has 7 NSes
+        // all under markmonitor.com; cnn.com's were spread across 4
+        // TLDs but a sibling-NS case is common), firing all of them
+        // concurrently has each one redundantly walking the same
+        // chain (root, .com, markmonitor.com) before they can share
+        // cache. That over-saturates the upstream worker pool and
+        // pushes per-sub-walk latency past the 2.5 s deadline.
+        // Pipelining them NS_PARALLEL at a time lets the first wave
+        // prime the parent-zone cache so subsequent sub-walks hit
+        // cached NSes and finish in ~50 ms each.
+        let make_subwalk = |target_name: Name| {
+            let remaining =
+                RESOLVE_NS_IPS_DEADLINE.saturating_sub(started.elapsed());
+            async move {
+                let mut sub_budget = Budget::new(8, 24, 4);
+                let mut sub_chain = WalkChain::default();
+                let res = tokio::time::timeout(
+                    remaining,
+                    Box::pin(self.walk(
+                        &target_name,
+                        RecordType::A,
+                        qclass,
+                        &mut sub_budget,
+                        &mut sub_chain,
+                    )),
+                )
+                .await;
+                (target_name, res)
+            }
+        };
+        let mut subwalk_iter = needs_subwalk.into_iter();
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        for _ in 0..NS_PARALLEL {
+            let Some(target) = subwalk_iter.next() else { break };
+            in_flight.push(make_subwalk(target));
+        }
 
         while let Some((target_name, res)) = in_flight.next().await {
             match res {
@@ -655,6 +664,17 @@ impl IterativeResolver {
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "glueless NS resolve timed out"
                     );
+                }
+            }
+            // Refill the slot from the pending queue so the
+            // pipeline keeps NS_PARALLEL sub-walks in flight until
+            // the queue drains. Late-wave sub-walks benefit from
+            // the cache primed by earlier ones (sibling NSes under
+            // a shared parent zone resolve in ~50 ms once the
+            // parent zone has been walked once).
+            if started.elapsed() < RESOLVE_NS_IPS_DEADLINE {
+                if let Some(next) = subwalk_iter.next() {
+                    in_flight.push(make_subwalk(next));
                 }
             }
             // Once we have one IP and the deadline has passed,
