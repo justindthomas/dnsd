@@ -16,7 +16,9 @@
 //! (and silently reverted on the response so cached entries use the
 //! canonical owner name).
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -25,7 +27,7 @@ use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
 use tokio::sync::oneshot;
-use vcl_rs::{query_tcp_dns_sync, VclReactor, VclUdpSyncSocket};
+use vcl_rs::{query_tcp_dns_sync, VclDgramSocket, VclReactor};
 
 use crate::config::Forwarder as ForwarderCfg;
 
@@ -43,17 +45,17 @@ const MAX_TCP_MESSAGE: usize = 65535;
 /// against a live worker. We bypass tokio's pool entirely for upstream
 /// queries.
 ///
-/// Each worker holds a long-lived UDP socket per address family,
-/// so per-query overhead is just a sendto + recvfrom rather than
-/// a full session create/close cycle. With persistent sockets the
-/// VPP-side memfd leak is gone (see project memory) so the
-/// per-app worker cap stays at libvppcom 25.10's design value
-/// rather than degrading over time. 8 leaves headroom for one
-/// pathologically slow walk to occupy a worker without starving
-/// concurrent client queries; workers that fail to register
-/// (libvppcom returns -17) just exit cleanly and the effective
-/// pool shrinks.
-const UPSTREAM_WORKERS: usize = 8;
+/// Worker pool size for the *TCP* upstream path. UDP queries no
+/// longer go through this pool — they multiplex across two
+/// persistent VclDgramSockets owned by `AsyncUdpUpstream` and run
+/// directly on the main Tokio thread (which is VCL worker-0,
+/// already registered). TCP fallback is rare (only when an
+/// upstream NS sets TC=1 to force TCP) so 4 workers is plenty.
+/// Each worker holds a long-lived UDP socket per family for
+/// fallback that-really-shouldn't-but-might-need-to share UDP, but
+/// in practice the TCP path doesn't touch the per-worker UDP
+/// sockets.
+const UPSTREAM_WORKERS: usize = 4;
 
 /// Bound on the in-flight command queue. Each command is small (a few
 /// hundred bytes for the wire query plus addresses); 256 is plenty
@@ -129,17 +131,13 @@ fn is_suffix(name: &Name, suffix: &Name) -> bool {
     suffix.zone_of(name)
 }
 
-/// One unit of work for a worker thread. The source IP is fixed per
-/// worker (each worker holds long-lived sockets bound to the
-/// configured source IPs at startup), so it's not part of the
-/// command — only peer + payload + reply channel.
+/// One unit of work for a worker thread. UDP queries used to live
+/// here too but moved to the async-multiplexer path
+/// (`AsyncUdpUpstream`) which doesn't need a worker pool. TCP
+/// stays here because TCP sessions are connection-oriented (can't
+/// multiplex on one socket the way UDP can) and libvppcom session
+/// ops still need a registered worker thread.
 enum UpstreamCmd {
-    Udp {
-        peer: SocketAddr,
-        query: Vec<u8>,
-        timeout: Duration,
-        reply: oneshot::Sender<vcl_rs::error::Result<(Vec<u8>, SocketAddr)>>,
-    },
     Tcp {
         peer: SocketAddr,
         source: Option<std::net::IpAddr>,
@@ -149,10 +147,233 @@ enum UpstreamCmd {
     },
 }
 
+/// Per-pending-query routing entry. The recv-demux task uses
+/// `(peer_ip, txid)` to match incoming UDP datagrams back to the
+/// awaiting query future.
+type PendingMap = HashMap<(IpAddr, u16), oneshot::Sender<(Vec<u8>, SocketAddr)>>;
+
+/// Async UDP upstream: one persistent VclDgramSocket per address
+/// family, plus a demuxer task that reads responses and routes them
+/// to the awaiting query future via `(peer_ip, txid)`. Lets dnsd
+/// have arbitrarily-many concurrent in-flight UDP queries with no
+/// dedicated worker threads — a single spawned recv loop per
+/// family is enough.
+///
+/// Replaces the older "dispatch UDP commands to a dedicated worker
+/// thread pool" approach. The worker pool was needed because
+/// libvppcom requires every session op to run on the OS thread
+/// that owns the worker context AND tokio's blocking pool was
+/// off-limits — but the main Tokio thread itself is already
+/// VCL-registered (worker-0 by `VclApp::init`), so calling VCL ops
+/// on it directly is safe. With persistent sockets bound at
+/// startup, all upstream UDP queries run on main and concurrency
+/// is bounded only by FIFO/peer-state, not thread count.
+struct AsyncUdpUpstream {
+    v4_sock: Option<Arc<VclDgramSocket>>,
+    v6_sock: Option<Arc<VclDgramSocket>>,
+    pending: Arc<Mutex<PendingMap>>,
+}
+
+impl AsyncUdpUpstream {
+    fn new(
+        source_v4: Option<std::net::Ipv4Addr>,
+        source_v6: Option<std::net::Ipv6Addr>,
+        reactor: VclReactor,
+    ) -> Result<Self> {
+        let pending = Arc::new(Mutex::new(PendingMap::new()));
+
+        let v4_sock = source_v4
+            .map(|ip| {
+                bind_ephemeral_with_source(IpAddr::V4(ip), reactor.clone())
+                    .map(Arc::new)
+                    .with_context(|| format!("bind v4 upstream socket on {ip}"))
+            })
+            .transpose()?;
+        let v6_sock = source_v6
+            .map(|ip| {
+                bind_ephemeral_with_source(IpAddr::V6(ip), reactor.clone())
+                    .map(Arc::new)
+                    .with_context(|| format!("bind v6 upstream socket on {ip}"))
+            })
+            .transpose()?;
+
+        // One demux task per family. Reads responses, looks up the
+        // (peer, txid) -> oneshot sender, hands the bytes off.
+        if let Some(s) = v4_sock.clone() {
+            let p = pending.clone();
+            tokio::spawn(async move { recv_demux_loop("v4", s, p).await });
+        }
+        if let Some(s) = v6_sock.clone() {
+            let p = pending.clone();
+            tokio::spawn(async move { recv_demux_loop("v6", s, p).await });
+        }
+
+        Ok(Self {
+            v4_sock,
+            v6_sock,
+            pending,
+        })
+    }
+
+    async fn query(
+        &self,
+        peer: SocketAddr,
+        query: &[u8],
+        expected_txid: u16,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, SocketAddr)> {
+        let sock = match peer.ip() {
+            IpAddr::V4(_) => self.v4_sock.as_ref(),
+            IpAddr::V6(_) => self.v6_sock.as_ref(),
+        }
+        .ok_or_else(|| anyhow!("no upstream socket for family of {peer}"))?;
+
+        let key = (peer.ip(), expected_txid);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            // 16-bit TXID across N concurrent queries to the same
+            // peer collides with probability ~N/65k. Caller picks
+            // TXIDs randomly; on the rare collision, fail the new
+            // query so the original gets its expected response.
+            // The caller's outer retry loop (query_ns_set or
+            // query() in this file) will pick a fresh TXID and try
+            // again, so this almost-never propagates to the user.
+            if pending.contains_key(&key) {
+                return Err(anyhow!(
+                    "upstream UDP TXID collision for {peer} (txid={expected_txid:#06x})"
+                ));
+            }
+            pending.insert(key, tx);
+        }
+
+        // RAII: ensure we clean up the pending entry on every exit
+        // path (timeout, send error, drop). Without this, a query
+        // future that's cancelled (e.g. by tokio::time::timeout
+        // higher up) leaves a dangling entry that wedges the slot
+        // for that (peer, txid) pair.
+        struct Cleanup<'a> {
+            pending: &'a Mutex<PendingMap>,
+            key: (IpAddr, u16),
+            disarmed: bool,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if !self.disarmed {
+                    self.pending.lock().unwrap().remove(&self.key);
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            pending: &self.pending,
+            key,
+            disarmed: false,
+        };
+
+        sock.send_to(query, peer)
+            .await
+            .map_err(|e| anyhow!("upstream UDP send to {peer}: {e:?}"))?;
+
+        let (resp, from) = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(_)) => {
+                return Err(anyhow!("upstream UDP {peer}: response channel closed"));
+            }
+            Err(_) => {
+                return Err(anyhow!("upstream UDP {peer}: timed out"));
+            }
+        };
+        cleanup.disarmed = true; // recv side already removed the entry
+        Ok((resp, from))
+    }
+}
+
+fn bind_ephemeral_with_source(
+    source: IpAddr,
+    reactor: VclReactor,
+) -> Result<VclDgramSocket> {
+    // Try a handful of random ephemeral ports — VPP's session
+    // table can have a port in use even when Linux's wouldn't.
+    const LOW: u16 = 32768;
+    const HIGH: u16 = 60999;
+    let mut last_err = None;
+    for _ in 0..8 {
+        let port: u16 = rand::thread_rng().gen_range(LOW..=HIGH);
+        let addr = SocketAddr::new(source, port);
+        match VclDgramSocket::bind(addr, reactor.clone()) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(anyhow!(
+        "ephemeral source bind exhausted: {:?}",
+        last_err
+    ))
+}
+
+async fn recv_demux_loop(
+    family: &'static str,
+    sock: Arc<VclDgramSocket>,
+    pending: Arc<Mutex<PendingMap>>,
+) {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, peer)) => {
+                if n < 12 {
+                    tracing::debug!(
+                        family,
+                        %peer,
+                        n,
+                        "upstream UDP: short response, dropping"
+                    );
+                    continue;
+                }
+                let txid = u16::from_be_bytes([buf[0], buf[1]]);
+                let key = (peer.ip(), txid);
+                let resp = buf[..n].to_vec();
+                let waiter = {
+                    let mut p = pending.lock().unwrap();
+                    p.remove(&key)
+                };
+                match waiter {
+                    Some(tx) => {
+                        let _ = tx.send((resp, peer));
+                    }
+                    None => {
+                        // Late response (caller already timed out
+                        // and dropped its entry), or unsolicited
+                        // packet, or TXID mismatch. Drop silently
+                        // at debug.
+                        tracing::debug!(
+                            family,
+                            %peer,
+                            txid = format!("{:#06x}", txid),
+                            "upstream UDP: unmatched response, dropping"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    family,
+                    "upstream UDP recv loop error: {e:?} — sleeping briefly"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
 pub struct UpstreamClient {
+    /// Async UDP path: one persistent socket per family +
+    /// `(peer, txid)` demultiplexer. Concurrency limited only by
+    /// in-flight pending entries, not thread count.
+    udp: Arc<AsyncUdpUpstream>,
     /// Sender side of the work queue. Cheap to clone (Arc internally
     /// in async-channel); we keep one and pass it around. Workers
-    /// hold the matching Receiver clones.
+    /// hold the matching Receiver clones. TCP-only now — UDP
+    /// doesn't dispatch through here anymore.
     cmd_tx: async_channel::Sender<UpstreamCmd>,
     timeout: Duration,
     /// Explicit source IP for outgoing v4 upstream queries. When
@@ -184,79 +405,36 @@ pub struct UpstreamClient {
 /// jt-router. With one v4 + one v6 socket per worker, per-query
 /// cost is just a sendto + busy-poll recvfrom on an existing
 /// session — no leak.
-fn upstream_worker(
-    rx: async_channel::Receiver<UpstreamCmd>,
-    worker_no: usize,
-    source_v4: Option<std::net::Ipv4Addr>,
-    source_v6: Option<std::net::Ipv6Addr>,
-) {
+fn upstream_worker(rx: async_channel::Receiver<UpstreamCmd>, worker_no: usize) {
     vcl_rs::register_worker_thread();
-    // libvppcom 25.10 caps workers per app and the cap is lower than
-    // the official 16 in practice (we've seen as few as 3 on a busy
-    // VPP). A thread that fails to register would GP-fault inside
-    // vppcom_session_create on first use; bail it out instead.
+    // Workers that fail VCL registration would GP-fault inside
+    // vppcom_session_create on first use; bail out instead.
     let vcl_idx = unsafe { vcl_rs::ffi::vppcom_worker_index() };
     if vcl_idx < 0 {
         tracing::warn!(
             worker_no,
-            "upstream worker registration failed — exiting (effective pool shrinks by one)"
+            "upstream TCP worker registration failed — exiting (pool shrinks by one)"
         );
         return;
     }
+    tracing::debug!(worker_no, vcl_idx, "upstream TCP worker thread started");
 
-    // Create persistent v4 + v6 sockets. Failure on either side
-    // doesn't fail the worker — queries to that family will return
-    // an error that bubbles up to the recursor's NS-set fallback.
-    let v4_sock = match VclUdpSyncSocket::bind(source_v4.map(std::net::IpAddr::V4), false) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(worker_no, "v4 upstream socket bind failed: {e}");
-            None
-        }
-    };
-    let v6_sock = match VclUdpSyncSocket::bind(source_v6.map(std::net::IpAddr::V6), true) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(worker_no, "v6 upstream socket bind failed: {e}");
-            None
-        }
-    };
-    tracing::debug!(
-        worker_no,
-        vcl_idx,
-        v4 = v4_sock.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.to_string()),
-        v6 = v6_sock.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.to_string()),
-        "upstream worker thread started"
-    );
-
+    // No persistent sockets here — TCP fallback creates one
+    // ephemeral session per query inside query_tcp_dns_sync. UDP
+    // doesn't route through this pool at all (handled by
+    // AsyncUdpUpstream on the main Tokio thread). That keeps each
+    // worker's per-thread VPP FIFO footprint to whatever
+    // query_tcp_dns_sync allocates per query, not 256 MB sitting
+    // around bound to family-specific sockets.
     while let Ok(cmd) = rx.recv_blocking() {
         match cmd {
-            UpstreamCmd::Udp { peer, query, timeout, reply } => {
-                let sock = if peer.is_ipv4() { &v4_sock } else { &v6_sock };
-                let res = match sock {
-                    Some(s) => s.query(peer, &query, timeout),
-                    None => Err(vcl_rs::error::VclError::Api(
-                        format!("no upstream socket for family of {peer}"),
-                        -1,
-                    )),
-                };
-                let _ = reply.send(res);
-            }
             UpstreamCmd::Tcp { peer, source, query, timeout, reply } => {
-                // TCP still uses the ephemeral path via
-                // query_tcp_dns_sync — TCP volume is much lower
-                // (only TC=1 fallback in normal operation), so
-                // the per-session leak hasn't surfaced. Reuse
-                // pattern can be applied here too if we ever see
-                // it bite.
                 let res = query_tcp_dns_sync(peer, source, &query, timeout);
                 let _ = reply.send(res);
             }
         }
     }
-    tracing::debug!(worker_no, "upstream worker thread exiting");
-    drop(v4_sock);
-    drop(v6_sock);
+    tracing::debug!(worker_no, "upstream TCP worker thread exiting");
     unsafe {
         vcl_rs::ffi::vppcom_worker_unregister();
     }
@@ -420,7 +598,7 @@ impl UpstreamClient {
         timeout_ms: Option<u32>,
         source_v4: Option<std::net::Ipv4Addr>,
         source_v6: Option<std::net::Ipv6Addr>,
-    ) -> Self {
+    ) -> Result<Self> {
         let timeout = Duration::from_millis(
             timeout_ms.map(|t| t as u64).unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         );
@@ -433,26 +611,40 @@ impl UpstreamClient {
             );
         }
 
+        // Async UDP upstream: persistent v4/v6 sockets bound on the
+        // main Tokio thread (which is already VCL worker-0). The
+        // demux task per family routes responses by (peer, txid).
+        let udp = Arc::new(
+            AsyncUdpUpstream::new(source_v4, source_v6, reactor.clone())
+                .context("AsyncUdpUpstream::new")?,
+        );
+
+        // Worker pool now serves only TCP fallback queries —
+        // libvppcom requires those to run on a registered worker
+        // thread and TCP sessions are connection-oriented (can't
+        // multiplex like UDP). 4 workers is plenty for TC=1
+        // fallback in normal operation.
         let (cmd_tx, cmd_rx) =
             async_channel::bounded::<UpstreamCmd>(UPSTREAM_QUEUE_DEPTH);
         for i in 0..UPSTREAM_WORKERS {
             let rx = cmd_rx.clone();
             std::thread::Builder::new()
                 .name(format!("dnsd-up-{i:02}"))
-                .spawn(move || upstream_worker(rx, i, source_v4, source_v6))
+                .spawn(move || upstream_worker(rx, i))
                 .expect("spawn upstream worker thread");
         }
         // Drop our local Receiver so the worker clones are the only
         // consumers. Channel will close cleanly when cmd_tx is dropped
         // (i.e. when UpstreamClient drops at shutdown).
         drop(cmd_rx);
-        Self {
+        Ok(Self {
+            udp,
             cmd_tx,
             reactor,
             timeout,
             source_v4,
             source_v6,
-        }
+        })
     }
 
     fn source_for(&self, peer: SocketAddr) -> Option<std::net::IpAddr> {
@@ -543,26 +735,15 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        // Upstream UDP queries dispatch to a dedicated VCL worker
-        // thread via the command channel. See `UPSTREAM_WORKERS` for
-        // why we don't use tokio's blocking pool: libvppcom 25.10
-        // requires every session op to run on the OS thread that
-        // owns the worker context, and tokio's blocking pool makes
-        // that invariant hard to keep.
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let cmd = UpstreamCmd::Udp {
-            peer,
-            query: query.to_vec(),
-            timeout: self.timeout,
-            reply: reply_tx,
-        };
-        self.cmd_tx
-            .send(cmd)
+        // Async multiplexer: send via the persistent per-family
+        // socket on the main Tokio thread, await a (peer, txid)-
+        // matched response from the demux task. No worker pool
+        // dispatch — concurrency is bounded only by the pending
+        // map size and per-peer FIFO state, not by thread count.
+        let (resp, from) = self
+            .udp
+            .query(peer, query, expected_txid, self.timeout)
             .await
-            .map_err(|_| anyhow!("upstream worker pool channel closed"))?;
-        let (resp, from) = reply_rx
-            .await
-            .map_err(|_| anyhow!("upstream worker dropped reply channel for {peer}"))?
             .with_context(|| format!("upstream UDP {peer}"))?;
 
         if from.ip() != peer.ip() {
@@ -574,6 +755,9 @@ impl UpstreamClient {
         if n < 12 {
             return Err(anyhow!("short upstream UDP response ({n} bytes)"));
         }
+        // TXID match is enforced at the demux layer (the response
+        // was routed to us BY the txid match), but verify here for
+        // defense in depth.
         let rx_txid = u16::from_be_bytes([resp[0], resp[1]]);
         if rx_txid != expected_txid {
             return Err(anyhow!(

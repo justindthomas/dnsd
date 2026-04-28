@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::RecordType;
@@ -361,12 +362,10 @@ impl RecursorHandler {
         let configured_v6 = cfg.recursion.as_ref().and_then(|r| r.source_v6);
         let source_v6 = configured_v6.or(listener_v6).or(discovered_v6_source);
         let source_v4 = discovered_v4_source.or(listener_v4);
-        let upstream = Arc::new(UpstreamClient::new(
-            reactor,
-            upstream_timeout_ms,
-            source_v4,
-            source_v6,
-        ));
+        let upstream = Arc::new(
+            UpstreamClient::new(reactor, upstream_timeout_ms, source_v4, source_v6)
+                .context("UpstreamClient::new")?,
+        );
 
         // Build a DNS64 policy if any listener has dns64 enabled,
         // OR if the operator wrote an explicit `dns.dns64:` block
