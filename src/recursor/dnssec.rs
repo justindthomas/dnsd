@@ -919,6 +919,21 @@ impl Validator {
         to_fetch.reverse(); // shallow → deep
 
         for zone in &to_fetch {
+            // Cache fast-path: if we've previously bootstrapped this
+            // intermediate (validator's `DnskeyCache`), reuse the
+            // validated keys without going back to the wire. The
+            // cache entry is from a successful prior bootstrap whose
+            // DS/DNSKEY/self-sign chain we already verified. Without
+            // this, every multi-zone-shortcut query re-pays a ~100ms
+            // arpa. round-trip — under heavy mDNS-spam load that adds
+            // up to seconds per minute of redundant upstream work.
+            if let Some(cached_keys) = self.cache.get_positive(&zone.to_lowercase()) {
+                tracing::debug!(zone = %zone, "intermediate zone cache hit — skipping bootstrap");
+                chain_keys.retain(|(n, _)| n != zone);
+                chain_keys.push((zone.clone(), cached_keys));
+                continue;
+            }
+
             // Parent is whichever entry in chain_keys is the deepest
             // ancestor — by construction that's the immediately
             // previous iteration's zone (or root for the first).
