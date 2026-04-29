@@ -73,8 +73,21 @@ rand = "0.8"
 http = "1"
 
 [features]
-default = ["dns-01"]
+default = ["dns-01", "vcl"]
 dns-01 = ["dep:instant-acme"]
+# Transport backend — exactly one must be enabled.
+#
+# `vcl` (default): listeners + upstream queries flow through VPP's
+# session layer via vcl-rs (libvppcom). Required for the production
+# router deployment; lets dnsd share the dataplane address that VPP
+# owns (e.g. 192.168.20.1 lives only inside VPP, never on the kernel).
+#
+# `kernel-sockets`: listeners + upstream queries use tokio::net::*
+# directly. No libvppcom link, no VPP needed at runtime — dnsd runs
+# as a plain recursive resolver process. Useful for non-router
+# deployments and for `cargo test` on dev machines without podman.
+vcl = []
+kernel-sockets = []
 
 [dev-dependencies]
 tempfile = "3"
