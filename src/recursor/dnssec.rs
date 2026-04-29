@@ -1450,11 +1450,31 @@ fn verify_authority_rrsets(
                 sig.signer_name()
             ));
         }
-        let verified = keys.iter().any(|k| verify_rrset(rrset, sig, k).is_ok());
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut tried_tags: Vec<u16> = Vec::new();
+        let mut verified = false;
+        for k in &keys {
+            tried_tags.push(k.calculate_key_tag().unwrap_or(0));
+            match verify_rrset(rrset, sig, k) {
+                Ok(()) => {
+                    verified = true;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
         if !verified {
             return Err(format!(
-                "denial RRSIG at {owner} did not verify under {}",
-                sig.signer_name()
+                "denial RRSIG at {owner} did not verify under {} \
+                 (rrsig key_tag={} alg={:?} type_covered={:?} owner={}, \
+                 chain key_tags={:?}, last err: {:?})",
+                sig.signer_name(),
+                sig.key_tag(),
+                sig.algorithm(),
+                rtype,
+                owner,
+                tried_tags,
+                last_err.map(|e| format!("{e:#}"))
             ));
         }
     }
