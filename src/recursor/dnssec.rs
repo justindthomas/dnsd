@@ -642,6 +642,42 @@ impl Validator {
                 // Already entered insecure territory.
                 break;
             }
+
+            // The DS RRSIG's signer name is whatever zone signed the
+            // DS RRset for `step.zone` — i.e., step.zone's parent.
+            // When the walker followed every delegation level, that
+            // parent is the previous step's zone (or root). But some
+            // authoritative servers shortcut multi-zone hierarchies
+            // they own (the canonical case: root operators also run
+            // arpa. + in-addr.arpa. + ip6.arpa., and a query for
+            // anything under in-addr.arpa. comes back as a single
+            // referral skipping arpa.). In that case the walker's
+            // chain misses arpa., but the DS RRSIG covering
+            // in-addr.arpa.'s DS records was still signed by arpa.'s
+            // ZSK. Bootstrap any missing ancestors so chain_keys has
+            // an entry for the actual signer before we try to verify.
+            if let Some(rrsig) = step
+                .ds_rrsig
+                .iter()
+                .find(|s| s.type_covered() == RecordType::DS)
+            {
+                let signer = rrsig.signer_name();
+                if !chain_keys.iter().any(|(n, _)| n == signer) {
+                    if let Err(e) = self
+                        .bootstrap_intermediate_zone(&mut chain_keys, signer, &root_ips)
+                        .await
+                    {
+                        tracing::warn!(
+                            zone = %step.zone,
+                            signer = %signer,
+                            "intermediate-zone bootstrap failed: {e:#}"
+                        );
+                        insecure_from = Some(step.zone.clone());
+                        continue;
+                    }
+                }
+            }
+
             // Find the parent zone's keys — the closest already-
             // trusted ancestor of step.zone.
             let parent_keys = closest_trusted_keys(&chain_keys, &step.zone);
@@ -847,6 +883,147 @@ impl Validator {
     /// `chain_keys` (either from the trust anchor, for root, or
     /// via the DS-covers check against the child's KSK, for
     /// deeper zones).
+    /// Bootstrap a missing intermediate zone's DNSKEYs into
+    /// `chain_keys`. Used when an authoritative server short-cuts
+    /// multiple zone cuts in a single referral (typical case: root
+    /// operators also run arpa./in-addr.arpa./ip6.arpa., so a deep
+    /// arpa. query returns a single referral and the walker never
+    /// records arpa. as its own step).
+    ///
+    /// Walks down label-by-label from the deepest already-trusted
+    /// ancestor of `target` toward `target`, fetching+verifying each
+    /// intermediate. Uses `root_ips` for queries — works for the
+    /// observed shared-server cases (root operators are also auth
+    /// for arpa. and below). Deeper-gap scenarios with NS-set
+    /// boundaries between intermediates would need a more elaborate
+    /// NS-finding pass; we haven't seen one in practice.
+    async fn bootstrap_intermediate_zone(
+        &self,
+        chain_keys: &mut Vec<(Name, Vec<DNSKEY>)>,
+        target: &Name,
+        root_ips: &[std::net::IpAddr],
+    ) -> Result<()> {
+        // Build the list of ancestors we need to fetch, ordered from
+        // shallow to deep. Stop at the deepest entry that's already
+        // in chain_keys.
+        let target_lower = target.to_lowercase();
+        let mut to_fetch: Vec<Name> = Vec::new();
+        let mut cursor = target_lower.clone();
+        while !chain_keys.iter().any(|(n, _)| n.to_lowercase() == cursor) {
+            to_fetch.push(cursor.clone());
+            if cursor.is_root() {
+                anyhow::bail!("root not present in chain_keys when bootstrapping {target}");
+            }
+            cursor = cursor.base_name();
+        }
+        to_fetch.reverse(); // shallow → deep
+
+        for zone in &to_fetch {
+            // Parent is whichever entry in chain_keys is the deepest
+            // ancestor — by construction that's the immediately
+            // previous iteration's zone (or root for the first).
+            let parent_keys = closest_trusted_keys(chain_keys, zone);
+            if parent_keys.is_empty() {
+                anyhow::bail!("no trusted parent for {zone}");
+            }
+
+            // Fetch DS records for `zone` from root NSes (which are
+            // auth for the entire shared-server hierarchy in this
+            // failure mode).
+            let ds_wire = build_ds_query(zone)?;
+            let mut ds_records: Vec<Record> = Vec::new();
+            let mut ds_rrsig: Option<RRSIG> = None;
+            let mut last_err: Option<anyhow::Error> = None;
+            for ip in root_ips {
+                match self.upstream.query(&[*ip], &ds_wire).await {
+                    Ok(bytes) => match Message::from_bytes(&bytes) {
+                        Ok(msg) => {
+                            for r in msg.answers().iter().chain(msg.name_servers().iter()) {
+                                if r.name().to_lowercase() != *zone {
+                                    continue;
+                                }
+                                match r.data() {
+                                    Some(RData::DNSSEC(DNSSECRData::DS(_))) => {
+                                        ds_records.push(r.clone());
+                                    }
+                                    Some(RData::DNSSEC(DNSSECRData::RRSIG(s)))
+                                        if s.type_covered() == RecordType::DS =>
+                                    {
+                                        ds_rrsig = Some(s.clone());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !ds_records.is_empty() && ds_rrsig.is_some() {
+                                break;
+                            }
+                        }
+                        Err(e) => last_err = Some(e.into()),
+                    },
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if ds_records.is_empty() {
+                anyhow::bail!(
+                    "no DS records returned for {zone} (last err: {:?})",
+                    last_err
+                );
+            }
+            let ds_rrsig = ds_rrsig
+                .ok_or_else(|| anyhow!("DS RRset for {zone} came without an RRSIG"))?;
+            check_rrsig_validity(&ds_rrsig)
+                .with_context(|| format!("DS RRSIG for {zone}"))?;
+            let ds_verified = parent_keys
+                .iter()
+                .any(|k| verify_rrset(&ds_records, &ds_rrsig, k).is_ok());
+            if !ds_verified {
+                anyhow::bail!("DS RRSIG for {zone} did not verify under parent keys");
+            }
+
+            // Fetch DNSKEY for `zone`. The same root NSes serve it.
+            let (dnskey_records, dnskeys, dnskey_rrsig) =
+                self.fetch_dnskey_rrset(zone, root_ips).await?;
+            let dnskey_rrsig = dnskey_rrsig
+                .ok_or_else(|| anyhow!("{zone} DNSKEY RRset came without an RRSIG"))?;
+            check_rrsig_validity(&dnskey_rrsig)
+                .with_context(|| format!("{zone} DNSKEY RRSIG"))?;
+            let self_signed = dnskeys
+                .iter()
+                .any(|k| verify_rrset(&dnskey_records, &dnskey_rrsig, k).is_ok());
+            if !self_signed {
+                anyhow::bail!("{zone} DNSKEY RRset is not self-signed");
+            }
+            // At least one of zone's DNSKEYs must hash to one of the DS records.
+            let ds_values: Vec<&DS> = ds_records
+                .iter()
+                .filter_map(|r| match r.data() {
+                    Some(RData::DNSSEC(DNSSECRData::DS(d))) => Some(d),
+                    _ => None,
+                })
+                .collect();
+            let ds_match = dnskeys
+                .iter()
+                .any(|k| ds_values.iter().any(|d| d.covers(zone, k).unwrap_or(false)));
+            if !ds_match {
+                anyhow::bail!("no DNSKEY for {zone} matches any bootstrapped DS");
+            }
+
+            let ttl = Duration::from_secs(
+                dnskey_records
+                    .iter()
+                    .map(|r| r.ttl() as u64)
+                    .min()
+                    .unwrap_or(MIN_POSITIVE_TTL.as_secs()),
+            );
+            self.cache
+                .put_positive(zone.to_lowercase(), dnskeys.clone(), ttl);
+            chain_keys.retain(|(n, _)| n != zone);
+            chain_keys.push((zone.clone(), dnskeys));
+            tracing::info!(zone = %zone, "intermediate zone bootstrapped");
+        }
+        Ok(())
+    }
+
     async fn splice_in_zone_dnskey(
         &self,
         chain_keys: &mut Vec<(Name, Vec<DNSKEY>)>,
@@ -1598,6 +1775,26 @@ fn base32_hex_decode(label: &[u8]) -> Option<Vec<u8>> {
 /// Build a DNSKEY query for `zone`. Always sets DO=1 — otherwise
 /// the server omits the covering RRSIG which is what we actually
 /// need.
+/// EDNS0 + DO=1 query for `zone DS`, used by the intermediate-zone
+/// bootstrap path when an authoritative server short-cut multiple
+/// zone cuts in a single referral.
+fn build_ds_query(zone: &Name) -> Result<Vec<u8>> {
+    let mut msg = Message::new();
+    msg.set_id(rand::random());
+    msg.set_message_type(MessageType::Query);
+    msg.set_op_code(OpCode::Query);
+    msg.set_recursion_desired(false);
+    let mut q = Query::query(zone.clone(), RecordType::DS);
+    q.set_query_class(DNSClass::IN);
+    msg.add_query(q);
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(1232);
+    edns.set_version(0);
+    edns.set_dnssec_ok(true);
+    msg.set_edns(edns);
+    msg.to_vec().context("encode DS query")
+}
+
 pub(crate) fn build_dnskey_query(zone: &Name) -> Result<Vec<u8>> {
     let mut msg = Message::new();
     msg.set_id(rand::random());
