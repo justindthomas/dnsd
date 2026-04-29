@@ -93,7 +93,10 @@ impl Dns64Policy {
 
     pub fn is_excluded(&self, qname: &Name) -> bool {
         let lq = qname.to_lowercase();
-        self.exclusions.iter().any(|ex| lq.zone_of(ex) || &lq == ex)
+        // hickory's `parent.zone_of(child)` returns true when parent is
+        // an ancestor zone of child. We want "qname is the exclusion
+        // OR a subdomain of one" — so the exclusion is the parent.
+        self.exclusions.iter().any(|ex| ex.zone_of(&lq) || &lq == ex)
     }
 }
 

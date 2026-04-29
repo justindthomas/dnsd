@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::io::transport::{DnsTcpListener, DnsTcpStream, ReactorCtx};
@@ -84,7 +85,7 @@ async fn accept_loop(
 }
 
 async fn serve_connection(
-    stream: DnsTcpStream,
+    mut stream: DnsTcpStream,
     peer: std::net::SocketAddr,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
@@ -99,15 +100,15 @@ async fn serve_connection(
     // latency at worst and avoid a write-serialisation bug surface.
     loop {
         let mut lenbuf = [0u8; 2];
-        match stream.read_exact(&mut lenbuf).await {
-            Ok(()) => {}
-            // Backend-specific connection-closed signal: VCL surfaces
-            // an explicit `Closed` variant; the kernel backend will
-            // return its own io::ErrorKind::UnexpectedEof. Phase 4
-            // adds the kernel arm; for now this branch only exists
-            // under the `vcl` feature.
-            #[cfg(feature = "vcl")]
-            Err(vcl_rs::error::VclError::Closed) => return Ok(()),
+        // UFCS through the AsyncReadExt trait so we get a uniform
+        // io::Result on both backends. VclStream has an inherent
+        // `read_exact` that would otherwise win method-resolution and
+        // return VclError; AsyncRead's tokio contract surfaces the
+        // VCL `Closed` variant as io::ErrorKind::UnexpectedEof inside
+        // vcl-rs, matching what tokio::net::TcpStream does on EOF.
+        match AsyncReadExt::read_exact(&mut stream, &mut lenbuf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         }
         let len = u16::from_be_bytes(lenbuf) as usize;
@@ -116,7 +117,7 @@ async fn serve_connection(
         }
 
         let mut query = vec![0u8; len];
-        stream.read_exact(&mut query).await?;
+        AsyncReadExt::read_exact(&mut stream, &mut query).await?;
 
         // Re-check ACL on each query inside the connection so a
         // SIGHUP that drops a CIDR boots already-connected clients
@@ -133,7 +134,7 @@ async fn serve_connection(
             let mut framed = Vec::with_capacity(2 + response.len());
             framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
             framed.extend_from_slice(&response);
-            stream.write_all(&framed).await?;
+            AsyncWriteExt::write_all(&mut stream, &framed).await?;
         }
     }
 }

@@ -484,6 +484,7 @@ pub async fn discover_v4_source(
     Ok(None)
 }
 
+#[cfg(feature = "vcl")]
 fn is_globally_routable_v4(v4: &std::net::Ipv4Addr) -> bool {
     if v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_broadcast() {
         return false;
@@ -497,6 +498,7 @@ fn is_globally_routable_v4(v4: &std::net::Ipv4Addr) -> bool {
     true
 }
 
+#[cfg(feature = "vcl")]
 fn is_globally_routable_v6(v6: &std::net::Ipv6Addr) -> bool {
     if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
         return false;

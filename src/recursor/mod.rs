@@ -50,7 +50,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 use crate::config::DnsConfig;
 use crate::handler::{DnsHandler, ListenerContext};
 use crate::metrics::Metrics;
-use vcl_rs::VclReactor;
+use crate::io::transport::ReactorCtx;
 
 pub use cache::{CacheKey, DnsCache};
 pub use dns64::Dns64Policy;
@@ -304,7 +304,7 @@ impl RecursorHandler {
 
     pub fn from_config(
         cfg: &DnsConfig,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let cache = Self::build_cache_from_config(cfg);
@@ -319,7 +319,7 @@ impl RecursorHandler {
     /// restarts (e.g. `/persistent/data/dnsd/root-hints` on imp).
     pub fn from_parts(
         cfg: &DnsConfig,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         metrics: Arc<Metrics>,
         cache: Arc<DnsCache>,
         forwarders: Arc<Forwarders>,

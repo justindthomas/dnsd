@@ -11,8 +11,10 @@ authors = ["Justin Thomas"]
 hickory-proto = { version = "0.24", features = ["dnssec-ring"] }
 hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-rustls"] }
 
-# VCL transport — every socket goes through VPP's session layer
-vcl-rs = { git = "https://github.com/justindthomas/vcl-rs" }
+# VCL transport — every socket goes through VPP's session layer.
+# Optional: with `--no-default-features --features kernel-sockets`
+# dnsd builds against tokio::net::* and skips libvppcom entirely.
+vcl-rs = { git = "https://github.com/justindthomas/vcl-rs", optional = true }
 
 # Runtime
 tokio = { version = "1", features = ["full"] }
@@ -52,8 +54,9 @@ async-channel = "2"
 # at startup to discover a globally-routable IPv6 source for upstream
 # queries (the VCL API doesn't expose VPP's FIB-derived source, and
 # binding `::` causes packets to leave with src=:: which the wire
-# drops).
-vpp-api = { git = "https://github.com/justindthomas/vpp-api" }
+# drops). Tied to the vcl feature — kernel-sockets builds rely on
+# kernel routing for source selection.
+vpp-api = { git = "https://github.com/justindthomas/vpp-api", optional = true }
 
 # Config + IO
 clap = { version = "4", features = ["derive"] }
@@ -86,7 +89,7 @@ dns-01 = ["dep:instant-acme"]
 # directly. No libvppcom link, no VPP needed at runtime — dnsd runs
 # as a plain recursive resolver process. Useful for non-router
 # deployments and for `cargo test` on dev machines without podman.
-vcl = []
+vcl = ["dep:vcl-rs", "dep:vpp-api"]
 kernel-sockets = []
 
 [dev-dependencies]
