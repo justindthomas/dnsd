@@ -1,6 +1,7 @@
 //! DNS-over-HTTPS (RFC 8484) listener.
 //!
-//! `VclListener` accepts TCP/443 through VPP. Each connection is
+//! `DnsTcpListener` (transport-backend-selected) accepts TCP/443.
+//! Each connection is
 //! wrapped in rustls and then in hyper via `axum` for the HTTP
 //! plumbing. We serve both modes per RFC 8484:
 //!
@@ -45,9 +46,8 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
-use vcl_rs::{VclListener, VclReactor};
-
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
+use crate::io::transport::{DnsTcpListener, ReactorCtx};
 use crate::metrics::Metrics;
 
 #[derive(Clone)]
@@ -64,14 +64,14 @@ pub struct DohListener;
 impl DohListener {
     pub async fn spawn(
         bind: SocketAddr,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
         tls_config: Arc<rustls::ServerConfig>,
         acl: AclSwap,
         ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let listener = VclListener::bind(bind, reactor.clone())
+        let listener = DnsTcpListener::bind(bind, reactor.clone())
             .with_context(|| format!("DoH bind {bind}"))?;
         let acceptor = TlsAcceptor::from(tls_config);
         {
@@ -87,7 +87,7 @@ impl DohListener {
 }
 
 async fn accept_loop(
-    listener: VclListener,
+    listener: DnsTcpListener,
     acceptor: TlsAcceptor,
     acl: AclSwap,
     handler: SharedHandler,

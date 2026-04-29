@@ -1,7 +1,7 @@
 //! DNS-over-TLS (RFC 7858) listener.
 //!
-//! `VclListener` accepts TCP/853 through VPP's session layer. Each
-//! connection is wrapped in `tokio-rustls` using the operator's
+//! `DnsTcpListener` (transport-backend-selected) accepts TCP/853;
+//! each connection is wrapped in `tokio-rustls` using the operator's
 //! certificate. Inside the TLS stream, the wire protocol is the
 //! same 2-byte-length-prefixed DNS of TCP/53 (RFC 1035 §4.2.2) — we
 //! reuse the same framing loop.
@@ -26,9 +26,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
-use vcl_rs::{VclListener, VclReactor};
-
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
+use crate::io::transport::{DnsTcpListener, ReactorCtx};
 use crate::metrics::Metrics;
 
 const MAX_TCP_MESSAGE: usize = 65535;
@@ -38,14 +37,14 @@ pub struct DotListener;
 impl DotListener {
     pub async fn spawn(
         bind: SocketAddr,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
         tls_config: Arc<rustls::ServerConfig>,
         acl: AclSwap,
         ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let listener = VclListener::bind(bind, reactor.clone())
+        let listener = DnsTcpListener::bind(bind, reactor.clone())
             .with_context(|| format!("DoT bind {bind}"))?;
         let acceptor = TlsAcceptor::from(tls_config);
         {
@@ -61,7 +60,7 @@ impl DotListener {
 }
 
 async fn accept_loop(
-    listener: VclListener,
+    listener: DnsTcpListener,
     acceptor: TlsAcceptor,
     acl: AclSwap,
     handler: SharedHandler,

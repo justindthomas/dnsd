@@ -1,4 +1,4 @@
-//! DNS-over-TCP (RFC 7766) listener over `vcl-rs`.
+//! DNS-over-TCP (RFC 7766) listener.
 //!
 //! Framing per RFC 1035 §4.2.2: each message prefixed with a 2-byte
 //! big-endian length. One TCP connection can carry many queries; we
@@ -17,9 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use vcl_rs::{VclListener, VclReactor, VclStream};
 
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
+use crate::io::transport::{DnsTcpListener, DnsTcpStream, ReactorCtx};
 use crate::metrics::Metrics;
 
 const MAX_TCP_MESSAGE: usize = 65535; // length field is u16
@@ -29,13 +29,13 @@ pub struct TcpListener;
 impl TcpListener {
     pub async fn spawn(
         bind: SocketAddr,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
         acl: AclSwap,
         ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let listener = VclListener::bind(bind, reactor.clone())
+        let listener = DnsTcpListener::bind(bind, reactor.clone())
             .with_context(|| format!("TCP bind {bind}"))?;
         {
             let snap = ctx.load();
@@ -50,7 +50,7 @@ impl TcpListener {
 }
 
 async fn accept_loop(
-    listener: VclListener,
+    listener: DnsTcpListener,
     acl: AclSwap,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
@@ -84,7 +84,7 @@ async fn accept_loop(
 }
 
 async fn serve_connection(
-    stream: VclStream,
+    stream: DnsTcpStream,
     peer: std::net::SocketAddr,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
@@ -92,7 +92,7 @@ async fn serve_connection(
     ctx: CtxSwap,
 ) -> anyhow::Result<()> {
     // Serve queries serially on a TCP connection. RFC 7766 allows
-    // clients to pipeline, but concurrent writes on the same VclStream
+    // clients to pipeline, but concurrent writes on the same DnsTcpStream
     // would require a write-side mutex + ordering guarantee we don't
     // need for v1. Hickory, BIND, and Unbound clients all pipeline at
     // most 2-3 deep in practice; serial answers add a few ms of
@@ -101,6 +101,12 @@ async fn serve_connection(
         let mut lenbuf = [0u8; 2];
         match stream.read_exact(&mut lenbuf).await {
             Ok(()) => {}
+            // Backend-specific connection-closed signal: VCL surfaces
+            // an explicit `Closed` variant; the kernel backend will
+            // return its own io::ErrorKind::UnexpectedEof. Phase 4
+            // adds the kernel arm; for now this branch only exists
+            // under the `vcl` feature.
+            #[cfg(feature = "vcl")]
             Err(vcl_rs::error::VclError::Closed) => return Ok(()),
             Err(e) => return Err(e.into()),
         }

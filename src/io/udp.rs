@@ -1,11 +1,12 @@
-//! UDP/53 listener over `vcl-rs`.
+//! UDP/53 listener.
 //!
-//! One `VclDgramSocket` per listener. Every recv → ACL → dispatch →
-//! send is handled on the caller's Tokio task; heavy lifting happens
-//! inside the handler (which is expected to spawn its own tasks for
-//! upstream queries). Datagrams up to 4096 B are accepted — enough
-//! for an EDNS0-advertised MTU that fits in our normal MTU, larger
-//! responses drop TC=1 and the client retries over TCP.
+//! One `DnsDgramSocket` (transport-backend-selected — VCL or kernel)
+//! per listener. Every recv → ACL → dispatch → send is handled on
+//! the caller's Tokio task; heavy lifting happens inside the handler
+//! (which is expected to spawn its own tasks for upstream queries).
+//! Datagrams up to 4096 B are accepted — enough for an EDNS0-
+//! advertised MTU that fits in our normal MTU, larger responses
+//! drop TC=1 and the client retries over TCP.
 //!
 //! `acl` and `ctx` are `ArcSwap`-backed so SIGHUP-triggered reload can
 //! publish a fresh allow-list / dns64 toggle without rebinding the
@@ -16,9 +17,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use vcl_rs::{VclDgramSocket, VclReactor};
 
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
+use crate::io::transport::{DnsDgramSocket, ReactorCtx};
 use crate::metrics::Metrics;
 
 const UDP_BUF_SIZE: usize = 4096;
@@ -31,13 +32,13 @@ impl UdpListener {
     /// loop runs until `reactor` / `handler` are dropped.
     pub async fn spawn(
         bind: SocketAddr,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         handler: SharedHandler,
         metrics: Arc<Metrics>,
         acl: AclSwap,
         ctx: CtxSwap,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let sock = VclDgramSocket::bind(bind, reactor)
+        let sock = DnsDgramSocket::bind(bind, reactor)
             .with_context(|| format!("UDP bind {bind}"))?;
         {
             let snap = ctx.load();
@@ -52,7 +53,7 @@ impl UdpListener {
 }
 
 async fn serve_loop(
-    sock: VclDgramSocket,
+    sock: DnsDgramSocket,
     acl: AclSwap,
     handler: SharedHandler,
     metrics: Arc<Metrics>,
