@@ -325,6 +325,13 @@ impl Default for TrustAnchors {
 ///
 /// Lines starting with `;` or blank are skipped. Multi-line records
 /// wrapped in `(` / `)` are flattened first.
+/// Public re-exported wrapper used by `anchor::bootstrap_self_managed`
+/// to parse the embedded root KSK string at startup. Same parser
+/// the operator-supplied file path uses.
+pub fn parse_presentation_format_str(raw: &str) -> Result<TrustAnchors> {
+    parse_presentation_format(raw)
+}
+
 fn parse_presentation_format(raw: &str) -> Result<TrustAnchors> {
     // Flatten parenthesised multi-line rdata.
     let mut flat = String::with_capacity(raw.len());

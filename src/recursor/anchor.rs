@@ -385,6 +385,25 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// IANA root KSKs embedded at build time. When dnsd starts in
+/// self-managed mode (no operator-supplied trust_anchor file) and
+/// no anchor exists on disk yet, these get written as the initial
+/// active set; the RFC 5011 refresh task takes over from there.
+///
+/// Source of truth: <https://data.iana.org/root-anchors/>.
+/// Keep current — out-of-date embedded keys will eventually fail
+/// to validate the live root once IANA fully revokes them. RFC 5011
+/// rotation handles smooth in-place rolls, but only if dnsd was
+/// running across the rollover; long-cold installs need a recent
+/// build to bootstrap. Update on each dnsd release.
+///
+/// As of 2026-04: KSK-2017 (tag 20326) is active, KSK-2024 (tag
+/// 38696) is active, no revocations yet.
+pub const EMBEDDED_ROOT_KSKS: &str = "\
+.\tIN\tDNSKEY\t257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIzuDWfdRUfhHdY6+cn8HFRm+2hM8AnXGXws9555KrUB5qihylGa8subX2Nn6UwNR1AkUTV74bU=\n\
+.\tIN\tDNSKEY\t257 3 8 AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc=\n\
+";
+
 /// Default RFC 5011 refresh cadence: 1 hour. The RFC permits
 /// "regular polling" without a hard floor; an hour is what BIND
 /// and Unbound default to.
@@ -393,6 +412,61 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 /// Default TTL we emit when re-rendering the active anchor file.
 /// 172800 (48h) is what IANA publishes for `. DNSKEY`.
 pub const DEFAULT_ANCHOR_TTL: u32 = 172_800;
+
+/// First-boot bootstrap for the self-managed anchor directory.
+/// Materialises `EMBEDDED_ROOT_KSKS` to disk: the active anchor
+/// file in presentation format, the state sidecar with all keys
+/// marked Active, and returns the parsed `TrustAnchors` for
+/// immediate use.
+///
+/// Pure local op — no network. The RFC 5011 refresh task that the
+/// caller spawns afterwards handles ongoing rotation, including
+/// picking up new IANA KSKs and revoking old ones once we observe
+/// a signed root response that proves the change.
+///
+/// Idempotent: if `anchor_path` already exists with non-empty
+/// contents the caller should skip this. We don't enforce that
+/// here — the caller has more context.
+pub fn bootstrap_self_managed(
+    anchor_path: &Path,
+    state_path: &Path,
+) -> Result<TrustAnchors> {
+    // Reuse the validator's presentation-format parser so the
+    // embedded strings go through the exact same code path that
+    // operator-supplied files do.
+    let anchors = super::dnssec::parse_presentation_format_str(EMBEDDED_ROOT_KSKS)
+        .context("parsing embedded root KSKs (build-time bug — please report)")?;
+
+    // Convert to ManagedKey set so we can persist via the same
+    // helpers the refresh task uses.
+    let mut managed = Vec::new();
+    for (name, key) in anchors.keys() {
+        managed.push(ManagedKey::from_observed(
+            &name.to_ascii(),
+            key,
+            KeyStatus::Active,
+        ));
+    }
+
+    save_anchor_file(anchor_path, &managed, DEFAULT_ANCHOR_TTL)
+        .with_context(|| format!("writing bootstrap anchor file {}", anchor_path.display()))?;
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    save_state(
+        state_path,
+        &StateFile {
+            version: 1,
+            last_refresh: now_unix,
+            keys: managed,
+        },
+    )
+    .with_context(|| format!("writing bootstrap state file {}", state_path.display()))?;
+
+    Ok(anchors)
+}
 
 /// Periodic trust-anchor refresh task. Spawned once at handler
 /// construction; lives for the daemon's lifetime. Each tick:
@@ -754,6 +828,40 @@ mod tests {
             .collect();
         assert_eq!(dnskey_lines.len(), 1, "only Active should render");
         assert!(dnskey_lines[0].contains("257 3 8"));
+    }
+
+    #[test]
+    fn embedded_root_ksks_parse() {
+        let parsed =
+            super::super::dnssec::parse_presentation_format_str(EMBEDDED_ROOT_KSKS).unwrap();
+        assert_eq!(parsed.len(), 2, "expected KSK-2017 + KSK-2024");
+        for (name, key) in parsed.keys() {
+            assert!(
+                name.is_root(),
+                "embedded keys must own the root zone, got {name}"
+            );
+            assert!(key.secure_entry_point(), "embedded keys must have SEP=1");
+            assert!(!key.revoke(), "embedded keys must not have REVOKE set");
+        }
+    }
+
+    #[test]
+    fn bootstrap_writes_anchor_and_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor_path = dir.path().join("active.key");
+        let state_path = dir.path().join("active.key.state");
+
+        let anchors = bootstrap_self_managed(&anchor_path, &state_path).unwrap();
+        assert_eq!(anchors.len(), 2);
+
+        // Re-parse the file we just wrote to confirm it round-trips
+        // through the same parser the operator-file path uses.
+        let reread = super::super::dnssec::TrustAnchors::load_from_file(&anchor_path).unwrap();
+        assert_eq!(reread.len(), 2);
+
+        let state = load_state(&state_path).unwrap().unwrap();
+        assert_eq!(state.keys.len(), 2);
+        assert!(state.keys.iter().all(|k| k.is_active()));
     }
 
     #[test]

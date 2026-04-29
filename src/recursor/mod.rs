@@ -506,11 +506,34 @@ impl RecursorHandler {
                     }
                 }
                 Some(path) => {
-                    tracing::info!(
-                        path = %path.display(),
-                        "trust anchor file missing — bootstrap needed (phase 5)"
-                    );
-                    Arc::new(dnssec::TrustAnchors::new())
+                    // Self-managed mode + missing file → bootstrap from
+                    // the embedded IANA KSKs. This is the "fresh
+                    // install" path: dnsd materialises a known-good
+                    // anchor set on disk, then RFC 5011 keeps it
+                    // current. No network during bootstrap; trust
+                    // comes from the dnsd build chain.
+                    let state_path = {
+                        let mut s = path.as_os_str().to_owned();
+                        s.push(".state");
+                        std::path::PathBuf::from(s)
+                    };
+                    match anchor::bootstrap_self_managed(path, &state_path) {
+                        Ok(a) => {
+                            tracing::info!(
+                                path = %path.display(),
+                                keys = a.len(),
+                                "bootstrapped trust anchor from embedded IANA KSKs"
+                            );
+                            Arc::new(a)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                "bootstrap failed: {e:#} — validation will report Insecure"
+                            );
+                            Arc::new(dnssec::TrustAnchors::new())
+                        }
+                    }
                 }
                 None => {
                     tracing::warn!(
