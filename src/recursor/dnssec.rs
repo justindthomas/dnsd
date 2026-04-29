@@ -858,6 +858,39 @@ impl Validator {
             return ValidationStatus::Insecure;
         }
 
+        // Bootstrap any zone that signed an answer-section or
+        // authority-section RRSIG but isn't yet in chain_keys.
+        // Triggered by AA=1 NXDOMAIN responses from a server that
+        // short-cuts multiple zone cuts: walk.steps stays empty (no
+        // referrals were followed), so we never fetched the
+        // authoritative zone's DNSKEYs even though we need them to
+        // verify the denial-of-existence proof. Same kind of fix as
+        // the per-step intermediate bootstrap above, just covering
+        // the no-referral path.
+        let mut needed: Vec<Name> = Vec::new();
+        for r in answer.answers().iter().chain(answer.name_servers().iter()) {
+            if let Some(RData::DNSSEC(DNSSECRData::RRSIG(s))) = r.data() {
+                let signer = s.signer_name().clone();
+                if !chain_keys.iter().any(|(n, _)| n == &signer)
+                    && !needed.iter().any(|n| n == &signer)
+                {
+                    needed.push(signer);
+                }
+            }
+        }
+        for signer in needed {
+            if let Err(e) = self
+                .bootstrap_intermediate_zone(&mut chain_keys, &signer, &root_ips)
+                .await
+            {
+                tracing::warn!(
+                    signer = %signer,
+                    "answer-RRSIG signer bootstrap failed: {e:#}"
+                );
+                return ValidationStatus::Insecure;
+            }
+        }
+
         // Validate the answer RRSIGs against the terminal zone's
         // DNSKEYs (or the closest trusted ancestor if we can't
         // identify a terminal zone). For empty-answer responses
