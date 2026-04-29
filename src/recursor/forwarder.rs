@@ -5,7 +5,7 @@
 //! a per-attempt timeout.
 //!
 //! Upstream transport picks: UDP first via a fresh ephemeral
-//! VclDgramSocket (independent source port per query — baseline
+//! DnsDgramSocket (independent source port per query — baseline
 //! Kaminsky defence). If the UDP response has TC=1 (truncated), we
 //! transparently retry the same server over TCP via a VclStream. If
 //! the operator wants to skip UDP entirely, `force_tcp` bypasses the
@@ -27,7 +27,7 @@ use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
 use rand::Rng;
 use tokio::sync::oneshot;
-use vcl_rs::{VclDgramSocket, VclReactor};
+use crate::io::transport::{self, DnsDgramSocket, ReactorCtx};
 
 use crate::config::Forwarder as ForwarderCfg;
 
@@ -38,7 +38,7 @@ const MAX_TCP_MESSAGE: usize = 65535;
 // thread — no worker pool, no spawn_blocking. The thread is VCL
 // worker-0 (registered by VclApp::init), which satisfies VCL's
 // invariant that session ops happen on the worker that owns the
-// context. UDP multiplexes across persistent VclDgramSockets
+// context. UDP multiplexes across persistent DnsDgramSockets
 // (`AsyncUdpUpstream`); TCP uses VclStream::connect_async +
 // query_tcp_dns_async with non-blocking sessions and the reactor
 // for connect/read/write completion notifications.
@@ -117,7 +117,7 @@ fn is_suffix(name: &Name, suffix: &Name) -> bool {
 /// awaiting query future.
 type PendingMap = HashMap<(IpAddr, u16), oneshot::Sender<(Vec<u8>, SocketAddr)>>;
 
-/// Async UDP upstream: one persistent VclDgramSocket per address
+/// Async UDP upstream: one persistent DnsDgramSocket per address
 /// family, plus a demuxer task that reads responses and routes them
 /// to the awaiting query future via `(peer_ip, txid)`. Lets dnsd
 /// have arbitrarily-many concurrent in-flight UDP queries with no
@@ -134,8 +134,8 @@ type PendingMap = HashMap<(IpAddr, u16), oneshot::Sender<(Vec<u8>, SocketAddr)>>
 /// startup, all upstream UDP queries run on main and concurrency
 /// is bounded only by FIFO/peer-state, not thread count.
 struct AsyncUdpUpstream {
-    v4_sock: Option<Arc<VclDgramSocket>>,
-    v6_sock: Option<Arc<VclDgramSocket>>,
+    v4_sock: Option<Arc<DnsDgramSocket>>,
+    v6_sock: Option<Arc<DnsDgramSocket>>,
     pending: Arc<Mutex<PendingMap>>,
 }
 
@@ -143,7 +143,7 @@ impl AsyncUdpUpstream {
     fn new(
         source_v4: Option<std::net::Ipv4Addr>,
         source_v6: Option<std::net::Ipv6Addr>,
-        reactor: VclReactor,
+        reactor: ReactorCtx,
     ) -> Result<Self> {
         let pending = Arc::new(Mutex::new(PendingMap::new()));
 
@@ -255,8 +255,8 @@ impl AsyncUdpUpstream {
 
 fn bind_ephemeral_with_source(
     source: IpAddr,
-    reactor: VclReactor,
-) -> Result<VclDgramSocket> {
+    reactor: ReactorCtx,
+) -> Result<DnsDgramSocket> {
     // Try a handful of random ephemeral ports — VPP's session
     // table can have a port in use even when Linux's wouldn't.
     const LOW: u16 = 32768;
@@ -265,7 +265,7 @@ fn bind_ephemeral_with_source(
     for _ in 0..8 {
         let port: u16 = rand::thread_rng().gen_range(LOW..=HIGH);
         let addr = SocketAddr::new(source, port);
-        match VclDgramSocket::bind(addr, reactor.clone()) {
+        match DnsDgramSocket::bind(addr, reactor.clone()) {
             Ok(s) => return Ok(s),
             Err(e) => last_err = Some(e),
         }
@@ -278,7 +278,7 @@ fn bind_ephemeral_with_source(
 
 async fn recv_demux_loop(
     family: &'static str,
-    sock: Arc<VclDgramSocket>,
+    sock: Arc<DnsDgramSocket>,
     pending: Arc<Mutex<PendingMap>>,
 ) {
     let mut buf = vec![0u8; 4096];
@@ -351,13 +351,14 @@ pub struct UpstreamClient {
     /// listener side via reference counting; the upstream path
     /// itself doesn't go through this reactor.
     #[allow(dead_code)]
-    reactor: VclReactor,
+    reactor: ReactorCtx,
 }
 
 
 /// Default VPP binary-API socket path. Operators can override per
 /// instance if their VPP is bound to a non-default socket; today
 /// nothing else in dnsd needs to touch VPP, so we just hardcode.
+#[cfg(feature = "vcl")]
 pub const DEFAULT_VPP_API_SOCKET: &str = "/run/vpp/core-api.sock";
 
 /// Walk every VPP interface and return the first globally-routable
@@ -370,6 +371,12 @@ pub const DEFAULT_VPP_API_SOCKET: &str = "/run/vpp/core-api.sock";
 /// Used to auto-populate `source_v6` so dnsd doesn't need an explicit
 /// config knob for the common case. The VCL API can't tell us VPP's
 /// FIB-derived source, so we go around it via the binary API.
+///
+/// VCL-only — the kernel-sockets backend lets the kernel FIB pick
+/// the source automatically (or honours an explicit `source_v6:`
+/// in config). Phase 4 may add a `getifaddrs`-based equivalent if
+/// auto-discovery turns out to be wanted there too.
+#[cfg(feature = "vcl")]
 pub async fn discover_v6_source(
     vpp_api_socket: &str,
 ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
@@ -423,6 +430,10 @@ pub async fn discover_v6_source(
 /// way UDP does — VPP's TCP handshake state lookup doesn't match
 /// when the SYN/ACK arrives if the session was unbound at connect
 /// time) sits in NotConnected forever and times out.
+///
+/// VCL-only — kernel-sockets backend doesn't have the VPP-TCP
+/// session-lookup quirk and can rely on kernel routing.
+#[cfg(feature = "vcl")]
 pub async fn discover_v4_source(
     vpp_api_socket: &str,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
@@ -509,7 +520,7 @@ fn is_globally_routable_v6(v6: &std::net::Ipv6Addr) -> bool {
 
 impl UpstreamClient {
     pub fn new(
-        reactor: VclReactor,
+        reactor: ReactorCtx,
         timeout_ms: Option<u32>,
         source_v4: Option<std::net::Ipv4Addr>,
         source_v6: Option<std::net::Ipv6Addr>,
@@ -683,7 +694,7 @@ impl UpstreamClient {
         expected_txid: u16,
         expected_qname: &[u8],
     ) -> Result<Vec<u8>> {
-        let resp = vcl_rs::query_tcp_dns_async(
+        let resp = transport::query_tcp_dns_async(
             peer,
             self.source_for(peer),
             query,

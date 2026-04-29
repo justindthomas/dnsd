@@ -30,7 +30,9 @@ use dnsd::handler::{AclSwap, CtxSwap, ListenerContext, LiveHandler, SharedHandle
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
 use dnsd::recursor::{DnsCache, Forwarders, RecursorHandler};
-use vcl_rs::{VclApp, VclReactor};
+use dnsd::io::transport::{self, ReactorCtx};
+#[cfg(feature = "vcl")]
+use vcl_rs::VclApp;
 
 // VCL ops do NOT go through tokio's blocking pool. libvppcom 25.10
 // pins each session to the OS thread that registered the worker
@@ -146,6 +148,11 @@ fn main() -> Result<()> {
     // still be in their recv loop holding sessions when libvppcom
     // tears the app down — and the SIGTERM-triggered shutdown wedges.
     // Hence: declare `vcl_app` first (drops last), then `runtime`.
+    //
+    // Kernel-sockets backend has no equivalent: no shared library
+    // state to initialise, no worker-thread registration, no shutdown
+    // ordering hazard.
+    #[cfg(feature = "vcl")]
     let vcl_app = VclApp::init("dnsd")
         .with_context(|| "VclApp::init — is VPP up and vcl.conf readable?")?;
 
@@ -175,6 +182,7 @@ fn main() -> Result<()> {
     // and to guarantee it even if something later inserts another
     // local between `vcl_app` and `runtime`.
     drop(runtime);
+    #[cfg(feature = "vcl")]
     drop(vcl_app);
     result
 }
@@ -252,7 +260,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
         }
     });
 
-    let reactor = VclReactor::new().with_context(|| "VclReactor::new")?;
+    let reactor = transport::new_reactor().with_context(|| "transport::new_reactor")?;
 
     // Ask VPP for a globally-routable v6 source IP. Used as the
     // outbound source for IPv6 upstream queries when neither
@@ -261,6 +269,11 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
     // it via the binary API (vpp-api crate). Discovery failure is
     // non-fatal — dnsd just won't have a v6 source and v6 NS
     // queries will time out.
+    //
+    // Kernel-sockets backend skips this: kernel routing picks the
+    // source automatically (or honours an explicit `source_v6:` from
+    // config). No VPP API is reachable in that build anyway.
+    #[cfg(feature = "vcl")]
     let discovered_v6 = match dnsd::recursor::forwarder::discover_v6_source(
         dnsd::recursor::forwarder::DEFAULT_VPP_API_SOCKET,
     )
@@ -272,10 +285,13 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             None
         }
     };
+    #[cfg(not(feature = "vcl"))]
+    let discovered_v6: Option<std::net::Ipv6Addr> = None;
     // Same for v4. Required for outbound TCP — VPP's TCP stack
     // doesn't reliably match the SYN/ACK back to a session whose
     // source was picked by FIB at SYN-emit time. With an explicit
     // bind the session-lookup just works.
+    #[cfg(feature = "vcl")]
     let discovered_v4 = match dnsd::recursor::forwarder::discover_v4_source(
         dnsd::recursor::forwarder::DEFAULT_VPP_API_SOCKET,
     )
@@ -287,6 +303,8 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             None
         }
     };
+    #[cfg(not(feature = "vcl"))]
+    let discovered_v4: Option<std::net::Ipv4Addr> = None;
 
     // Build the initial recursor and wrap it for hot-swap on SIGHUP.
     // Listener tasks hold the LiveHandler — they keep working across
@@ -364,7 +382,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
 async fn try_bind_one(
     lc: &ListenerCfg,
     proto: &'static str,
-    reactor: &VclReactor,
+    reactor: &ReactorCtx,
     handler: &SharedHandler,
     metrics: &Arc<Metrics>,
     tls: Option<&Arc<rustls::ServerConfig>>,
@@ -443,7 +461,7 @@ async fn try_bind_one(
 /// land in `out` so reload's hot-swap path can find them later.
 async fn bind_listener_set_with_retry(
     cfg: &DnsConfig,
-    reactor: &VclReactor,
+    reactor: &ReactorCtx,
     handler: &SharedHandler,
     metrics: &Arc<Metrics>,
     tls: Option<&Arc<rustls::ServerConfig>>,
@@ -548,7 +566,7 @@ struct WaitArgs {
     control_socket: PathBuf,
     config_path: PathBuf,
     root_hints_path: PathBuf,
-    reactor: VclReactor,
+    reactor: ReactorCtx,
     metrics: Arc<Metrics>,
     cache: Arc<DnsCache>,
     live: Arc<LiveHandler<RecursorHandler>>,
