@@ -319,6 +319,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
         Some(root_hints_path.clone()),
         discovered_v6,
         discovered_v4,
+        Some(args.data_dir.join("anchor")),
     )
     .context("RecursorHandler init")?;
     initial_recursor.spawn_dnssec_prewarm();
@@ -362,6 +363,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             forwarders_swap,
             discovered_v6_source: discovered_v6,
             discovered_v4_source: discovered_v4,
+            anchor_dir: args.data_dir.join("anchor"),
         },
         listeners,
     )
@@ -583,6 +585,11 @@ struct WaitArgs {
     discovered_v6_source: Option<std::net::Ipv6Addr>,
     /// VPP-discovered v4 source IP. Same rationale as v6.
     discovered_v4_source: Option<std::net::Ipv4Addr>,
+    /// Self-managed trust-anchor directory (`<data_dir>/anchor/`).
+    /// Used when no operator `trust_anchor:` path is set; the
+    /// RFC 5011 refresh task and (in phase 5) the bootstrap fetch
+    /// both write here.
+    anchor_dir: PathBuf,
 }
 
 /// Re-read router.yaml, build a fresh RecursorHandler, atomically
@@ -632,6 +639,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
         Some(args.root_hints_path.clone()),
         args.discovered_v6_source,
         args.discovered_v4_source,
+        Some(args.anchor_dir.clone()),
     ) {
         Ok(r) => r,
         Err(e) => {

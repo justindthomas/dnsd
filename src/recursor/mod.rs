@@ -310,7 +310,7 @@ impl RecursorHandler {
     ) -> anyhow::Result<Self> {
         let cache = Self::build_cache_from_config(cfg);
         let forwarders = Self::build_forwarders_from_config(cfg)?;
-        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None, None, None)
+        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None, None, None, None)
     }
 
     /// Build a RecursorHandler using a pre-constructed cache +
@@ -327,6 +327,7 @@ impl RecursorHandler {
         root_hints_path: Option<std::path::PathBuf>,
         discovered_v6_source: Option<std::net::Ipv6Addr>,
         discovered_v4_source: Option<std::net::Ipv4Addr>,
+        anchor_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let upstream_timeout_ms = cfg
             .recursion
@@ -454,38 +455,67 @@ impl RecursorHandler {
             .map(|r| r.roots_arc())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(Vec::new())));
 
-        // Load trust anchors if a path is configured AND DNSSEC
-        // validation is on. Anchor-load failures log a warning but
-        // don't fail startup — operators can fix the file and SIGHUP
-        // once it's in place.
+        // Trust anchor loading — three modes:
+        //
+        //   1. Operator-supplied file (`trust_anchor: /path`): use as
+        //      the source of truth. Refresh writes back to the same
+        //      path. State sidecar lives at `<path>.state`.
+        //   2. Self-managed (`trust_anchor` unset, anchor_dir provided):
+        //      look in `<data_dir>/anchor/active.key`. Empty/missing →
+        //      log "needs bootstrap"; phase 5 fills in. Refresh
+        //      writes here too.
+        //   3. Neither: warn — validation reports Insecure.
+        //
+        // Anchor-load failures never fail startup; operators can fix
+        // the file and SIGHUP without taking the daemon down.
         let validator = if matches!(dnssec, DnssecPolicy::Validate) {
-            let anchors = match cfg
+            // Resolve the active-anchor file path that the refresh
+            // task will read/write.
+            let anchor_path: Option<std::path::PathBuf> = cfg
                 .recursion
                 .as_ref()
                 .and_then(|r| r.trust_anchor.as_ref())
-            {
-                Some(path) => match dnssec::TrustAnchors::load_from_file(
-                    std::path::Path::new(path),
-                ) {
-                    Ok(a) => {
-                        tracing::info!(
-                            path = %path,
-                            keys = a.len(),
-                            "loaded DNSSEC trust anchors"
-                        );
-                        Arc::new(a)
+                .map(std::path::PathBuf::from)
+                .or_else(|| anchor_dir.as_ref().map(|d| d.join("active.key")));
+
+            let anchors = match anchor_path.as_deref() {
+                Some(path) if path.exists() => {
+                    match dnssec::TrustAnchors::load_from_file(path) {
+                        Ok(a) if !a.is_empty() => {
+                            tracing::info!(
+                                path = %path.display(),
+                                keys = a.len(),
+                                "loaded DNSSEC trust anchors"
+                            );
+                            Arc::new(a)
+                        }
+                        Ok(_) => {
+                            tracing::info!(
+                                path = %path.display(),
+                                "trust anchor file is empty — bootstrap needed (phase 5)"
+                            );
+                            Arc::new(dnssec::TrustAnchors::new())
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                "failed to load trust anchors: {e} (validation will report Insecure)"
+                            );
+                            Arc::new(dnssec::TrustAnchors::new())
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path,
-                            "failed to load trust anchors: {e} (validation disabled)"
-                        );
-                        Arc::new(dnssec::TrustAnchors::new())
-                    }
-                },
+                }
+                Some(path) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "trust anchor file missing — bootstrap needed (phase 5)"
+                    );
+                    Arc::new(dnssec::TrustAnchors::new())
+                }
                 None => {
                     tracing::warn!(
-                        "dnssec: validate is set but no trust_anchor path configured — validation will report Insecure"
+                        "dnssec: validate is set but no trust_anchor path configured \
+                         and no anchor_dir provided — validation will report Insecure"
                     );
                     Arc::new(dnssec::TrustAnchors::new())
                 }
@@ -495,20 +525,13 @@ impl RecursorHandler {
             let anchors_swap: dnssec::TrustAnchorSwap =
                 Arc::new(arc_swap::ArcSwap::new(anchors));
 
-            // Spawn the periodic refresh task if we have a file
-            // path to persist into. State sidecar lives next to it
-            // as `<anchor>.state`. If `trust_anchor` is unset, the
-            // refresh task doesn't run yet — phase 4 wires the
-            // self-managed-directory + bootstrap path that handles
-            // the no-config case.
-            if let Some(path) = cfg
-                .recursion
-                .as_ref()
-                .and_then(|r| r.trust_anchor.as_ref())
-            {
-                let anchor_path: std::path::PathBuf = path.into();
+            // Spawn the periodic refresh task whenever we have a
+            // file path to persist into — operator-supplied or self-
+            // managed. State sidecar lives next to the anchor file
+            // as `<anchor>.state`.
+            if let Some(path) = anchor_path {
                 let state_path = {
-                    let mut s = anchor_path.as_os_str().to_owned();
+                    let mut s = path.as_os_str().to_owned();
                     s.push(".state");
                     std::path::PathBuf::from(s)
                 };
@@ -516,7 +539,7 @@ impl RecursorHandler {
                     anchors: anchors_swap.clone(),
                     upstream: upstream.clone(),
                     roots: validator_roots.clone(),
-                    anchor_path,
+                    anchor_path: path,
                     state_path,
                     interval: anchor::DEFAULT_REFRESH_INTERVAL,
                     hold_down: anchor::DEFAULT_HOLD_DOWN,
