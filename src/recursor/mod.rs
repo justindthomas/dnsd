@@ -489,8 +489,14 @@ impl RecursorHandler {
                     Arc::new(dnssec::TrustAnchors::new())
                 }
             };
+            // Wrap in arc-swap so the upcoming RFC 5011 rotation task
+            // can publish updates without rebuilding the validator.
+            // Phase 1 just plumbs the swap; later phases do the
+            // periodic refresh + bootstrap fill.
+            let anchors_swap: dnssec::TrustAnchorSwap =
+                Arc::new(arc_swap::ArcSwap::new(anchors));
             Some(Arc::new(dnssec::Validator::new(
-                anchors,
+                anchors_swap,
                 upstream.clone(),
                 validator_roots,
             )))

@@ -485,10 +485,20 @@ pub fn apply_validation(resp: &mut Message, status: &ValidationStatus) {
     };
 }
 
+/// Shared, swappable handle to the active trust-anchor set. The RFC
+/// 5011 refresh task publishes a new set into this swap whenever a
+/// hold-down completes or a key gets revoked; existing in-flight
+/// validations keep using the snapshot they loaded.
+pub type TrustAnchorSwap = Arc<arc_swap::ArcSwap<TrustAnchors>>;
+
 /// Helper that glues a validator into the handler: `Arc<Validator>`
 /// can be cheaply cloned across tasks.
 pub struct Validator {
-    pub anchors: Arc<TrustAnchors>,
+    /// Active trust anchors. Loaded via `arc-swap` so the RFC 5011
+    /// rotation task can publish updates without restarting the
+    /// validator. Each `validate*` call snapshots once; long-running
+    /// chain walks don't see mid-walk changes.
+    pub anchors: TrustAnchorSwap,
     /// Upstream client used to fetch per-zone DNSKEY RRsets during
     /// chain validation.
     pub upstream: Arc<UpstreamClient>,
@@ -506,7 +516,7 @@ pub struct Validator {
 
 impl Validator {
     pub fn new(
-        anchors: Arc<TrustAnchors>,
+        anchors: TrustAnchorSwap,
         upstream: Arc<UpstreamClient>,
         roots: Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
     ) -> Self {
@@ -521,7 +531,7 @@ impl Validator {
     /// Quick-path validation against pre-loaded anchors only. Used
     /// for tests and for responses we don't have a WalkChain for.
     pub fn validate(&self, resp: &Message) -> ValidationStatus {
-        validate_response(resp, &self.anchors)
+        validate_response(resp, &self.anchors.load())
     }
 
     /// Full chain validation for an iterative-resolve result:
@@ -548,8 +558,13 @@ impl Validator {
     ) -> ValidationStatus {
         let mut chain_keys: Vec<(Name, Vec<DNSKEY>)> = Vec::new();
 
+        // Snapshot the active anchor set once for this whole walk so
+        // a concurrent RFC 5011 refresh that publishes a new set
+        // doesn't shift our trust mid-validation.
+        let anchors = self.anchors.load_full();
+
         // Seed with trust anchors.
-        for (name, key) in &self.anchors.keys {
+        for (name, key) in &anchors.keys {
             let entry = chain_keys
                 .iter_mut()
                 .find(|(n, _)| n == name);
