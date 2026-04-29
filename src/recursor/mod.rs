@@ -490,12 +490,40 @@ impl RecursorHandler {
                     Arc::new(dnssec::TrustAnchors::new())
                 }
             };
-            // Wrap in arc-swap so the upcoming RFC 5011 rotation task
-            // can publish updates without rebuilding the validator.
-            // Phase 1 just plumbs the swap; later phases do the
-            // periodic refresh + bootstrap fill.
+            // Wrap in arc-swap so the RFC 5011 rotation task can
+            // publish updates without rebuilding the validator.
             let anchors_swap: dnssec::TrustAnchorSwap =
                 Arc::new(arc_swap::ArcSwap::new(anchors));
+
+            // Spawn the periodic refresh task if we have a file
+            // path to persist into. State sidecar lives next to it
+            // as `<anchor>.state`. If `trust_anchor` is unset, the
+            // refresh task doesn't run yet — phase 4 wires the
+            // self-managed-directory + bootstrap path that handles
+            // the no-config case.
+            if let Some(path) = cfg
+                .recursion
+                .as_ref()
+                .and_then(|r| r.trust_anchor.as_ref())
+            {
+                let anchor_path: std::path::PathBuf = path.into();
+                let state_path = {
+                    let mut s = anchor_path.as_os_str().to_owned();
+                    s.push(".state");
+                    std::path::PathBuf::from(s)
+                };
+                anchor::AnchorRefresh {
+                    anchors: anchors_swap.clone(),
+                    upstream: upstream.clone(),
+                    roots: validator_roots.clone(),
+                    anchor_path,
+                    state_path,
+                    interval: anchor::DEFAULT_REFRESH_INTERVAL,
+                    hold_down: anchor::DEFAULT_HOLD_DOWN,
+                }
+                .spawn();
+            }
+
             Some(Arc::new(dnssec::Validator::new(
                 anchors_swap,
                 upstream.clone(),

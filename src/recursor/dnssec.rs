@@ -276,6 +276,30 @@ impl TrustAnchors {
         self.keys.len()
     }
 
+    /// Build a `TrustAnchors` from a slice of `ManagedKey`s,
+    /// skipping anything not in the `Active` state. Used by the
+    /// RFC 5011 refresh loop to publish a new active set after a
+    /// transition (promote / revoke).
+    pub fn from_managed_keys(
+        keys: &[crate::recursor::anchor::ManagedKey],
+    ) -> anyhow::Result<Self> {
+        let mut out = Vec::new();
+        for k in keys.iter().filter(|k| k.is_active()) {
+            let dnskey = k.to_dnskey()?;
+            let name = hickory_proto::rr::Name::from_ascii(&k.zone)
+                .with_context(|| format!("bad zone name {:?}", k.zone))?;
+            out.push((name, dnskey));
+        }
+        Ok(Self { keys: out })
+    }
+
+    /// Read-only access to all (zone, key) pairs. Used by the
+    /// RFC 5011 refresh task to verify a fresh DNSKEY RRset against
+    /// every active anchor.
+    pub fn keys(&self) -> &[(hickory_proto::rr::Name, DNSKEY)] {
+        &self.keys
+    }
+
     pub fn dnskeys_for(&self, owner: &hickory_proto::rr::Name) -> Vec<&DNSKEY> {
         let lower = owner.to_lowercase();
         self.keys
@@ -1567,7 +1591,7 @@ fn base32_hex_decode(label: &[u8]) -> Option<Vec<u8>> {
 /// Build a DNSKEY query for `zone`. Always sets DO=1 — otherwise
 /// the server omits the covering RRSIG which is what we actually
 /// need.
-fn build_dnskey_query(zone: &Name) -> Result<Vec<u8>> {
+pub(crate) fn build_dnskey_query(zone: &Name) -> Result<Vec<u8>> {
     let mut msg = Message::new();
     msg.set_id(rand::random());
     msg.set_message_type(MessageType::Query);

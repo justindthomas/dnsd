@@ -28,14 +28,22 @@
 //! * Phase 4: self-managed anchor directory (no operator file).
 //! * Phase 5: RFC 7958 bootstrap.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::prelude::{Engine, BASE64_STANDARD};
-use hickory_proto::rr::dnssec::rdata::DNSKEY;
+use hickory_proto::op::Message;
+use hickory_proto::rr::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
 use hickory_proto::rr::dnssec::Algorithm;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
 use serde::{Deserialize, Serialize};
+
+use super::dnssec::{build_dnskey_query, verify_rrset, TrustAnchorSwap, TrustAnchors};
+use super::forwarder::UpstreamClient;
 
 /// Default RFC 5011 hold-down: 30 days. New KSKs sit in PendingAdd
 /// for at least this long before promoting to Active. RFC 5011 §2.4
@@ -375,6 +383,182 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     PathBuf::from(s)
+}
+
+/// Default RFC 5011 refresh cadence: 1 hour. The RFC permits
+/// "regular polling" without a hard floor; an hour is what BIND
+/// and Unbound default to.
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Default TTL we emit when re-rendering the active anchor file.
+/// 172800 (48h) is what IANA publishes for `. DNSKEY`.
+pub const DEFAULT_ANCHOR_TTL: u32 = 172_800;
+
+/// Periodic trust-anchor refresh task. Spawned once at handler
+/// construction; lives for the daemon's lifetime. Each tick:
+///
+///   1. Snapshot current active anchors.
+///   2. Query `. DNSKEY +dnssec` from a root NS.
+///   3. Verify the response's RRSIG against the active anchors
+///      (RFC 5011 §2.3 — the new RRset must be signed by a key we
+///      already trust, otherwise we ignore it).
+///   4. Run `apply_refresh` to compute next state.
+///   5. Persist state file + anchor file (atomic).
+///   6. Publish the new TrustAnchors into the validator's swap.
+pub struct AnchorRefresh {
+    pub anchors: TrustAnchorSwap,
+    pub upstream: Arc<UpstreamClient>,
+    pub roots: Arc<RwLock<Vec<IpAddr>>>,
+    pub anchor_path: PathBuf,
+    pub state_path: PathBuf,
+    pub interval: Duration,
+    pub hold_down: Duration,
+}
+
+impl AnchorRefresh {
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Stagger first tick by a few seconds so handler
+            // construction completes and root hints are populated
+            // before we hit the wire.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut ticker = tokio::time::interval(self.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First fire is immediate; subsequent ticks honour `interval`.
+            loop {
+                ticker.tick().await;
+                match self.tick().await {
+                    Ok(diff) if !diff.is_empty() => {
+                        tracing::info!(
+                            added = diff.added_pending.len(),
+                            promoted = diff.promoted.len(),
+                            revoked = diff.revoked.len(),
+                            dropped = diff.dropped_pending.len(),
+                            pruned = diff.pruned_revoked.len(),
+                            "trust anchor state changed"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::debug!("trust anchor refresh: no change");
+                    }
+                    Err(e) => {
+                        tracing::warn!("trust anchor refresh failed: {e:#}");
+                    }
+                }
+            }
+        })
+    }
+
+    async fn tick(&self) -> Result<RefreshDiff> {
+        let root_ips = {
+            let g = self
+                .roots
+                .read()
+                .map_err(|_| anyhow!("root hints lock poisoned"))?;
+            g.clone()
+        };
+        if root_ips.is_empty() {
+            anyhow::bail!("no root-hint NS IPs available");
+        }
+
+        let wire = build_dnskey_query(&Name::root())?;
+        let bytes = self
+            .upstream
+            .query(&root_ips, &wire)
+            .await
+            .context("upstream . DNSKEY query")?;
+        let resp = Message::from_bytes(&bytes).context("parsing . DNSKEY response")?;
+        let (records, keys, sig) = extract_dnskey_response(&resp)?;
+        let sig = sig.ok_or_else(|| anyhow!("no RRSIG on root DNSKEY response"))?;
+
+        // Verify the RRset against our currently-active anchors.
+        // RFC 5011 §2.3: a key transition requires the new RRset to
+        // be signed by an existing trusted key. If nothing
+        // validates, we keep the old state — better to alert on
+        // "refresh failed" than to silently accept an unsigned
+        // KSK rotation.
+        let active = self.anchors.load_full();
+        let any_valid = active
+            .keys()
+            .iter()
+            .any(|(_, k)| verify_rrset(&records, &sig, k).is_ok());
+        if !any_valid {
+            anyhow::bail!(
+                "DNSKEY RRSIG does not validate against any active trust anchor — \
+                 refusing to update state"
+            );
+        }
+
+        // Roll the state machine.
+        let prior = load_state(&self.state_path)
+            .context("loading prior anchor state")?
+            .map(|s| s.keys)
+            .unwrap_or_else(|| {
+                // First refresh on a freshly-loaded operator file:
+                // seed state from the active anchor set so we have
+                // a baseline to compute transitions against.
+                active
+                    .keys()
+                    .iter()
+                    .map(|(name, k)| ManagedKey::from_observed(&name.to_ascii(), k, KeyStatus::Active))
+                    .collect()
+            });
+        let observed: Vec<(String, DNSKEY)> = keys
+            .into_iter()
+            .map(|k| (".".to_string(), k))
+            .collect();
+
+        let (next, diff) = apply_refresh(&prior, &observed, SystemTime::now(), self.hold_down);
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        save_state(
+            &self.state_path,
+            &StateFile {
+                version: 1,
+                last_refresh: now_unix,
+                keys: next.clone(),
+            },
+        )?;
+        save_anchor_file(&self.anchor_path, &next, DEFAULT_ANCHOR_TTL)?;
+
+        // Publish into the swap so live validations see the new set.
+        let new_anchors =
+            TrustAnchors::from_managed_keys(&next).context("building TrustAnchors from state")?;
+        self.anchors.store(Arc::new(new_anchors));
+
+        Ok(diff)
+    }
+}
+
+/// Pull the DNSKEY records, the bare DNSKEY rdata, and the (single)
+/// RRSIG covering the DNSKEY RRset from a `. DNSKEY` response.
+fn extract_dnskey_response(
+    resp: &Message,
+) -> Result<(Vec<Record>, Vec<DNSKEY>, Option<RRSIG>)> {
+    let mut records = Vec::new();
+    let mut keys = Vec::new();
+    let mut sig: Option<RRSIG> = None;
+    let zone = Name::root();
+    for r in resp.answers() {
+        if r.name() != &zone {
+            continue;
+        }
+        match r.data() {
+            Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => {
+                records.push(r.clone());
+                keys.push(k.clone());
+            }
+            Some(RData::DNSSEC(DNSSECRData::RRSIG(s)))
+                if s.type_covered() == RecordType::DNSKEY =>
+            {
+                sig = Some(s.clone());
+            }
+            _ => {}
+        }
+    }
+    Ok((records, keys, sig))
 }
 
 #[cfg(test)]
