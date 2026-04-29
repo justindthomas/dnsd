@@ -22,6 +22,7 @@
 //! the iterative recursor; until then `validate` acts like `strip`
 //! and is documented in `dnssec.rs`.
 
+pub mod anchor;
 pub mod cache;
 pub mod cookies;
 pub mod forwarder;
