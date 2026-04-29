@@ -106,12 +106,30 @@ struct Args {
 fn main() -> Result<()> {
     // Honour NO_COLOR — keeps ANSI escapes out of impd-captured
     // stderr → journald.
-    fmt()
-        .with_ansi(std::env::var_os("NO_COLOR").is_none())
+    //
+    // Skip the per-event timestamp when stderr isn't a terminal:
+    // under impd the captured line already gets impd's own timestamp
+    // and journald adds a third on top. Triple-stamping was just
+    // visual noise in `journalctl -u impd`. When dnsd runs standalone
+    // (foreground in a shell, kernel-sockets dev mode) stderr IS a
+    // terminal and timestamps stay on.
+    use std::io::IsTerminal as _;
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let builder = fmt()
+        .with_ansi(stderr_is_tty && std::env::var_os("NO_COLOR").is_none())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+        );
+    if stderr_is_tty {
+        builder.init();
+    } else {
+        // Drop both timestamp and level prefix — impd's capture
+        // already prepends both. Without this we'd see e.g.
+        // `... impd[88]: 2026-... INFO  INFO dnsd::recursor: ...`
+        // (impd adds the leading "INFO ts", dnsd contributes the
+        // second "INFO").
+        builder.without_time().with_level(false).init();
+    }
 
     let args = Args::parse();
 
