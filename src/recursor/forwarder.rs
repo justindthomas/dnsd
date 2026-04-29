@@ -147,16 +147,39 @@ impl AsyncUdpUpstream {
     ) -> Result<Self> {
         let pending = Arc::new(Mutex::new(PendingMap::new()));
 
-        let v4_sock = source_v4
+        // VCL backend: source IP MUST be set or no socket gets bound,
+        // because VPP's TCP/UDP session lookup needs an explicit local
+        // address (the FIB-picked one isn't guaranteed to match on the
+        // SYN/ACK return path).
+        //
+        // Kernel backend: missing source means "let the kernel pick" —
+        // bind 0.0.0.0:eph for v4 and [::]:eph for v6 so we still get
+        // an outbound socket. Operators can still pin sources via
+        // `recursion.source_v4` / `source_v6` when they want explicit
+        // egress addresses.
+        #[cfg(feature = "vcl")]
+        let v4_source = source_v4.map(IpAddr::V4);
+        #[cfg(feature = "vcl")]
+        let v6_source = source_v6.map(IpAddr::V6);
+        #[cfg(feature = "kernel-sockets")]
+        let v4_source = Some(source_v4
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        #[cfg(feature = "kernel-sockets")]
+        let v6_source = Some(source_v6
+            .map(IpAddr::V6)
+            .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)));
+
+        let v4_sock = v4_source
             .map(|ip| {
-                bind_ephemeral_with_source(IpAddr::V4(ip), reactor.clone())
+                bind_ephemeral_with_source(ip, reactor.clone())
                     .map(Arc::new)
                     .with_context(|| format!("bind v4 upstream socket on {ip}"))
             })
             .transpose()?;
-        let v6_sock = source_v6
+        let v6_sock = v6_source
             .map(|ip| {
-                bind_ephemeral_with_source(IpAddr::V6(ip), reactor.clone())
+                bind_ephemeral_with_source(ip, reactor.clone())
                     .map(Arc::new)
                     .with_context(|| format!("bind v6 upstream socket on {ip}"))
             })
@@ -531,6 +554,11 @@ impl UpstreamClient {
             timeout_ms.map(|t| t as u64).unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         );
 
+        // Only warn under VCL — that backend NEEDS an explicit source
+        // because of VPP's TCP/UDP session-lookup quirk. Kernel
+        // backend lets the FIB pick automatically and v6 still works
+        // when the host has v6 connectivity.
+        #[cfg(feature = "vcl")]
         if source_v6.is_none() {
             tracing::warn!(
                 "no source_v6 — IPv6 upstream queries will time out. Set \
