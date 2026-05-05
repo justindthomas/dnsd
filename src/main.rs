@@ -24,7 +24,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use dnsd::acl::ClientAcl;
 use dnsd::acme;
-use dnsd::config::{DnsConfig, Listener as ListenerCfg};
+use dnsd::config::{DnsConfig, Listener as ListenerCfg, DEFAULT_MAX_INFLIGHT};
 use dnsd::control::{ControlServer, ControlState, DEFAULT_SOCKET};
 use dnsd::handler::{AclSwap, CtxSwap, ListenerContext, LiveHandler, SharedHandler};
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
@@ -411,6 +411,7 @@ async fn try_bind_one(
 ) -> Result<Option<JoinHandle<()>>> {
     let bind = SocketAddr::new(lc.address, lc.port);
     let name = lc.name.clone();
+    let max_inflight = lc.max_inflight.unwrap_or(DEFAULT_MAX_INFLIGHT);
     match proto {
         "udp" => UdpListener::spawn(
             bind,
@@ -419,6 +420,7 @@ async fn try_bind_one(
             metrics.clone(),
             acl.clone(),
             ctx.clone(),
+            max_inflight,
         )
         .await
         .map(Some),

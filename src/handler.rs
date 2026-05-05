@@ -64,6 +64,34 @@ pub trait DnsHandler: Send + Sync + 'static {
     ) -> Option<Vec<u8>>;
 }
 
+/// Build a REFUSED reply mirroring the TXID + question section of
+/// `query`. Returns `None` if `query` doesn't parse — the caller
+/// should silently drop in that case (never reply to a malformed
+/// packet, that's an amplification vector).
+///
+/// Used in two places:
+/// * `RefusedHandler` — the disabled-mode dispatcher.
+/// * UDP listener load shedding — when the per-listener inflight
+///   cap is full, the listener answers REFUSED inline rather than
+///   spawning a walk task.
+pub fn build_refused(query: &[u8]) -> Option<Vec<u8>> {
+    let msg = Message::from_bytes(query).ok()?;
+    let mut resp = Message::new();
+    resp.set_id(msg.id());
+    resp.set_message_type(MessageType::Response);
+    resp.set_op_code(msg.op_code());
+    resp.set_recursion_desired(msg.recursion_desired());
+    resp.set_recursion_available(false);
+    resp.set_response_code(match msg.op_code() {
+        OpCode::Query => ResponseCode::Refused,
+        _ => ResponseCode::NotImp,
+    });
+    for q in msg.queries() {
+        resp.add_query(q.clone());
+    }
+    resp.to_vec().ok()
+}
+
 /// Stub handler: parses the query, mirrors the TXID + question section
 /// into a response with RCODE=REFUSED. Used by tests and as the
 /// disabled-mode handler when the operator turns recursion off — a
@@ -79,21 +107,7 @@ impl DnsHandler for RefusedHandler {
         _peer: IpAddr,
         _ctx: &ListenerContext,
     ) -> Option<Vec<u8>> {
-        let msg = Message::from_bytes(query).ok()?;
-        let mut resp = Message::new();
-        resp.set_id(msg.id());
-        resp.set_message_type(MessageType::Response);
-        resp.set_op_code(msg.op_code());
-        resp.set_recursion_desired(msg.recursion_desired());
-        resp.set_recursion_available(false);
-        resp.set_response_code(match msg.op_code() {
-            OpCode::Query => ResponseCode::Refused,
-            _ => ResponseCode::NotImp,
-        });
-        for q in msg.queries() {
-            resp.add_query(q.clone());
-        }
-        resp.to_vec().ok()
+        build_refused(query)
     }
 }
 

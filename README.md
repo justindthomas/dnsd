@@ -156,6 +156,7 @@ dns:
       allow_from:
         - 192.168.1.0/24
       dns64: false                       # default false; per-listener
+      max_inflight: 1024                 # UDP load-shed cap; REFUSED above
 
   # Conditional forwarders. Longest-suffix match on the qname.
   forwarders:

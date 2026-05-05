@@ -22,6 +22,9 @@ pub struct Metrics {
     pub dns64_synthesised: AtomicU64,
     pub dnssec_validated: AtomicU64,
     pub dnssec_failed: AtomicU64,
+    /// Incoming UDP queries refused because the per-listener
+    /// inflight cap was full. See `Listener.max_inflight`.
+    pub udp_inflight_shed: AtomicU64,
 }
 
 impl Metrics {
@@ -40,6 +43,7 @@ impl Metrics {
             dns64_synthesised: self.dns64_synthesised.load(Ordering::Relaxed),
             dnssec_validated: self.dnssec_validated.load(Ordering::Relaxed),
             dnssec_failed: self.dnssec_failed.load(Ordering::Relaxed),
+            udp_inflight_shed: self.udp_inflight_shed.load(Ordering::Relaxed),
         }
     }
 }
@@ -59,4 +63,6 @@ pub struct MetricsSnapshot {
     pub dns64_synthesised: u64,
     pub dnssec_validated: u64,
     pub dnssec_failed: u64,
+    #[serde(default)]
+    pub udp_inflight_shed: u64,
 }

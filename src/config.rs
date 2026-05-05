@@ -55,9 +55,19 @@ pub struct Listener {
     pub allow_from: Vec<IpNet>,
     #[serde(default)]
     pub dns64: bool,
+    /// Maximum concurrent in-flight UDP queries on this listener.
+    /// New queries above this cap are answered REFUSED immediately
+    /// without spawning a walk task. Defends against task pile-up
+    /// during upstream blackouts (every cache miss hangs ~5s, the
+    /// single tokio thread otherwise fills with timed-out tasks).
+    /// Unset → 1024.
+    #[serde(default)]
+    pub max_inflight: Option<u32>,
 }
 
 fn default_port() -> u16 { 53 }
+
+pub const DEFAULT_MAX_INFLIGHT: u32 = 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Forwarder {
