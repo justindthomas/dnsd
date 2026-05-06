@@ -17,11 +17,62 @@ use serde::Deserialize;
 struct RouterYaml {
     #[serde(default)]
     dns: Option<DnsConfig>,
+    /// Top-level VRF declarations. dnsd doesn't program FIB
+    /// entries (it speaks DNS, not routing), but per-VRF
+    /// instances bind sockets in the matching VPP session-layer
+    /// namespace via VCL_CONFIG. The vrfs: block is here so the
+    /// per-VRF loader can validate that `--vrf <name>` references
+    /// a declared VRF.
+    #[serde(default)]
+    vrfs: Vec<VrfYaml>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VrfYaml {
+    pub name: String,
+    #[serde(default)]
+    pub table_id_v4: u32,
+    #[serde(default)]
+    pub table_id_v6: u32,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct DnsConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub listeners: Vec<Listener>,
+    #[serde(default)]
+    pub forwarders: Vec<Forwarder>,
+    #[serde(default)]
+    pub recursion: Option<Recursion>,
+    #[serde(default)]
+    pub cache: Option<Cache>,
+    #[serde(default)]
+    pub dns64: Option<Dns64>,
+    #[serde(default)]
+    pub tls: Option<Tls>,
+    #[serde(default)]
+    pub rate_limit: Option<RateLimit>,
+    #[serde(default)]
+    pub sfw: Option<SfwHint>,
+    /// Per-VRF DNS instances. Each entry has its own listeners /
+    /// forwarders / cache / etc. plus a `name` matching a
+    /// top-level `vrfs[].name`. impd's supervisor spawns one
+    /// dnsd@<name> child per entry. Default-VRF DNS lives in the
+    /// flat top-level fields above.
+    #[serde(default)]
+    pub vrfs: Vec<DnsVrfConfig>,
+}
+
+/// One per-VRF DNS instance. Same shape as `DnsConfig` minus
+/// nested `vrfs`, plus a required `name`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsVrfConfig {
+    pub name: String,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub listeners: Vec<Listener>,
@@ -253,6 +304,45 @@ impl DnsConfig {
             .with_context(|| format!("parsing {}", path.display()))?;
         Ok(doc.dns.unwrap_or_default())
     }
+
+    /// Per-VRF loader: pick `dns.vrfs[name]`, return it as a flat
+    /// `DnsConfig`. Errors when `name` doesn't match a `dns.vrfs[]`
+    /// entry or the corresponding top-level `vrfs[]` declaration is
+    /// missing.
+    pub fn load_for_vrf(path: &Path, vrf_name: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let doc: RouterYaml = serde_yaml::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        // Validate that the VRF is declared at the router level.
+        if !doc.vrfs.iter().any(|v| v.name == vrf_name) {
+            return Err(anyhow::anyhow!(
+                "--vrf {}: VRF not declared in router.yaml's vrfs: block",
+                vrf_name
+            ));
+        }
+        let dns = doc.dns.unwrap_or_default();
+        let v = dns
+            .vrfs
+            .into_iter()
+            .find(|v| v.name == vrf_name)
+            .ok_or_else(|| anyhow::anyhow!(
+                "--vrf {}: no matching dns.vrfs[] block in config",
+                vrf_name
+            ))?;
+        Ok(DnsConfig {
+            enabled: v.enabled,
+            listeners: v.listeners,
+            forwarders: v.forwarders,
+            recursion: v.recursion,
+            cache: v.cache,
+            dns64: v.dns64,
+            tls: v.tls,
+            rate_limit: v.rate_limit,
+            sfw: v.sfw,
+            vrfs: Vec::new(),
+        })
+    }
 }
 
 impl Listener {
@@ -304,5 +394,68 @@ dns:
         assert_eq!(dns.forwarders[1].servers.len(), 2);
         let rec = dns.recursion.unwrap();
         assert!(rec.enabled && rec.dnssec_validate);
+    }
+
+    fn vrf_yaml() -> &'static str {
+        r#"
+vrfs:
+  - name: cust-a
+    table_id_v4: 100
+    table_id_v6: 200
+dns:
+  enabled: false
+  vrfs:
+    - name: cust-a
+      enabled: true
+      listeners:
+        - name: cust-a-lan
+          address: 10.42.0.1
+          protocols: [udp, tcp]
+      forwarders:
+        - domain: cust-a.local
+          servers: [10.42.0.53]
+"#
+    }
+
+    fn write_yaml(content: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn per_vrf_loader_picks_named_slice() {
+        let f = write_yaml(vrf_yaml());
+        let cfg = DnsConfig::load_for_vrf(f.path(), "cust-a").unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.listeners.len(), 1);
+        assert_eq!(cfg.listeners[0].name, "cust-a-lan");
+        assert_eq!(cfg.forwarders.len(), 1);
+        assert_eq!(cfg.forwarders[0].domain, "cust-a.local");
+    }
+
+    #[test]
+    fn per_vrf_loader_rejects_unknown_vrf() {
+        let f = write_yaml(vrf_yaml());
+        let err = DnsConfig::load_for_vrf(f.path(), "cust-b").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("cust-b"), "got {}", msg);
+    }
+
+    #[test]
+    fn default_loader_ignores_per_vrf_config() {
+        // The flat top-level `dns:` block is what `load()` returns;
+        // any `dns.vrfs[]` entries are surfaced via vrfs but the
+        // top-level identity doesn't inherit from them.
+        let f = write_yaml(vrf_yaml());
+        let cfg = DnsConfig::load(f.path()).unwrap();
+        assert!(!cfg.enabled);
+        assert!(cfg.listeners.is_empty());
+        // The vrfs[] block is preserved on the parsed default-VRF
+        // config so the supervisor can introspect it (though dnsd
+        // itself ignores it once running).
+        assert_eq!(cfg.vrfs.len(), 1);
+        assert_eq!(cfg.vrfs[0].name, "cust-a");
     }
 }

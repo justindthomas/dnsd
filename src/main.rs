@@ -101,6 +101,14 @@ struct Args {
     /// Control socket path.
     #[arg(long, default_value = DEFAULT_SOCKET)]
     control_socket: PathBuf,
+
+    /// Per-VRF instance name. When set, dnsd reads only the
+    /// matching `dns.vrfs[name]` slice from router.yaml; without
+    /// it the daemon falls back to the legacy single-tenant
+    /// top-level `dns:` block. impd's supervisor passes this for
+    /// every non-default-VRF child it spawns (`imp-dnsd@<vrf>`).
+    #[arg(long)]
+    vrf: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -133,12 +141,22 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let cfg = DnsConfig::load(&args.config)
-        .with_context(|| format!("loading dns config from {}", args.config.display()))?;
+    let cfg = match &args.vrf {
+        None => DnsConfig::load(&args.config)
+            .with_context(|| format!("loading dns config from {}", args.config.display()))?,
+        Some(name) => DnsConfig::load_for_vrf(&args.config, name).with_context(|| {
+            format!(
+                "loading dns config from {} for vrf {}",
+                args.config.display(),
+                name
+            )
+        })?,
+    };
     tracing::info!(
         enabled = cfg.enabled,
         listeners = cfg.listeners.len(),
         forwarders = cfg.forwarders.len(),
+        vrf = ?args.vrf,
         "dns config loaded"
     );
 
