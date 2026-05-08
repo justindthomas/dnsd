@@ -1226,7 +1226,7 @@ impl Validator {
                     tracing::info!(
                         zone = %zone,
                         ns = %ip,
-                        elapsed_ms = ns_t0.elapsed().as_millis() as u64,
+                        elapsed_ms = u64::try_from(ns_t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                         size = bytes.len(),
                         "DNSKEY fetch ok"
                     );
@@ -1259,7 +1259,7 @@ impl Validator {
                     tracing::info!(
                         zone = %zone,
                         ns = %ip,
-                        elapsed_ms = ns_t0.elapsed().as_millis() as u64,
+                        elapsed_ms = u64::try_from(ns_t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "DNSKEY fetch attempt failed: {e:#}"
                     );
                     last_err = Some(e);
@@ -1880,6 +1880,11 @@ pub(crate) fn build_dnskey_query(zone: &Name) -> Result<Vec<u8>> {
 /// Validity-window + sanity check on an RRSIG. Catches expired
 /// signatures (RFC 4034 §3.1.5) and garbage inception/expiry.
 fn check_rrsig_validity(sig: &RRSIG) -> Result<()> {
+    // RFC 4034 §3.1.5 defines the RRSIG inception/expiration fields
+    // as 32-bit unsigned seconds since the Unix epoch. The protocol
+    // mandates u32; the truncation here is the format, not a bug.
+    // (RFC 1982 serial-number arithmetic handles 2106 wrap-around.)
+    #[allow(clippy::cast_possible_truncation)]
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
@@ -1891,6 +1896,9 @@ fn check_rrsig_validity(sig: &RRSIG) -> Result<()> {
             "RRSIG expiration {expiration} precedes inception {inception}"
         ));
     }
+    // CLOCK_SKEW is a hardcoded `Duration::from_secs(...)` constant
+    // bounded well under 2^32 — the cast can't actually truncate.
+    #[allow(clippy::cast_possible_truncation)]
     let skew = CLOCK_SKEW.as_secs() as u32;
     if now + skew < inception {
         return Err(anyhow!(

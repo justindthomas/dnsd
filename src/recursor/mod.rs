@@ -270,7 +270,7 @@ impl RecursorHandler {
                 let _ = j.await;
             }
             tracing::info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "DNSSEC cache prewarm complete"
             );
         });
@@ -614,7 +614,7 @@ impl DnsHandler for RecursorHandler {
         }
         impl Drop for QTiming {
             fn drop(&mut self) {
-                let ms = self.t0.elapsed().as_millis() as u64;
+                let ms = u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if ms >= 50 {
                     tracing::info!(
                         qname = %self.qname,

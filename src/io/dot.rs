@@ -137,6 +137,19 @@ where
 
         let ctx_snap = ctx.load_full();
         if let Some(response) = handler.handle_bytes(&query, peer.ip(), &ctx_snap).await {
+            // RFC 1035 §4.2.2 length prefix is u16; defensive guard
+            // against the silent `as u16` truncation. dnsd's handler
+            // pipeline never produces an oversize response in
+            // practice — bounded by EDNS payload size on success and
+            // tiny on error — but the cast would otherwise wrap.
+            if response.len() > MAX_TCP_MESSAGE {
+                tracing::warn!(
+                    %peer,
+                    response_len = response.len(),
+                    "dropping oversize DoT response (>65535 bytes)"
+                );
+                return Ok(());
+            }
             let mut framed = Vec::with_capacity(2 + response.len());
             framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
             framed.extend_from_slice(&response);

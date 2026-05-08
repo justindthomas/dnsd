@@ -131,6 +131,20 @@ async fn serve_connection(
 
         let ctx_snap = ctx.load_full();
         if let Some(response) = handler.handle_bytes(&query, peer.ip(), &ctx_snap).await {
+            // RFC 1035 §4.2.2 length prefix is u16; refuse anything our
+            // own handler somehow built bigger than that. dnsd's
+            // pipeline never produces oversize answers in practice
+            // (positive responses are bounded by EDNS payload size,
+            // SERVFAIL etc. are tiny), so this is defensive — but the
+            // `as u16` cast would otherwise truncate silently.
+            if response.len() > MAX_TCP_MESSAGE {
+                tracing::warn!(
+                    %peer,
+                    response_len = response.len(),
+                    "dropping oversize TCP response (>65535 bytes)"
+                );
+                return Ok(());
+            }
             let mut framed = Vec::with_capacity(2 + response.len());
             framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
             framed.extend_from_slice(&response);

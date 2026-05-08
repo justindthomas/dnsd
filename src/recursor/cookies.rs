@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
-use rand::RngCore;
+use rand::Rng;
 
 /// EDNS option code for COOKIE (RFC 7873 §9).
 pub const OPT_COOKIE: u16 = 10;
@@ -46,7 +46,7 @@ pub struct CookieState {
 impl CookieState {
     pub fn new() -> Self {
         let mut c = [0u8; CLIENT_COOKIE_LEN];
-        rand::thread_rng().fill_bytes(&mut c);
+        rand::rng().fill_bytes(&mut c);
         Self {
             client_cookie: c,
             server_cookies: Mutex::new(HashMap::new()),

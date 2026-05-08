@@ -40,8 +40,7 @@ async-trait = "0.1"
 
 # Cache + rate limiting
 moka = { version = "0.12", features = ["future"] }
-governor = "0.7"
-nonzero_ext = "0.3"
+governor = "0.10"
 
 # MPMC channel for the upstream-query worker pool. The pool is a fixed
 # set of std::thread workers (libvppcom's worker model is one VCL
@@ -71,7 +70,7 @@ bytes = "1"
 base64 = "0.22"
 data-encoding = "2"
 arc-swap = "1"
-rand = "0.8"
+rand = "0.10"
 http = "1"
 
 [features]

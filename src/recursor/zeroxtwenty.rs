@@ -18,21 +18,21 @@
 //! `cnn.com.` instead of whatever case the upstream echoed.
 
 use anyhow::{anyhow, Result};
-use rand::Rng;
+use rand::RngExt;
 
 /// In-place 0x20-encode the question name in a DNS wire query.
 /// Returns the encoded question-name byte range as a vector so
 /// `verify` can compare against the response.
 pub fn encode(query: &mut [u8]) -> Result<Vec<u8>> {
     let range = qname_byte_range(query)?;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for i in range.clone() {
         let b = query[i];
         // Only flip letters, not label length bytes. We walk label
         // bodies below; skipping length bytes means walking the
         // length-prefix structure. qname_label_positions yields
         // exactly the data positions.
-        if b.is_ascii_alphabetic() && rng.gen::<bool>() {
+        if b.is_ascii_alphabetic() && rng.random::<bool>() {
             query[i] = b ^ 0x20;
         }
     }

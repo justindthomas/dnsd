@@ -474,7 +474,7 @@ impl IterativeResolver {
         use rand::seq::SliceRandom;
 
         let mut order: Vec<IpAddr> = ns_ips.to_vec();
-        order.shuffle(&mut rand::thread_rng());
+        order.shuffle(&mut rand::rng());
         order.truncate(MAX_NS_ATTEMPTS);
 
         let wire = build_query(qname, qtype, qclass, self.dnssec_ok)?;
@@ -658,7 +658,7 @@ impl IterativeResolver {
                 Err(_) => {
                     tracing::debug!(
                         ns = %target_name,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "glueless NS resolve timed out"
                     );
                 }
@@ -681,7 +681,7 @@ impl IterativeResolver {
             // walks the parent doesn't need.
             if !ips.is_empty() && started.elapsed() >= RESOLVE_NS_IPS_DEADLINE {
                 tracing::debug!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     remaining_subwalks = in_flight.len(),
                     "resolve_ns_ips deadline reached, stopping with partial set"
                 );

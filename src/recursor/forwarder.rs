@@ -25,7 +25,7 @@ use anyhow::{anyhow, Context, Result};
 use hickory_proto::op::Message;
 use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::BinDecodable;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::oneshot;
 use crate::io::transport::{self, DnsDgramSocket, ReactorCtx};
 
@@ -286,7 +286,7 @@ fn bind_ephemeral_with_source(
     const HIGH: u16 = 60999;
     let mut last_err = None;
     for _ in 0..8 {
-        let port: u16 = rand::thread_rng().gen_range(LOW..=HIGH);
+        let port: u16 = rand::rng().random_range(LOW..=HIGH);
         let addr = SocketAddr::new(source, port);
         match DnsDgramSocket::bind(addr, reactor.clone()) {
             Ok(s) => return Ok(s),
@@ -626,7 +626,7 @@ impl UpstreamClient {
     async fn query_one(&self, peer: SocketAddr, orig_query: &[u8]) -> Result<Vec<u8>> {
         let orig_msg = Message::from_bytes(orig_query).context("parse client query")?;
         let client_txid = orig_msg.metadata.id;
-        let upstream_txid: u16 = rand::thread_rng().gen();
+        let upstream_txid: u16 = rand::rng().random();
 
         // Build the upstream wire. Fresh TXID + 0x20-randomised
         // question name; the body is otherwise byte-identical to
@@ -646,7 +646,7 @@ impl UpstreamClient {
         // Fresh TXID + fresh 0x20 mask for the TCP hop.
         let final_resp = if parsed.metadata.truncation {
             tracing::debug!(%peer, "TC=1 on UDP; retrying over TCP");
-            let tcp_txid: u16 = rand::thread_rng().gen();
+            let tcp_txid: u16 = rand::rng().random();
             let mut tcp_out = orig_query.to_vec();
             tcp_out[0..2].copy_from_slice(&tcp_txid.to_be_bytes());
             let tcp_mask = super::zeroxtwenty::encode(&mut tcp_out)
