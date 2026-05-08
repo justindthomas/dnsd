@@ -223,7 +223,7 @@ fn min_ttl_from_response(bytes: &[u8]) -> Option<u32> {
     use hickory_proto::op::Message;
     use hickory_proto::serialize::binary::BinDecodable;
     let msg = Message::from_bytes(bytes).ok()?;
-    msg.answers().iter().map(|r| r.ttl()).min()
+    msg.answers.iter().map(|r| r.ttl).min()
 }
 
 #[allow(dead_code)]

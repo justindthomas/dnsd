@@ -221,9 +221,9 @@ pub fn should_synthesise(
     // terminal AAAA records in the answer. A CNAME chain with no
     // AAAA at the end is still a DNS64 trigger — the name exists
     // but has no v6 address, which is exactly what DNS64 is for.
-    match response.response_code() {
+    match response.metadata.response_code {
         ResponseCode::NoError => !response
-            .answers()
+            .answers
             .iter()
             .any(|r| r.record_type() == RecordType::AAAA),
         ResponseCode::NXDomain => true,
@@ -239,36 +239,36 @@ pub fn synthesise_from_a(
     original_query: &Message,
     a_response: &Message,
 ) -> Message {
-    let mut resp = Message::new();
-    resp.set_id(original_query.id());
-    resp.set_message_type(hickory_proto::op::MessageType::Response);
-    resp.set_op_code(hickory_proto::op::OpCode::Query);
-    resp.set_recursion_desired(original_query.recursion_desired());
-    resp.set_recursion_available(true);
-    resp.set_response_code(ResponseCode::NoError);
+    let mut resp = Message::response(
+        original_query.metadata.id,
+        hickory_proto::op::OpCode::Query,
+    );
+    resp.metadata.recursion_desired = original_query.metadata.recursion_desired;
+    resp.metadata.recursion_available = true;
+    resp.metadata.response_code = ResponseCode::NoError;
     // AD MUST be 0 for synthesised responses (RFC 6147 §5.5).
-    resp.set_authentic_data(false);
-    for q in original_query.queries() {
+    resp.metadata.authentic_data = false;
+    for q in &original_query.queries {
         resp.add_query(q.clone());
     }
     // Walk the A-response's answer section. Preserve CNAME records
     // verbatim (clients need the chain to understand why the AAAAs
     // at a different owner name "belong" to their query), synthesise
     // each A into an AAAA at the same owner. RFC 6147 §5.1.6.
-    for rec in a_response.answers() {
+    for rec in &a_response.answers {
         match rec.record_type() {
             RecordType::CNAME => {
                 resp.add_answer(rec.clone());
             }
             RecordType::A => {
-                let Some(RData::A(a)) = rec.data() else { continue };
+                let RData::A(a) = &rec.data else { continue };
                 let v6 = embed_v4(&policy.prefix, a.0);
                 let mut new_rec = Record::from_rdata(
-                    rec.name().clone(),
-                    rec.ttl(),
+                    rec.name.clone(),
+                    rec.ttl,
                     RData::AAAA(AAAA(v6)),
                 );
-                new_rec.set_dns_class(rec.dns_class());
+                new_rec.dns_class = rec.dns_class;
                 resp.add_answer(new_rec);
             }
             _ => {}
@@ -299,32 +299,32 @@ pub fn rewrap_ptr_response(
     original_query: &Message,
     v4_response: &Message,
 ) -> Message {
-    let original_qname = match original_query.queries().first() {
+    let original_qname = match original_query.queries.first() {
         Some(q) => q.name().clone(),
         None => return v4_response.clone(),
     };
-    let mut resp = Message::new();
-    resp.set_id(original_query.id());
-    resp.set_message_type(hickory_proto::op::MessageType::Response);
-    resp.set_op_code(hickory_proto::op::OpCode::Query);
-    resp.set_recursion_desired(original_query.recursion_desired());
-    resp.set_recursion_available(true);
-    resp.set_response_code(v4_response.response_code());
-    resp.set_authentic_data(false); // AD cleared for synthesised
-    for q in original_query.queries() {
+    let mut resp = Message::response(
+        original_query.metadata.id,
+        hickory_proto::op::OpCode::Query,
+    );
+    resp.metadata.recursion_desired = original_query.metadata.recursion_desired;
+    resp.metadata.recursion_available = true;
+    resp.metadata.response_code = v4_response.metadata.response_code;
+    resp.metadata.authentic_data = false; // AD cleared for synthesised
+    for q in &original_query.queries {
         resp.add_query(q.clone());
     }
-    for rec in v4_response.answers() {
+    for rec in &v4_response.answers {
         if rec.record_type() != RecordType::PTR {
             continue;
         }
-        let Some(RData::PTR(ptr)) = rec.data() else { continue };
+        let RData::PTR(ptr) = &rec.data else { continue };
         let mut new_rec = Record::from_rdata(
             original_qname.clone(),
-            rec.ttl(),
+            rec.ttl,
             RData::PTR(PTR(ptr.0.clone())),
         );
-        new_rec.set_dns_class(DNSClass::IN);
+        new_rec.dns_class = DNSClass::IN;
         resp.add_answer(new_rec);
     }
     resp
@@ -424,11 +424,10 @@ mod tests {
 
     #[test]
     fn should_synthesise_triggers() {
-        use hickory_proto::op::{MessageType, Query};
+        use hickory_proto::op::{MessageType, OpCode, Query};
         let policy = wkp();
-        let mut resp = Message::new();
-        resp.set_message_type(MessageType::Response);
-        resp.set_response_code(ResponseCode::NoError);
+        let mut resp = Message::new(0, MessageType::Response, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         // NODATA: NoError with no answers.
         assert!(should_synthesise(
             Some(&policy),
@@ -439,7 +438,7 @@ mod tests {
         ));
 
         // NXDOMAIN also triggers.
-        resp.set_response_code(ResponseCode::NXDomain);
+        resp.metadata.response_code = ResponseCode::NXDomain;
         assert!(should_synthesise(
             Some(&policy),
             true,
@@ -449,7 +448,7 @@ mod tests {
         ));
 
         // SERVFAIL does not.
-        resp.set_response_code(ResponseCode::ServFail);
+        resp.metadata.response_code = ResponseCode::ServFail;
         assert!(!should_synthesise(
             Some(&policy),
             true,
@@ -459,7 +458,7 @@ mod tests {
         ));
 
         // A query never triggers.
-        resp.set_response_code(ResponseCode::NoError);
+        resp.metadata.response_code = ResponseCode::NoError;
         assert!(!should_synthesise(
             Some(&policy),
             true,
@@ -508,37 +507,32 @@ mod tests {
         use hickory_proto::op::{MessageType, OpCode, Query};
         use hickory_proto::rr::rdata::A;
         let policy = wkp();
-        let mut original = Message::new();
-        original.set_id(0xbeef);
-        original.set_message_type(MessageType::Query);
-        original.set_op_code(OpCode::Query);
+        let mut original = Message::new(0xbeef, MessageType::Query, OpCode::Query);
         original.add_query(Query::query(
             Name::from_ascii("example.com.").unwrap(),
             RecordType::AAAA,
         ));
 
-        let mut a_resp = Message::new();
-        a_resp.set_id(0xbeef);
-        a_resp.set_message_type(MessageType::Response);
-        a_resp.set_response_code(ResponseCode::NoError);
-        a_resp.set_authentic_data(true);
+        let mut a_resp = Message::new(0xbeef, MessageType::Response, OpCode::Query);
+        a_resp.metadata.response_code = ResponseCode::NoError;
+        a_resp.metadata.authentic_data = true;
         let mut rec = Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             123,
             RData::A(A::new(192, 0, 2, 33)),
         );
-        rec.set_dns_class(DNSClass::IN);
+        rec.dns_class = DNSClass::IN;
         a_resp.add_answer(rec);
 
         let synth = synthesise_from_a(&policy, &original, &a_resp);
-        assert_eq!(synth.id(), 0xbeef);
-        assert_eq!(synth.queries().len(), 1);
-        assert_eq!(synth.answers().len(), 1);
-        let ans = &synth.answers()[0];
-        assert_eq!(ans.ttl(), 123);
+        assert_eq!(synth.metadata.id, 0xbeef);
+        assert_eq!(synth.queries.len(), 1);
+        assert_eq!(synth.answers.len(), 1);
+        let ans = &synth.answers[0];
+        assert_eq!(ans.ttl, 123);
         assert_eq!(ans.record_type(), RecordType::AAAA);
-        assert!(!synth.authentic_data(), "AD must be cleared for synthesised AAAA");
-        if let Some(RData::AAAA(aaaa)) = ans.data() {
+        assert!(!synth.metadata.authentic_data, "AD must be cleared for synthesised AAAA");
+        if let RData::AAAA(aaaa) = &ans.data {
             assert_eq!(aaaa.0, "64:ff9b::c000:221".parse::<Ipv6Addr>().unwrap());
         } else {
             panic!("expected AAAA answer");

@@ -625,7 +625,7 @@ impl UpstreamClient {
 
     async fn query_one(&self, peer: SocketAddr, orig_query: &[u8]) -> Result<Vec<u8>> {
         let orig_msg = Message::from_bytes(orig_query).context("parse client query")?;
-        let client_txid = orig_msg.id();
+        let client_txid = orig_msg.metadata.id;
         let upstream_txid: u16 = rand::thread_rng().gen();
 
         // Build the upstream wire. Fresh TXID + 0x20-randomised
@@ -644,7 +644,7 @@ impl UpstreamClient {
 
         // TC=1 → retry the same server over TCP per RFC 7766 §6.2.2.
         // Fresh TXID + fresh 0x20 mask for the TCP hop.
-        let final_resp = if parsed.truncated() {
+        let final_resp = if parsed.metadata.truncation {
             tracing::debug!(%peer, "TC=1 on UDP; retrying over TCP");
             let tcp_txid: u16 = rand::thread_rng().gen();
             let mut tcp_out = orig_query.to_vec();
@@ -663,7 +663,7 @@ impl UpstreamClient {
         let mut parsed = Message::from_bytes(&final_resp)
             .context("parse upstream response for normalisation")?;
         super::normalize::lowercase_response_names(&mut parsed);
-        parsed.set_id(client_txid);
+        parsed.metadata.id = client_txid;
         let resp = parsed
             .to_vec()
             .context("re-encode normalised forwarder response")?;

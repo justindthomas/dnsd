@@ -36,7 +36,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use hickory_proto::rr::dnssec::rdata::{DNSSECRData, RRSIG};
+use hickory_proto::dnssec::rdata::{DNSSECRData, RRSIG};
 
 use anyhow::{anyhow, Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -227,7 +227,7 @@ impl IterativeResolver {
         client_query: &Message,
     ) -> Result<(Vec<u8>, WalkChain)> {
         let q = client_query
-            .queries()
+            .queries
             .first()
             .ok_or_else(|| anyhow!("iterative resolve needs a question"))?
             .clone();
@@ -244,7 +244,7 @@ impl IterativeResolver {
         // queries on the floor (10s timeout × MAX_NS_ATTEMPTS) and
         // pin our worker pool. BIND/Unbound/Knot all do this by
         // default. Cached so repeats are ~free.
-        if super::local_zones::is_private_reverse(q.name()) {
+        if super::local_zones::is_private_reverse(&q.name) {
             return synthesize_local_nxdomain(client_query, &q, &self.cache).await;
         }
 
@@ -252,7 +252,7 @@ impl IterativeResolver {
         let mut chain = WalkChain::default();
         let answer = self
             .walk(
-                &q.name().clone(),
+                q.name(),
                 q.query_type(),
                 q.query_class(),
                 &mut budget,
@@ -262,21 +262,18 @@ impl IterativeResolver {
 
         // Stitch the answer onto a response carrying the client's
         // TXID + question section.
-        let mut response = Message::new();
-        response.set_id(client_query.id());
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_recursion_desired(client_query.recursion_desired());
-        response.set_recursion_available(true);
-        response.set_response_code(answer.response_code());
-        for orig_q in client_query.queries() {
+        let mut response = Message::response(client_query.metadata.id, OpCode::Query);
+        response.metadata.recursion_desired = client_query.metadata.recursion_desired;
+        response.metadata.recursion_available = true;
+        response.metadata.response_code = answer.metadata.response_code;
+        for orig_q in &client_query.queries {
             response.add_query(orig_q.clone());
         }
-        for r in answer.answers() {
+        for r in &answer.answers {
             response.add_answer(r.clone());
         }
-        for r in answer.name_servers() {
-            response.add_name_server(r.clone());
+        for r in &answer.authorities {
+            response.add_authority(r.clone());
         }
 
         // Lowercase every RR owner name before caching/serialising —
@@ -372,10 +369,10 @@ impl IterativeResolver {
                     // a single Message so the client sees the full
                     // chain.
                     let mut merged = resp.clone();
-                    for a in cname_resp.answers() {
+                    for a in cname_resp.answers {
                         merged.add_answer(a.clone());
                     }
-                    merged.set_response_code(cname_resp.response_code());
+                    merged.metadata.response_code = cname_resp.metadata.response_code;
                     return Ok(merged);
                 }
 
@@ -562,7 +559,7 @@ impl IterativeResolver {
         // that needs a sub-walk gets queued; we race the queued set
         // below.
         for ns in ns_records {
-            let Some(RData::NS(target)) = ns.data() else { continue };
+            let RData::NS(target) = &ns.data else { continue };
             let target_name = target.0.to_lowercase();
             if let Some(glued) = glue.get(&target_name) {
                 for ip in glued {
@@ -649,8 +646,8 @@ impl IterativeResolver {
         while let Some((target_name, res)) = in_flight.next().await {
             match res {
                 Ok(Ok(resp)) => {
-                    for a in resp.answers() {
-                        if let Some(RData::A(A(v4))) = a.data() {
+                    for a in &resp.answers {
+                        if let RData::A(A(v4)) = &a.data {
                             ips.push(IpAddr::V4(*v4));
                         }
                     }
@@ -733,8 +730,8 @@ impl IterativeResolver {
         let key_a = CacheKey::new(name, RecordType::A, DNSClass::IN);
         if let Some(bytes) = self.cache.get(&key_a).await {
             if let Ok(msg) = Message::from_bytes(&bytes) {
-                for ans in msg.answers() {
-                    if let Some(RData::A(A(v4))) = ans.data() {
+                for ans in &msg.answers {
+                    if let RData::A(A(v4)) = &ans.data {
                         out.push(IpAddr::V4(*v4));
                     }
                 }
@@ -744,8 +741,8 @@ impl IterativeResolver {
             let key_aaaa = CacheKey::new(name, RecordType::AAAA, DNSClass::IN);
             if let Some(bytes) = self.cache.get(&key_aaaa).await {
                 if let Ok(msg) = Message::from_bytes(&bytes) {
-                    for ans in msg.answers() {
-                        if let Some(RData::AAAA(AAAA(v6))) = ans.data() {
+                    for ans in &msg.answers {
+                        if let RData::AAAA(AAAA(v6)) = &ans.data {
                             out.push(IpAddr::V6(*v6));
                         }
                     }
@@ -765,16 +762,13 @@ impl IterativeResolver {
     async fn cache_zone_ns(&self, zone: &Name, ns_records: &[Record]) {
         let owners_match: Vec<&Record> = ns_records
             .iter()
-            .filter(|r| r.record_type() == RecordType::NS && r.name() == zone)
+            .filter(|r| r.record_type() == RecordType::NS && &r.name == zone)
             .collect();
         if owners_match.is_empty() {
             return;
         }
-        let mut msg = Message::new();
-        msg.set_id(0);
-        msg.set_message_type(MessageType::Response);
-        msg.set_op_code(OpCode::Query);
-        msg.set_response_code(ResponseCode::NoError);
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
         let mut q = Query::query(zone.clone(), RecordType::NS);
         q.set_query_class(DNSClass::IN);
         msg.add_query(q);
@@ -811,8 +805,8 @@ impl IterativeResolver {
             if let Some(bytes) = self.cache.get(&key).await {
                 if let Ok(msg) = Message::from_bytes(&bytes) {
                     let mut ips = Vec::new();
-                    for ans in msg.answers() {
-                        if let Some(RData::NS(NS(target))) = ans.data() {
+                    for ans in &msg.answers {
+                        if let RData::NS(NS(target)) = &ans.data {
                             ips.extend(self.cached_ns_ips(target).await);
                         }
                     }
@@ -873,11 +867,11 @@ impl IterativeResolver {
         // Extract NS targets from the answer section (root is
         // authoritative for itself, so the NS RRset is in Answers).
         let ns_targets: Vec<Name> = resp
-            .answers()
+            .answers
             .iter()
             .filter(|r| r.record_type() == RecordType::NS)
-            .filter_map(|r| match r.data() {
-                Some(RData::NS(target)) => Some(target.0.to_lowercase()),
+            .filter_map(|r| match &r.data {
+                RData::NS(target) => Some(target.0.to_lowercase()),
                 _ => None,
             })
             .collect();
@@ -889,13 +883,13 @@ impl IterativeResolver {
 
         // Build a name→ips glue map from the Additional section.
         let mut glue: HashMap<Name, Vec<IpAddr>> = HashMap::new();
-        for add in resp.additionals() {
-            let owner = add.name().to_lowercase();
-            match add.data() {
-                Some(RData::A(A(v4))) => {
+        for add in &resp.additionals {
+            let owner = add.name.to_lowercase();
+            match &add.data {
+                RData::A(A(v4)) => {
                     glue.entry(owner).or_default().push(IpAddr::V4(*v4));
                 }
-                Some(RData::AAAA(AAAA(v6))) => {
+                RData::AAAA(AAAA(v6)) => {
                     glue.entry(owner).or_default().push(IpAddr::V6(*v6));
                 }
                 _ => {}
@@ -998,11 +992,8 @@ fn build_synthetic_answer(
     rtype: RecordType,
     ips: &[IpAddr],
 ) -> Option<(Message, Vec<u8>)> {
-    let mut msg = Message::new();
-    msg.set_id(0);
-    msg.set_message_type(MessageType::Response);
-    msg.set_op_code(OpCode::Query);
-    msg.set_response_code(ResponseCode::NoError);
+    let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+    msg.metadata.response_code = ResponseCode::NoError;
     let mut q = Query::query(name.clone(), rtype);
     q.set_query_class(DNSClass::IN);
     msg.add_query(q);
@@ -1104,15 +1095,12 @@ async fn synthesize_local_nxdomain(
     q: &Query,
     cache: &Arc<DnsCache>,
 ) -> Result<(Vec<u8>, WalkChain)> {
-    let mut response = Message::new();
-    response.set_id(client_query.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(OpCode::Query);
-    response.set_recursion_desired(client_query.recursion_desired());
-    response.set_recursion_available(true);
-    response.set_authoritative(true);
-    response.set_response_code(ResponseCode::NXDomain);
-    for orig_q in client_query.queries() {
+    let mut response = Message::response(client_query.metadata.id, OpCode::Query);
+    response.metadata.recursion_desired = client_query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.authoritative = true;
+    response.metadata.response_code = ResponseCode::NXDomain;
+    for orig_q in &client_query.queries {
         response.add_query(orig_q.clone());
     }
     super::normalize::lowercase_response_names(&mut response);
@@ -1129,14 +1117,14 @@ fn extract_ds_and_rrsig(resp: &Message, child_zone: &Name) -> (Vec<Record>, Vec<
     let child_lower = child_zone.to_lowercase();
     let mut ds = Vec::new();
     let mut sigs = Vec::new();
-    for r in resp.name_servers() {
-        if r.name().to_lowercase() != child_lower {
+    for r in &resp.authorities {
+        if r.name.to_lowercase() != child_lower {
             continue;
         }
-        match r.data() {
-            Some(RData::DNSSEC(DNSSECRData::DS(_))) => ds.push(r.clone()),
-            Some(RData::DNSSEC(DNSSECRData::RRSIG(s))) => {
-                if s.type_covered() == RecordType::DS {
+        match &r.data {
+            RData::DNSSEC(DNSSECRData::DS(_)) => ds.push(r.clone()),
+            RData::DNSSEC(DNSSECRData::RRSIG(s)) => {
+                if s.input().type_covered == RecordType::DS {
                     sigs.push(s.clone());
                 }
             }
@@ -1147,7 +1135,7 @@ fn extract_ds_and_rrsig(resp: &Message, child_zone: &Name) -> (Vec<Record>, Vec<
 }
 
 fn classify(resp: &Message, qname: &Name, qtype: RecordType) -> Classification {
-    match resp.response_code() {
+    match resp.metadata.response_code {
         ResponseCode::NXDomain => return Classification::NxDomain,
         ResponseCode::ServFail | ResponseCode::Refused => return Classification::ServFail,
         _ => {}
@@ -1158,11 +1146,11 @@ fn classify(resp: &Message, qname: &Name, qtype: RecordType) -> Classification {
     // CNAME chase takes priority over direct-answer when qtype is
     // anything other than CNAME itself.
     if qtype != RecordType::CNAME {
-        for ans in resp.answers() {
-            if ans.name().to_lowercase() == lower_qname
+        for ans in &resp.answers {
+            if ans.name.to_lowercase() == lower_qname
                 && ans.record_type() == RecordType::CNAME
             {
-                if let Some(RData::CNAME(target)) = ans.data() {
+                if let RData::CNAME(target) = &ans.data {
                     return Classification::Cname(target.0.to_lowercase());
                 }
             }
@@ -1170,36 +1158,36 @@ fn classify(resp: &Message, qname: &Name, qtype: RecordType) -> Classification {
     }
 
     // Direct answer?
-    for ans in resp.answers() {
-        if ans.name().to_lowercase() == lower_qname && ans.record_type() == qtype {
+    for ans in &resp.answers {
+        if ans.name.to_lowercase() == lower_qname && ans.record_type() == qtype {
             return Classification::Answer;
         }
     }
     // Any answer at all (could be partial CNAME chain ending in
     // record of wanted type already)?
-    if !resp.answers().is_empty() {
+    if !resp.answers.is_empty() {
         return Classification::Answer;
     }
 
     // Referral: Authority section has NS records for a zone that's
     // an ancestor of qname.
     let ns_records: Vec<Record> = resp
-        .name_servers()
+        .authorities
         .iter()
         .filter(|r| r.record_type() == RecordType::NS)
         .cloned()
         .collect();
     if !ns_records.is_empty() {
-        let delegated_zone = ns_records[0].name().to_lowercase();
+        let delegated_zone = ns_records[0].name.to_lowercase();
         // Build glue map from the Additional section.
         let mut glue: HashMap<Name, Vec<IpAddr>> = HashMap::new();
-        for add in resp.additionals() {
-            let owner = add.name().to_lowercase();
-            match add.data() {
-                Some(RData::A(A(v4))) => {
+        for add in &resp.additionals {
+            let owner = add.name.to_lowercase();
+            match &add.data {
+                RData::A(A(v4)) => {
                     glue.entry(owner).or_default().push(IpAddr::V4(*v4));
                 }
-                Some(RData::AAAA(AAAA(v6))) => {
+                RData::AAAA(AAAA(v6)) => {
                     glue.entry(owner).or_default().push(IpAddr::V6(*v6));
                 }
                 _ => {}
@@ -1231,11 +1219,8 @@ fn build_query(
     qclass: DNSClass,
     dnssec_ok: bool,
 ) -> Result<Vec<u8>> {
-    let mut msg = Message::new();
-    msg.set_id(rand::random());
-    msg.set_message_type(MessageType::Query);
-    msg.set_op_code(OpCode::Query);
-    msg.set_recursion_desired(false);
+    let mut msg = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = false;
     let mut q = Query::query(qname.clone(), qtype);
     q.set_query_class(qclass);
     msg.add_query(q);
@@ -1320,19 +1305,21 @@ mod tests {
         assert!(b.cname().is_err());
     }
 
-    fn mk_record(name: &str, rtype: RecordType, rdata: RData) -> Record {
+    fn mk_record(name: &str, _rtype: RecordType, rdata: RData) -> Record {
+        // The 0.26 Record API derives record_type() from the rdata, so
+        // the explicit `_rtype` argument is ignored — it's accepted only
+        // to keep the test call sites readable.
         let n = Name::from_ascii(name).unwrap();
         let mut r = Record::from_rdata(n, 300, rdata);
-        r.set_dns_class(DNSClass::IN);
-        r.set_record_type(rtype);
+        r.dns_class = DNSClass::IN;
         r
     }
 
     #[test]
     fn classify_direct_answer() {
         use hickory_proto::rr::rdata::A;
-        let mut m = Message::new();
-        m.set_response_code(ResponseCode::NoError);
+        let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+        m.metadata.response_code = ResponseCode::NoError;
         m.add_answer(mk_record(
             "example.com.",
             RecordType::A,
@@ -1348,8 +1335,8 @@ mod tests {
 
     #[test]
     fn classify_nxdomain() {
-        let mut m = Message::new();
-        m.set_response_code(ResponseCode::NXDomain);
+        let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+        m.metadata.response_code = ResponseCode::NXDomain;
         let c = classify(
             &m,
             &Name::from_ascii("nope.example.").unwrap(),
@@ -1361,8 +1348,8 @@ mod tests {
     #[test]
     fn classify_cname_takes_priority_over_nodata() {
         use hickory_proto::rr::rdata::CNAME;
-        let mut m = Message::new();
-        m.set_response_code(ResponseCode::NoError);
+        let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+        m.metadata.response_code = ResponseCode::NoError;
         m.add_answer(mk_record(
             "www.example.com.",
             RecordType::CNAME,
@@ -1388,9 +1375,9 @@ mod tests {
     #[test]
     fn classify_referral_with_glue() {
         use hickory_proto::rr::rdata::{A, NS};
-        let mut m = Message::new();
-        m.set_response_code(ResponseCode::NoError);
-        m.add_name_server(mk_record(
+        let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+        m.metadata.response_code = ResponseCode::NoError;
+        m.add_authority(mk_record(
             "com.",
             RecordType::NS,
             RData::NS(NS(Name::from_ascii("a.gtld-servers.net.").unwrap())),

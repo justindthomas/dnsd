@@ -8,8 +8,8 @@ authors = ["Justin Thomas"]
 
 [dependencies]
 # Core DNS wire format + DNSSEC primitives
-hickory-proto = { version = "0.24", features = ["dnssec-ring"] }
-hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-rustls"] }
+hickory-proto = { version = "0.26.1", features = ["dnssec-ring"] }
+hickory-resolver = { version = "0.26.1", features = ["tokio", "tls-ring", "https-ring"] }
 
 # VCL transport — every socket goes through VPP's session layer.
 # Optional: with `--no-default-features --features kernel-sockets`

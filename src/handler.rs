@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::serialize::binary::BinDecodable;
 
 use crate::acl::ClientAcl;
@@ -76,17 +76,14 @@ pub trait DnsHandler: Send + Sync + 'static {
 ///   spawning a walk task.
 pub fn build_refused(query: &[u8]) -> Option<Vec<u8>> {
     let msg = Message::from_bytes(query).ok()?;
-    let mut resp = Message::new();
-    resp.set_id(msg.id());
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(msg.op_code());
-    resp.set_recursion_desired(msg.recursion_desired());
-    resp.set_recursion_available(false);
-    resp.set_response_code(match msg.op_code() {
+    let mut resp = Message::response(msg.metadata.id, msg.metadata.op_code);
+    resp.metadata.recursion_desired = msg.metadata.recursion_desired;
+    resp.metadata.recursion_available = false;
+    resp.metadata.response_code = match msg.metadata.op_code {
         OpCode::Query => ResponseCode::Refused,
         _ => ResponseCode::NotImp,
-    });
-    for q in msg.queries() {
+    };
+    for q in msg.queries {
         resp.add_query(q.clone());
     }
     resp.to_vec().ok()
@@ -166,16 +163,13 @@ impl<T: DnsHandler> DnsHandler for LiveHandler<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::Query;
+    use hickory_proto::op::{MessageType, Query};
     use hickory_proto::rr::{Name, RecordType};
 
     #[tokio::test]
     async fn refused_stub_mirrors_txid_and_question() {
-        let mut req = Message::new();
-        req.set_id(0x4242);
-        req.set_message_type(MessageType::Query);
-        req.set_op_code(OpCode::Query);
-        req.set_recursion_desired(true);
+        let mut req = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        req.metadata.recursion_desired = true;
         req.add_query(Query::query(
             Name::from_ascii("example.com.").unwrap(),
             RecordType::A,
@@ -189,10 +183,10 @@ mod tests {
             .await
             .unwrap();
         let resp = Message::from_bytes(&resp_bytes).unwrap();
-        assert_eq!(resp.id(), 0x4242);
-        assert_eq!(resp.response_code(), ResponseCode::Refused);
-        assert_eq!(resp.queries().len(), 1);
-        assert!(resp.recursion_desired());
-        assert!(!resp.recursion_available());
+        assert_eq!(resp.metadata.id, 0x4242);
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(resp.queries.len(), 1);
+        assert!(resp.metadata.recursion_desired);
+        assert!(!resp.metadata.recursion_available);
     }
 }

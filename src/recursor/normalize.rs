@@ -24,76 +24,17 @@ use hickory_proto::op::Message;
 /// Lowercase every record's owner name in the message, in-place.
 /// Touches QUESTION, ANSWER, AUTHORITY, and ADDITIONAL sections.
 pub fn lowercase_response_names(msg: &mut Message) {
-    let new_queries: Vec<_> = msg
-        .queries()
-        .iter()
-        .map(|q| {
-            let mut nq = q.clone();
-            nq.set_name(q.name().to_lowercase());
-            nq
-        })
-        .collect();
-    msg.take_queries();
-    for q in new_queries {
-        msg.add_query(q);
+    for q in msg.queries.iter_mut() {
+        q.set_name(q.name().to_lowercase());
     }
-
-    rewrite_section_names(
-        msg.take_answers(),
-        |r| r,
-        |msg, r| {
-            msg.add_answer(r);
-        },
-        msg,
-    );
-    rewrite_section_names(
-        msg.take_name_servers(),
-        |r| r,
-        |msg, r| {
-            msg.add_name_server(r);
-        },
-        msg,
-    );
-    rewrite_section_names(
-        msg.take_additionals(),
-        |r| r,
-        |msg, r| {
-            msg.add_additional(r);
-        },
-        msg,
-    );
-}
-
-fn rewrite_section_names<R, F, A>(
-    records: Vec<R>,
-    _identity: F,
-    add_back: A,
-    msg: &mut Message,
-) where
-    R: NameOwned,
-    F: Fn(R) -> R,
-    A: Fn(&mut Message, R),
-{
-    for mut r in records {
-        let lower = r.name().to_lowercase();
-        r.set_name(lower);
-        add_back(msg, r);
+    for r in msg.answers.iter_mut() {
+        r.name = r.name.to_lowercase();
     }
-}
-
-/// Tiny shim so the same closure works for `Record` (answer/auth/
-/// additional sections all hand back `Record`s in hickory 0.24).
-pub trait NameOwned {
-    fn name(&self) -> &hickory_proto::rr::Name;
-    fn set_name(&mut self, name: hickory_proto::rr::Name);
-}
-
-impl NameOwned for hickory_proto::rr::Record {
-    fn name(&self) -> &hickory_proto::rr::Name {
-        hickory_proto::rr::Record::name(self)
+    for r in msg.authorities.iter_mut() {
+        r.name = r.name.to_lowercase();
     }
-    fn set_name(&mut self, name: hickory_proto::rr::Name) {
-        hickory_proto::rr::Record::set_name(self, name);
+    for r in msg.additionals.iter_mut() {
+        r.name = r.name.to_lowercase();
     }
 }
 
@@ -106,10 +47,7 @@ mod tests {
 
     #[test]
     fn lowercases_question_and_answer() {
-        let mut m = Message::new();
-        m.set_id(1);
-        m.set_message_type(MessageType::Response);
-        m.set_op_code(OpCode::Query);
+        let mut m = Message::new(1, MessageType::Response, OpCode::Query);
         m.add_query(Query::query(
             Name::from_str("CnN.COm.").unwrap(),
             RecordType::A,
@@ -123,10 +61,10 @@ mod tests {
 
         lowercase_response_names(&mut m);
         assert_eq!(
-            m.queries()[0].name().to_string(),
+            m.queries[0].name().to_string(),
             "cnn.com."
         );
-        assert_eq!(m.answers()[0].name().to_string(), "cnn.com.");
+        assert_eq!(m.answers[0].name.to_string(), "cnn.com.");
         let _ = DNSClass::IN; // silence unused
     }
 }

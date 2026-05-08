@@ -120,10 +120,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
 
     fn build_query(name: &str) -> Vec<u8> {
-        let mut m = Message::new();
-        m.set_id(0x1234);
-        m.set_message_type(MessageType::Query);
-        m.set_op_code(OpCode::Query);
+        let mut m = Message::new(0x1234, MessageType::Query, OpCode::Query);
         m.add_query(Query::query(
             Name::from_ascii(name).unwrap(),
             RecordType::A,

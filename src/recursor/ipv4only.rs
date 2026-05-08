@@ -23,7 +23,7 @@
 
 use std::net::Ipv4Addr;
 
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, PTR};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
@@ -65,21 +65,18 @@ pub fn synth_response(
     dns64_enabled: bool,
 ) -> Message {
     let q = original_query
-        .queries()
+        .queries
         .first()
         .expect("caller already extracted a question");
-    let qname = q.name();
+    let qname = q.name.clone();
     let qtype = q.query_type();
 
-    let mut resp = Message::new();
-    resp.set_id(original_query.id());
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(OpCode::Query);
-    resp.set_recursion_desired(original_query.recursion_desired());
-    resp.set_recursion_available(true);
-    resp.set_response_code(ResponseCode::NoError);
-    resp.set_authentic_data(false);
-    for q in original_query.queries() {
+    let mut resp = Message::response(original_query.metadata.id, OpCode::Query);
+    resp.metadata.recursion_desired = original_query.metadata.recursion_desired;
+    resp.metadata.recursion_available = true;
+    resp.metadata.response_code = ResponseCode::NoError;
+    resp.metadata.authentic_data = false;
+    for q in &original_query.queries {
         resp.add_query(q.clone());
     }
 
@@ -87,7 +84,7 @@ pub fn synth_response(
         RecordType::A => {
             for v4 in [A_170, A_171] {
                 let mut rec = Record::from_rdata(qname.clone(), LOCAL_TTL, RData::A(A(v4)));
-                rec.set_dns_class(DNSClass::IN);
+                rec.dns_class = DNSClass::IN;
                 resp.add_answer(rec);
             }
         }
@@ -102,7 +99,7 @@ pub fn synth_response(
                         LOCAL_TTL,
                         RData::AAAA(AAAA(v6)),
                     );
-                    rec.set_dns_class(DNSClass::IN);
+                    rec.dns_class = DNSClass::IN;
                     resp.add_answer(rec);
                 }
             }
@@ -115,7 +112,7 @@ pub fn synth_response(
                 LOCAL_TTL,
                 RData::PTR(PTR(target)),
             );
-            rec.set_dns_class(DNSClass::IN);
+            rec.dns_class = DNSClass::IN;
             resp.add_answer(rec);
         }
         _ => {}
@@ -126,15 +123,12 @@ pub fn synth_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::Query;
+    use hickory_proto::op::{MessageType, Query};
     use std::net::Ipv6Addr;
 
     fn build_query(name: &str, qtype: RecordType) -> Message {
-        let mut m = Message::new();
-        m.set_id(0xabcd);
-        m.set_message_type(MessageType::Query);
-        m.set_op_code(OpCode::Query);
-        m.set_recursion_desired(true);
+        let mut m = Message::new(0xabcd, MessageType::Query, OpCode::Query);
+        m.metadata.recursion_desired = true;
         m.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
         m
     }
@@ -173,28 +167,28 @@ mod tests {
     fn a_query_returns_both_records() {
         let q = build_query("ipv4only.arpa.", RecordType::A);
         let resp = synth_response(&q, None, false);
-        assert_eq!(resp.id(), 0xabcd);
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert_eq!(resp.answers().len(), 2);
+        assert_eq!(resp.metadata.id, 0xabcd);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 2);
         let mut got = resp
-            .answers()
+            .answers
             .iter()
-            .filter_map(|r| match r.data() {
-                Some(RData::A(a)) => Some(a.0),
+            .filter_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
                 _ => None,
             })
             .collect::<Vec<_>>();
         got.sort();
         assert_eq!(got, vec![A_170, A_171]);
-        assert!(!resp.authentic_data());
+        assert!(!resp.metadata.authentic_data);
     }
 
     #[test]
     fn aaaa_without_dns64_is_nodata() {
         let q = build_query("ipv4only.arpa.", RecordType::AAAA);
         let resp = synth_response(&q, None, false);
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert!(resp.answers().is_empty());
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(resp.answers.is_empty());
     }
 
     #[test]
@@ -202,32 +196,32 @@ mod tests {
         let policy = Dns64Policy::default_wkp();
         let q = build_query("ipv4only.arpa.", RecordType::AAAA);
         let resp = synth_response(&q, Some(&policy), true);
-        assert_eq!(resp.answers().len(), 2);
+        assert_eq!(resp.answers.len(), 2);
         let want_170: Ipv6Addr = "64:ff9b::c000:aa".parse().unwrap();
         let want_171: Ipv6Addr = "64:ff9b::c000:ab".parse().unwrap();
         let got: Vec<_> = resp
-            .answers()
+            .answers
             .iter()
-            .filter_map(|r| match r.data() {
-                Some(RData::AAAA(a)) => Some(a.0),
+            .filter_map(|r| match &r.data {
+                RData::AAAA(a) => Some(a.0),
                 _ => None,
             })
             .collect();
         assert!(got.contains(&want_170));
         assert!(got.contains(&want_171));
-        assert!(!resp.authentic_data());
+        assert!(!resp.metadata.authentic_data);
     }
 
     #[test]
     fn ptr_returns_ipv4only_arpa() {
         let q = build_query("170.0.0.192.in-addr.arpa.", RecordType::PTR);
         let resp = synth_response(&q, None, false);
-        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers.len(), 1);
         let target = Name::from_ascii("ipv4only.arpa.").unwrap();
-        match resp.answers()[0].data() {
-            Some(RData::PTR(p)) => assert_eq!(p.0, target),
+        match &resp.answers[0].data {
+            RData::PTR(p) => assert_eq!(p.0, target),
             other => panic!("expected PTR, got {other:?}"),
         }
-        assert!(!resp.authentic_data());
+        assert!(!resp.metadata.authentic_data);
     }
 }

@@ -94,20 +94,20 @@ impl DnsCache {
     }
 
     fn compute_ttl(&self, msg: &Message) -> u32 {
-        match msg.response_code() {
-            ResponseCode::NXDomain | ResponseCode::NoError if msg.answers().is_empty() => {
+        match msg.metadata.response_code {
+            ResponseCode::NXDomain | ResponseCode::NoError if msg.answers.is_empty() => {
                 // Negative cache: cap at SOA MINIMUM if present, else
                 // operator default. (NoError + empty answers = NODATA.)
                 let soa_min = msg
-                    .name_servers()
+                    .authorities
                     .iter()
                     .find_map(|r| {
                         if r.record_type() == RecordType::SOA {
                             // SOA MINIMUM is the 7th field (index 6 in
                             // the wire format). hickory exposes it via
                             // the typed rdata.
-                            if let Some(hickory_proto::rr::RData::SOA(soa)) = r.data() {
-                                return Some(soa.minimum());
+                            if let hickory_proto::rr::RData::SOA(soa) = &r.data {
+                                return Some(soa.minimum);
                             }
                         }
                         None
@@ -119,9 +119,9 @@ impl DnsCache {
                 // Positive cache: min TTL across answer section
                 // (RFC 2181 §5.2 conservative reading).
                 let min_answer_ttl = msg
-                    .answers()
+                    .answers
                     .iter()
-                    .map(|r| r.ttl())
+                    .map(|r| r.ttl)
                     .min()
                     .unwrap_or(self.negative_ttl);
                 min_answer_ttl.min(self.max_ttl).max(self.min_ttl)
@@ -194,11 +194,8 @@ mod tests {
     use hickory_proto::rr::{rdata::A, RData, Record};
 
     fn build_positive() -> (Message, Vec<u8>) {
-        let mut msg = Message::new();
-        msg.set_id(0x1234);
-        msg.set_message_type(MessageType::Response);
-        msg.set_op_code(OpCode::Query);
-        msg.set_response_code(ResponseCode::NoError);
+        let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
         let rec = Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             300,
@@ -237,9 +234,8 @@ mod tests {
     #[tokio::test]
     async fn servfail_not_cached() {
         let cache = DnsCache::new(100, 0, 3600, 60);
-        let mut msg = Message::new();
-        msg.set_id(1);
-        msg.set_response_code(ResponseCode::ServFail);
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::ServFail;
         let bytes = msg.to_vec().unwrap();
         let key = CacheKey::new(
             &Name::from_ascii("sf.test.").unwrap(),

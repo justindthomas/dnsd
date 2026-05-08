@@ -36,8 +36,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use base64::prelude::{Engine, BASE64_STANDARD};
 use hickory_proto::op::Message;
-use hickory_proto::rr::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
-use hickory_proto::rr::dnssec::Algorithm;
+use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
+use hickory_proto::dnssec::{Algorithm, PublicKey, PublicKeyBuf, Verifier};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde::{Deserialize, Serialize};
@@ -109,8 +109,7 @@ impl ManagedKey {
             zone_flag,
             secure_entry_point,
             revoked,
-            algorithm,
-            public_key,
+            PublicKeyBuf::new(public_key, algorithm),
         ))
     }
 
@@ -125,7 +124,7 @@ impl ManagedKey {
             key_tag: key.calculate_key_tag().unwrap_or(0),
             algorithm: u8::from(key.algorithm()),
             flags,
-            public_key: BASE64_STANDARD.encode(key.public_key()),
+            public_key: BASE64_STANDARD.encode(key.public_key().public_bytes()),
             status,
         }
     }
@@ -185,7 +184,7 @@ pub fn apply_refresh(
     // change across the revocation transition.
     let observed_idx: Vec<(String, u8, Vec<u8>, &DNSKEY)> = observed
         .iter()
-        .map(|(z, k)| (z.clone(), u8::from(k.algorithm()), k.public_key().to_vec(), k))
+        .map(|(z, k)| (z.clone(), u8::from(k.algorithm()), k.public_key().public_bytes().to_vec(), k))
         .collect();
 
     // Track which observed keys we've matched against existing
@@ -615,17 +614,17 @@ fn extract_dnskey_response(
     let mut keys = Vec::new();
     let mut sig: Option<RRSIG> = None;
     let zone = Name::root();
-    for r in resp.answers() {
-        if r.name() != &zone {
+    for r in &resp.answers {
+        if r.name != zone {
             continue;
         }
-        match r.data() {
-            Some(RData::DNSSEC(DNSSECRData::DNSKEY(k))) => {
+        match &r.data {
+            RData::DNSSEC(DNSSECRData::DNSKEY(k)) => {
                 records.push(r.clone());
                 keys.push(k.clone());
             }
-            Some(RData::DNSSEC(DNSSECRData::RRSIG(s)))
-                if s.type_covered() == RecordType::DNSKEY =>
+            RData::DNSSEC(DNSSECRData::RRSIG(s))
+                if s.input().type_covered == RecordType::DNSKEY =>
             {
                 sig = Some(s.clone());
             }
@@ -638,13 +637,18 @@ fn extract_dnskey_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::rr::dnssec::Algorithm;
+    use hickory_proto::dnssec::Algorithm;
 
     fn fake_key(byte: u8, sep: bool, revoke: bool) -> DNSKEY {
         // Pseudo-key; the validator never runs against these so
         // the bytes can be anything. Length 64 to look ECDSA-P256-ish.
         let public_key = vec![byte; 64];
-        DNSKEY::new(true, sep, revoke, Algorithm::ECDSAP256SHA256, public_key)
+        DNSKEY::new(
+            true,
+            sep,
+            revoke,
+            PublicKeyBuf::new(public_key, Algorithm::ECDSAP256SHA256),
+        )
     }
 
     fn pending_with_age(secs: u64) -> ManagedKey {
@@ -690,7 +694,7 @@ mod tests {
         // Put it in PendingAdd 31 days ago.
         let mut existing = pending_with_age(31 * 24 * 3600);
         existing.key_tag = key.calculate_key_tag().unwrap_or(0);
-        existing.public_key = BASE64_STANDARD.encode(key.public_key());
+        existing.public_key = BASE64_STANDARD.encode(key.public_key().public_bytes());
 
         let observed = vec![(".".to_string(), key)];
         let (next, diff) = apply_refresh(
@@ -709,7 +713,7 @@ mod tests {
         let key = fake_key(0x11, true, false);
         let mut existing = pending_with_age(5 * 24 * 3600); // 5 days
         existing.key_tag = key.calculate_key_tag().unwrap_or(0);
-        existing.public_key = BASE64_STANDARD.encode(key.public_key());
+        existing.public_key = BASE64_STANDARD.encode(key.public_key().public_bytes());
 
         let observed = vec![(".".to_string(), key)];
         let (next, diff) =

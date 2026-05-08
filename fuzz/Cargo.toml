@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-hickory-proto = { version = "0.24", features = ["dnssec-ring"] }
+hickory-proto = { version = "0.26.1", features = ["dnssec-ring"] }
 
 # kernel-sockets backend so the fuzz harness builds without libvppcom.
 # dns-01 is left off — ACME pulls in instant-acme which the fuzzer

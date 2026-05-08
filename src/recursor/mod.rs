@@ -250,10 +250,8 @@ impl RecursorHandler {
                         Ok(n) => n,
                         Err(_) => return,
                     };
-                    let mut q = Message::new();
-                    q.set_message_type(MessageType::Query);
-                    q.set_op_code(OpCode::Query);
-                    q.set_recursion_desired(true);
+                    let mut q = Message::new(0, MessageType::Query, OpCode::Query);
+                    q.metadata.recursion_desired = true;
                     q.add_query(Query::query(parsed, RecordType::A));
                     match iter.resolve_with_chain(&q).await {
                         Ok((bytes, chain)) => {
@@ -644,7 +642,7 @@ impl DnsHandler for RecursorHandler {
                 return None;
             }
         };
-        let q = msg.queries().first()?.clone();
+        let q = msg.queries.first()?.clone();
         let _qtiming = QTiming {
             t0,
             qname: q.name().to_string(),
@@ -664,7 +662,7 @@ impl DnsHandler for RecursorHandler {
         // touching upstream. AAAA depends on whether this listener
         // has DNS64 enabled — synthesised under our prefix when it
         // is, NODATA when it isn't.
-        if ipv4only::is_local_question(q.name(), q.query_type()) {
+        if ipv4only::is_local_question(&q.name, q.query_type()) {
             let synth = ipv4only::synth_response(&msg, self.dns64.as_deref(), ctx.dns64);
             return synth.to_vec().ok();
         }
@@ -674,7 +672,7 @@ impl DnsHandler for RecursorHandler {
         // wrap the v4 PTR back into an ip6.arpa answer.
         if ctx.dns64 && q.query_type() == RecordType::PTR {
             if let Some(policy) = &self.dns64 {
-                if let Some(new_qname) = dns64::rewrite_ptr_question(policy, q.name()) {
+                if let Some(new_qname) = dns64::rewrite_ptr_question(policy, &q.name) {
                     let rewritten_query = rewrite_query_name(&msg, &new_qname);
                     if let Some(ans) = self
                         .resolve_forwarded(&rewritten_query, &new_qname, RecordType::PTR)
@@ -698,15 +696,15 @@ impl DnsHandler for RecursorHandler {
         // sub-walk on their CNAME target zone breaks, and re-walking
         // the chain each time burns sustained worker time on a
         // request the user can't see anyway.
-        if self.neg_resolve_cache.hit(q.name(), q.query_type()) {
+        if self.neg_resolve_cache.hit(&q.name, q.query_type()) {
             return Some(servfail(&msg));
         }
-        let key = CacheKey::new(q.name(), q.query_type(), q.query_class());
+        let key = CacheKey::new(&q.name, q.query_type(), q.query_class());
         // First, the fast unguarded path: if the cache is already
         // warm we don't need to take the per-key lock.
         if let Some(mut cached) = self.cache.get(&key).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            cache::rewrite_txid(&mut cached, msg.id());
+            cache::rewrite_txid(&mut cached, msg.metadata.id);
             if let Ok(mut parsed) = Message::from_bytes(&cached) {
                 // Cache-hit DNS64: if the cached AAAA response is
                 // empty/NXDOMAIN and this listener wants DNS64,
@@ -716,13 +714,13 @@ impl DnsHandler for RecursorHandler {
                 if dns64::should_synthesise(
                     self.dns64.as_deref(),
                     ctx.dns64,
-                    q.name(),
+                    &q.name,
                     q.query_type(),
                     &parsed,
                 ) {
                     if let Some(policy) = self.dns64.as_deref() {
                         if let Some(synth) =
-                            self.synthesise_from_cached_a(policy, &msg, q.name()).await
+                            self.synthesise_from_cached_a(policy, &msg, &q.name).await
                         {
                             self.metrics
                                 .dns64_synthesised
@@ -759,10 +757,10 @@ impl DnsHandler for RecursorHandler {
         // first arrival wins the per-key lock and runs the walk;
         // followers wait, then the recheck below picks up the
         // cached / negative-cached result instead of walking again.
-        let coalesce_lock = self.in_flight.lock_for(q.name(), q.query_type());
+        let coalesce_lock = self.in_flight.lock_for(&q.name, q.query_type());
         let _coalesce_guard = coalesce_lock.lock().await;
         if let Some(mut cached) = self.cache.get(&key).await {
-            cache::rewrite_txid(&mut cached, msg.id());
+            cache::rewrite_txid(&mut cached, msg.metadata.id);
             if let Ok(mut parsed) = Message::from_bytes(&cached) {
                 if self.validator.is_none() {
                     self.dnssec.apply_to_response(&mut parsed);
@@ -773,11 +771,11 @@ impl DnsHandler for RecursorHandler {
             }
             return Some(cached);
         }
-        if self.neg_resolve_cache.hit(q.name(), q.query_type()) {
+        if self.neg_resolve_cache.hit(&q.name, q.query_type()) {
             return Some(servfail(&msg));
         }
 
-        let servers = match self.forwarders.lookup(q.name()) {
+        let servers = match self.forwarders.lookup(&q.name) {
             Some(s) => {
                 self.metrics
                     .forwarder_matched
@@ -803,16 +801,16 @@ impl DnsHandler for RecursorHandler {
                                         dnssec::ValidationStatus::Secure => {
                                             self.metrics.dnssec_validated
                                                 .fetch_add(1, Ordering::Relaxed);
-                                            parsed.set_authentic_data(true);
+                                            parsed.metadata.authentic_data = true;
                                         }
                                         dnssec::ValidationStatus::Insecure => {
-                                            parsed.set_authentic_data(false);
+                                            parsed.metadata.authentic_data = false;
                                         }
                                         dnssec::ValidationStatus::Bogus(reason) => {
                                             self.metrics.dnssec_failed
                                                 .fetch_add(1, Ordering::Relaxed);
                                             tracing::warn!(
-                                                qname = %q.name(),
+                                                qname = %&q.name,
                                                 "DNSSEC validation bogus: {reason}"
                                             );
                                             return Some(servfail_with_ede(
@@ -838,13 +836,13 @@ impl DnsHandler for RecursorHandler {
                                 if dns64::should_synthesise(
                                     self.dns64.as_deref(),
                                     ctx.dns64,
-                                    q.name(),
+                                    &q.name,
                                     q.query_type(),
                                     &parsed,
                                 ) {
                                     if let Some(policy) = self.dns64.as_deref() {
                                         let mut a_query = msg.clone();
-                                        a_query.take_queries();
+                                        a_query.queries.clear();
                                         a_query.add_query(Query::query(
                                             q.name().clone(),
                                             RecordType::A,
@@ -853,7 +851,7 @@ impl DnsHandler for RecursorHandler {
                                             iter.resolve_with_chain(&a_query).await
                                         {
                                             if let Ok(a_resp) = Message::from_bytes(&a_bytes) {
-                                                if !a_resp.answers().is_empty() {
+                                                if !a_resp.answers.is_empty() {
                                                     let mut synth = dns64::synthesise_from_a(
                                                         policy, &msg, &a_resp,
                                                     );
@@ -891,7 +889,7 @@ impl DnsHandler for RecursorHandler {
                             // status. For PassThrough/Strip modes this
                             // is a no-op overwrite (no AD changes).
                             let key = CacheKey::new(
-                                q.name(),
+                                &q.name,
                                 q.query_type(),
                                 q.query_class(),
                             );
@@ -901,7 +899,7 @@ impl DnsHandler for RecursorHandler {
                             Some(bytes)
                         }
                         Err(e) => {
-                            tracing::warn!(qname = %q.name(), "iterative resolve failed: {e:#}");
+                            tracing::warn!(qname = %&q.name, "iterative resolve failed: {e:#}");
                             self.neg_resolve_cache
                                 .insert(q.name().clone(), q.query_type());
                             Some(servfail(&msg))
@@ -915,7 +913,7 @@ impl DnsHandler for RecursorHandler {
         let resp_bytes = match self.upstream.query(&servers, query).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(qname = %q.name(), "forwarder failed: {e}");
+                tracing::warn!(qname = %&q.name, "forwarder failed: {e}");
                 return Some(servfail(&msg));
             }
         };
@@ -931,13 +929,13 @@ impl DnsHandler for RecursorHandler {
         if dns64::should_synthesise(
             self.dns64.as_deref(),
             ctx.dns64,
-            q.name(),
+            &q.name,
             q.query_type(),
             &resp,
         ) {
             if let Some(policy) = &self.dns64 {
                 let mut a_query = msg.clone();
-                a_query.take_queries();
+                a_query.queries.clear();
                 a_query.add_query(Query::query(q.name().clone(), RecordType::A));
                 let Ok(a_query_bytes) = a_query.to_vec() else {
                     // Fall through to the original AAAA response.
@@ -946,7 +944,7 @@ impl DnsHandler for RecursorHandler {
                 match self.upstream.query(&servers, &a_query_bytes).await {
                     Ok(a_bytes) => {
                         if let Ok(a_resp) = Message::from_bytes(&a_bytes) {
-                            if !a_resp.answers().is_empty() {
+                            if !a_resp.answers.is_empty() {
                                 let mut synth =
                                     dns64::synthesise_from_a(policy, &msg, &a_resp);
                                 self.metrics
@@ -965,7 +963,7 @@ impl DnsHandler for RecursorHandler {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(qname = %q.name(), "DNS64 A-side failed: {e}");
+                        tracing::debug!(qname = %&q.name, "DNS64 A-side failed: {e}");
                     }
                 }
             }
@@ -997,7 +995,7 @@ impl RecursorHandler {
         let a_bytes = self.cache.get(&a_key).await?;
         let a_resp = Message::from_bytes(&a_bytes).ok()?;
         if !a_resp
-            .answers()
+            .answers
             .iter()
             .any(|r| r.record_type() == RecordType::A)
         {
@@ -1038,29 +1036,23 @@ fn respond_with_policy(msg: &mut Message, policy: &DnssecPolicy) -> Vec<u8> {
 }
 
 fn rewrite_query_name(original: &Message, new_name: &hickory_proto::rr::Name) -> Message {
-    let mut new_msg = Message::new();
-    new_msg.set_id(rand::random());
-    new_msg.set_message_type(MessageType::Query);
-    new_msg.set_op_code(OpCode::Query);
-    new_msg.set_recursion_desired(original.recursion_desired());
+    let mut new_msg = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+    new_msg.metadata.recursion_desired = original.metadata.recursion_desired;
     new_msg.add_query(Query::query(new_name.clone(), RecordType::PTR));
     new_msg
 }
 
 fn servfail(req: &Message) -> Vec<u8> {
-    let mut resp = Message::new();
-    resp.set_id(req.id());
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(OpCode::Query);
-    resp.set_recursion_desired(req.recursion_desired());
-    resp.set_recursion_available(false);
-    resp.set_response_code(ResponseCode::ServFail);
-    for q in req.queries() {
+    let mut resp = Message::response(req.metadata.id, OpCode::Query);
+    resp.metadata.recursion_desired = req.metadata.recursion_desired;
+    resp.metadata.recursion_available = false;
+    resp.metadata.response_code = ResponseCode::ServFail;
+    for q in &req.queries {
         resp.add_query(q.clone());
     }
     resp.to_vec().unwrap_or_else(|_| {
         let mut buf = vec![0u8; 12];
-        buf[0..2].copy_from_slice(&req.id().to_be_bytes());
+        buf[0..2].copy_from_slice(&req.metadata.id.to_be_bytes());
         buf[2] = 0x80; // QR=1
         buf[3] = 0x02; // RCODE=SERVFAIL
         buf
@@ -1071,14 +1063,11 @@ fn servfail(req: &Message) -> Vec<u8> {
 /// Bogus so operators + curious clients can see *why* validation
 /// failed instead of just "SERVFAIL, unknown reason".
 fn servfail_with_ede(req: &Message, info_code: u16, extra_text: &str) -> Vec<u8> {
-    let mut resp = Message::new();
-    resp.set_id(req.id());
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(OpCode::Query);
-    resp.set_recursion_desired(req.recursion_desired());
-    resp.set_recursion_available(false);
-    resp.set_response_code(ResponseCode::ServFail);
-    for q in req.queries() {
+    let mut resp = Message::response(req.metadata.id, OpCode::Query);
+    resp.metadata.recursion_desired = req.metadata.recursion_desired;
+    resp.metadata.recursion_available = false;
+    resp.metadata.response_code = ResponseCode::ServFail;
+    for q in &req.queries {
         resp.add_query(q.clone());
     }
 
