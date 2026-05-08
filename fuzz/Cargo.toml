@@ -1,0 +1,48 @@
+[package]
+name = "dnsd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hickory-proto = { version = "0.24", features = ["dnssec-ring"] }
+
+# kernel-sockets backend so the fuzz harness builds without libvppcom.
+# dns-01 is left off — ACME pulls in instant-acme which the fuzzer
+# doesn't reach.
+[dependencies.dnsd]
+path = ".."
+default-features = false
+features = ["kernel-sockets"]
+
+[[bin]]
+name = "handle_bytes"
+path = "fuzz_targets/handle_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_response"
+path = "fuzz_targets/validate_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_trust_anchors"
+path = "fuzz_targets/parse_trust_anchors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalize_response"
+path = "fuzz_targets/normalize_response.rs"
+test = false
+doc = false
+bench = false
