@@ -24,7 +24,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TLS for DoT + DoH + ACME
 tokio-rustls = "0.26"
 rustls = "0.23"
-rustls-pemfile = "2"
 rustls-pki-types = "1"
 
 # DoH HTTP server

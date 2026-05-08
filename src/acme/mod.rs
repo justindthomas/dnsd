@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use rustls_acme::caches::DirCache;
@@ -152,18 +153,15 @@ fn load_file_pair(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> 
     let key_pem = std::fs::read(key_path)
         .with_context(|| format!("reading key {key_path}"))?;
 
-    let mut cert_reader: &[u8] = &cert_pem;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("parsing cert PEM {cert_path}"))?;
     if certs.is_empty() {
         return Err(anyhow!("no certificates found in {cert_path}"));
     }
 
-    let mut key_reader: &[u8] = &key_pem;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("parsing key PEM {key_path}"))?
-        .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(&key_pem)
+        .with_context(|| format!("parsing key PEM {key_path}"))?;
 
     // Ensure ring is installed as the default crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
