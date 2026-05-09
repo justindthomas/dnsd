@@ -60,6 +60,17 @@ pub use forwarder::{Forwarders, UpstreamClient};
 pub use iterative::IterativeResolver;
 pub use rrl::Rrl;
 
+/// Result of `resolve_validate_cache`: either a validated answer
+/// (with the parsed form retained for callers that need to inspect
+/// it, e.g. the DNS64 NODATA branch), a Bogus chain that the caller
+/// should hand back as-is, or a walk failure that the caller
+/// converts into SERVFAIL + neg-resolve insert.
+enum ResolveOutcome {
+    Ok { bytes: Vec<u8>, parsed: Message },
+    Bogus(Vec<u8>),
+    WalkFailed,
+}
+
 pub struct RecursorHandler {
     cache: Arc<DnsCache>,
     forwarders: Arc<Forwarders>,
@@ -702,54 +713,16 @@ impl DnsHandler for RecursorHandler {
         let key = CacheKey::new(&q.name, q.query_type(), q.query_class());
         // First, the fast unguarded path: if the cache is already
         // warm we don't need to take the per-key lock.
-        if let Some(mut cached) = self.cache.get(&key).await {
+        if let Some(cached) = self.cache.get(&key).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            cache::rewrite_txid(&mut cached, msg.metadata.id);
-            if let Ok(mut parsed) = Message::from_bytes(&cached) {
-                // Cache-hit DNS64: if the cached AAAA response is
-                // empty/NXDOMAIN and this listener wants DNS64,
-                // synthesise from the cached A (if any). We don't
-                // cache synthesised responses because DNS64 policy
-                // is per-listener; the cached A is always authentic.
-                if dns64::should_synthesise(
-                    self.dns64.as_deref(),
-                    ctx.dns64,
-                    &q.name,
-                    q.query_type(),
-                    &parsed,
-                ) {
-                    if let Some(policy) = self.dns64.as_deref() {
-                        if let Some(synth) =
-                            self.synthesise_from_cached_a(policy, &msg, &q.name).await
-                        {
-                            self.metrics
-                                .dns64_synthesised
-                                .fetch_add(1, Ordering::Relaxed);
-                            return synth.to_vec().ok();
-                        }
-                        // Cached A missed — fall through to regular
-                        // resolution (forwarder or iterative) which
-                        // will fire the A query itself.
-                    }
-                } else {
-                    // Apply the configured DNSSEC policy on cache
-                    // hit — UNLESS we're in Validate mode and the
-                    // cached bytes carry the validator's verdict
-                    // (AD bit was set by a prior `validate_walk`
-                    // succeeding, or explicitly cleared on Insecure).
-                    // Stripping AD here would lose the validator's
-                    // result on every cache replay.
-                    if self.validator.is_none() {
-                        self.dnssec.apply_to_response(&mut parsed);
-                    }
-                    if let Ok(reencoded) = parsed.to_vec() {
-                        return Some(reencoded);
-                    }
-                    return Some(cached);
-                }
-            } else {
-                return Some(cached);
+            if let Some(resp) = self
+                .build_from_cache_value(&msg, &q, cached, ctx)
+                .await
+            {
+                return Some(resp);
             }
+            // Cached AAAA NODATA on a DNS64 listener but the cached
+            // A is missing — fall through to a fresh resolve below.
         }
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -759,17 +732,15 @@ impl DnsHandler for RecursorHandler {
         // cached / negative-cached result instead of walking again.
         let coalesce_lock = self.in_flight.lock_for(&q.name, q.query_type());
         let _coalesce_guard = coalesce_lock.lock().await;
-        if let Some(mut cached) = self.cache.get(&key).await {
-            cache::rewrite_txid(&mut cached, msg.metadata.id);
-            if let Ok(mut parsed) = Message::from_bytes(&cached) {
-                if self.validator.is_none() {
-                    self.dnssec.apply_to_response(&mut parsed);
-                }
-                if let Ok(reencoded) = parsed.to_vec() {
-                    return Some(reencoded);
-                }
+        if let Some(cached) = self.cache.get(&key).await {
+            if let Some(resp) = self
+                .build_from_cache_value(&msg, &q, cached, ctx)
+                .await
+            {
+                return Some(resp);
             }
-            return Some(cached);
+            // Same fall-through as the pre-lock path: leader cached
+            // NODATA AAAA but cached A is gone, so we have to walk.
         }
         if self.neg_resolve_cache.hit(&q.name, q.query_type()) {
             return Some(servfail(&msg));
@@ -785,128 +756,68 @@ impl DnsHandler for RecursorHandler {
             None => {
                 // No forwarder match — fall through to iterative
                 // recursion if enabled, otherwise SERVFAIL.
-                return match self.iterative.as_ref() {
-                    Some(iter) => match iter.resolve_with_chain(&msg).await {
-                        Ok((mut bytes, walk_chain)) => {
-                            if let Ok(mut parsed) = Message::from_bytes(&bytes) {
-                                // If DNSSEC validation is on, run the
-                                // chain validator BEFORE applying the
-                                // policy's AD-bit defaulting — a
-                                // Secure result promotes AD=1, Bogus
-                                // flips to SERVFAIL + EDE.
-                                if let Some(validator) = self.validator.as_ref() {
-                                    let status =
-                                        validator.validate_walk(&walk_chain, &parsed).await;
-                                    match status {
-                                        dnssec::ValidationStatus::Secure => {
-                                            self.metrics.dnssec_validated
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            parsed.metadata.authentic_data = true;
-                                        }
-                                        dnssec::ValidationStatus::Insecure => {
-                                            parsed.metadata.authentic_data = false;
-                                        }
-                                        dnssec::ValidationStatus::Bogus(reason) => {
-                                            self.metrics.dnssec_failed
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            tracing::warn!(
-                                                qname = %&q.name,
-                                                "DNSSEC validation bogus: {reason}"
-                                            );
-                                            return Some(servfail_with_ede(
-                                                &msg,
-                                                dnssec::EDE_DNSSEC_BOGUS,
-                                                &reason,
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    // Not validating — honour the
-                                    // configured policy's AD handling.
-                                    self.dnssec.apply_to_response(&mut parsed);
-                                }
-
-                                // DNS64 synthesis: fires when the
-                                // AAAA response is empty/NXDOMAIN,
-                                // the listener opted into DNS64, and
-                                // the name isn't on the exclusion
-                                // list. We fire a follow-up A query
-                                // on the same iterative path and
-                                // wrap the answers into v4-in-v6.
-                                if dns64::should_synthesise(
-                                    self.dns64.as_deref(),
-                                    ctx.dns64,
-                                    &q.name,
-                                    q.query_type(),
-                                    &parsed,
-                                ) {
-                                    if let Some(policy) = self.dns64.as_deref() {
-                                        let mut a_query = msg.clone();
-                                        a_query.queries.clear();
-                                        a_query.add_query(Query::query(
-                                            q.name().clone(),
-                                            RecordType::A,
-                                        ));
-                                        if let Ok((a_bytes, _)) =
-                                            iter.resolve_with_chain(&a_query).await
-                                        {
-                                            if let Ok(a_resp) = Message::from_bytes(&a_bytes) {
-                                                if !a_resp.answers.is_empty() {
-                                                    let mut synth = dns64::synthesise_from_a(
-                                                        policy, &msg, &a_resp,
-                                                    );
-                                                    self.metrics.dns64_synthesised.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed,
-                                                    );
-                                                    self.dnssec.apply_to_response(&mut synth);
-                                                    if let Ok(synth_bytes) = synth.to_vec() {
-                                                        // DON'T cache the synthesised response
-                                                        // under the AAAA key — that would serve
-                                                        // DNS64 answers to listeners that haven't
-                                                        // opted in. The underlying A query is
-                                                        // already cached by iter.resolve, so
-                                                        // re-synthesising on the next query is
-                                                        // cheap.
-                                                        return Some(synth_bytes);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Ok(re) = parsed.to_vec() {
-                                    bytes = re;
-                                }
-                            }
-                            // Re-cache the FINAL bytes (post-validator,
-                            // post-policy). The iterative recursor
-                            // already cached the pre-validation bytes
-                            // — overwrite with the version that has the
-                            // AD bit set as the validator decided so
-                            // cache hits replay the right authentication
-                            // status. For PassThrough/Strip modes this
-                            // is a no-op overwrite (no AD changes).
-                            let key = CacheKey::new(
-                                &q.name,
-                                q.query_type(),
-                                q.query_class(),
-                            );
-                            if let Ok(reparsed) = Message::from_bytes(&bytes) {
-                                self.cache.put(key, &reparsed, bytes.clone()).await;
-                            }
-                            Some(bytes)
-                        }
-                        Err(e) => {
-                            tracing::warn!(qname = %&q.name, "iterative resolve failed: {e:#}");
-                            self.neg_resolve_cache
-                                .insert(q.name().clone(), q.query_type());
-                            Some(servfail(&msg))
-                        }
-                    },
-                    None => Some(servfail(&msg)),
+                let Some(iter) = self.iterative.as_ref() else {
+                    return Some(servfail(&msg));
                 };
+                let (bytes, parsed) = match self
+                    .resolve_validate_cache(iter, &msg)
+                    .await
+                {
+                    ResolveOutcome::Ok { bytes, parsed } => (bytes, parsed),
+                    ResolveOutcome::Bogus(servfail_bytes) => {
+                        return Some(servfail_bytes);
+                    }
+                    ResolveOutcome::WalkFailed => {
+                        self.neg_resolve_cache
+                            .insert(q.name().clone(), q.query_type());
+                        return Some(servfail(&msg));
+                    }
+                };
+
+                // DNS64 synthesis: fires when the AAAA response is
+                // empty/NXDOMAIN, the listener opted into DNS64, and
+                // the name isn't on the exclusion list. We fire a
+                // follow-up A query through the same validate+cache
+                // helper so the cached A persists for follow-up
+                // followers waking from `in_flight`. The
+                // synthesised AAAA itself is NOT cached under the
+                // AAAA key — DNS64 is per-listener, so cache holds
+                // the canonical (NODATA) AAAA and we re-synthesise
+                // for each request that needs it.
+                if dns64::should_synthesise(
+                    self.dns64.as_deref(),
+                    ctx.dns64,
+                    &q.name,
+                    q.query_type(),
+                    &parsed,
+                ) {
+                    if let Some(policy) = self.dns64.as_deref() {
+                        let mut a_query = msg.clone();
+                        a_query.queries.clear();
+                        a_query.add_query(Query::query(
+                            q.name().clone(),
+                            RecordType::A,
+                        ));
+                        if let ResolveOutcome::Ok { parsed: a_resp, .. } =
+                            self.resolve_validate_cache(iter, &a_query).await
+                        {
+                            if !a_resp.answers.is_empty() {
+                                let mut synth = dns64::synthesise_from_a(
+                                    policy, &msg, &a_resp,
+                                );
+                                self.metrics
+                                    .dns64_synthesised
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.dnssec.apply_to_response(&mut synth);
+                                if let Ok(synth_bytes) = synth.to_vec() {
+                                    return Some(synth_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return Some(bytes);
             }
         };
 
@@ -982,6 +893,126 @@ impl RecursorHandler {
     /// name through the forwarder + cache path, return the raw
     /// response bytes. Does not apply DNS64 post-processing itself —
     /// the caller does that with `rewrap_ptr_response`.
+    /// Iterative resolve + DNSSEC validate + cache write. Used for
+    /// the user's question AND for the follow-up A query that DNS64
+    /// fires when AAAA comes back NODATA.
+    ///
+    /// Caching here (rather than waiting for an outer post-DNS64 cache
+    /// write) is what makes `in_flight` collapsing actually pay off
+    /// for AAAA queries on a DNS64 listener. With the leader caching
+    /// both the validated NODATA AAAA and the validated A, every
+    /// follower waking from the per-key lock hits cache, runs
+    /// `synthesise_from_cached_a` for ~milliseconds, and returns
+    /// without burning a fresh walk.
+    ///
+    /// The DNSSEC chain validator is still gated by the outer
+    /// `validator` field; in PassThrough/Strip modes we apply the
+    /// configured AD-bit policy instead.
+    async fn resolve_validate_cache(
+        &self,
+        iter: &Arc<IterativeResolver>,
+        msg: &Message,
+    ) -> ResolveOutcome {
+        let q = match msg.queries.first() {
+            Some(q) => q.clone(),
+            None => return ResolveOutcome::WalkFailed,
+        };
+        let (bytes, walk_chain) = match iter.resolve_with_chain(msg).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(qname = %&q.name, "iterative resolve failed: {e:#}");
+                return ResolveOutcome::WalkFailed;
+            }
+        };
+        let mut parsed = match Message::from_bytes(&bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                // Couldn't decode — return the raw bytes uncached.
+                // Validator can't run on garbage, and there's nothing
+                // useful to put in cache.
+                return ResolveOutcome::Ok { bytes, parsed: Message::new(0, MessageType::Response, OpCode::Query) };
+            }
+        };
+
+        if let Some(validator) = self.validator.as_ref() {
+            match validator.validate_walk(&walk_chain, &parsed).await {
+                dnssec::ValidationStatus::Secure => {
+                    self.metrics
+                        .dnssec_validated
+                        .fetch_add(1, Ordering::Relaxed);
+                    parsed.metadata.authentic_data = true;
+                }
+                dnssec::ValidationStatus::Insecure => {
+                    parsed.metadata.authentic_data = false;
+                }
+                dnssec::ValidationStatus::Bogus(reason) => {
+                    self.metrics
+                        .dnssec_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(qname = %&q.name, "DNSSEC validation bogus: {reason}");
+                    return ResolveOutcome::Bogus(servfail_with_ede(
+                        msg,
+                        dnssec::EDE_DNSSEC_BOGUS,
+                        &reason,
+                    ));
+                }
+            }
+        } else {
+            self.dnssec.apply_to_response(&mut parsed);
+        }
+
+        let final_bytes = parsed.to_vec().unwrap_or(bytes);
+        let key = CacheKey::new(&q.name, q.query_type(), q.query_class());
+        self.cache.put(key, &parsed, final_bytes.clone()).await;
+        ResolveOutcome::Ok {
+            bytes: final_bytes,
+            parsed,
+        }
+    }
+
+    /// Build the response from an already-fetched cache entry.
+    /// Handles DNS64 synthesis (re-doing it cheaply against the
+    /// cached A) and DNSSEC policy on hit.
+    ///
+    /// Returns:
+    ///   * `Some(bytes)` — final bytes for the client.
+    ///   * `None` — cache held an AAAA NODATA on a DNS64 listener
+    ///     but the cached A is missing; caller falls through to a
+    ///     fresh resolve.
+    async fn build_from_cache_value(
+        &self,
+        msg: &Message,
+        q: &Query,
+        cached: Vec<u8>,
+        ctx: &ListenerContext,
+    ) -> Option<Vec<u8>> {
+        let mut cached = cached;
+        cache::rewrite_txid(&mut cached, msg.metadata.id);
+        let Ok(mut parsed) = Message::from_bytes(&cached) else {
+            return Some(cached);
+        };
+        if dns64::should_synthesise(
+            self.dns64.as_deref(),
+            ctx.dns64,
+            &q.name,
+            q.query_type(),
+            &parsed,
+        ) {
+            let policy = self.dns64.as_deref()?;
+            let synth = self
+                .synthesise_from_cached_a(policy, msg, &q.name)
+                .await?;
+            self.metrics
+                .dns64_synthesised
+                .fetch_add(1, Ordering::Relaxed);
+            return synth.to_vec().ok();
+        }
+        if self.validator.is_none() {
+            self.dnssec.apply_to_response(&mut parsed);
+        }
+        Some(parsed.to_vec().unwrap_or(cached))
+    }
+
     /// Look up the cached A response for `qname`; if present,
     /// synthesise an AAAA response from its answers. Returns None
     /// when A isn't cached (caller falls through to re-resolution).
