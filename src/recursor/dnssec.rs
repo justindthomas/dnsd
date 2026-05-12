@@ -2024,11 +2024,17 @@ mod tests {
         // A real-shape .  DNSKEY record (root KSK-2017-ish; the
         // base64 here is intentionally a placeholder that has valid
         // base64 but not a real key — parsing is what's under test,
-        // not cryptographic correctness).
+        // not cryptographic correctness. Use unpadded 16-char
+        // strings: every char is a fully-significant 6-bit group,
+        // so there are no trailing pad bits for the base64 crate's
+        // strict mode to reject. Earlier placeholders ended with
+        // `e` / `l` whose lower bits were non-zero, which the
+        // strict decoder treats as malformed even though the input
+        // length matches the spec.)
         let raw = r#"
 ; the root KSK
-.       172800  IN      DNSKEY  257 3 8 AwEAAcoGlCP1+vrZMw/baseline=
-.       172800  IN      DNSKEY  256 3 8 AwEAAfakeZSKeyMaterial=
+.       172800  IN      DNSKEY  257 3 8 AwEAAcoGlCP1AAAA
+.       172800  IN      DNSKEY  256 3 8 AwEAAfakeZSKey/A
 "#;
         let ta = parse_presentation_format(raw).expect("parse");
         assert_eq!(ta.len(), 2, "expected KSK + ZSK");
