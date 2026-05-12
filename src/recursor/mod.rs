@@ -305,6 +305,14 @@ impl RecursorHandler {
             cache_cfg.min_ttl.unwrap_or(0),
             cache_cfg.max_ttl.unwrap_or(604_800),
             cache_cfg.negative_ttl.unwrap_or(3_600),
+            // Default 600s (10 min) for the negative-TTL cap —
+            // shorter than every mainstream resolver's default
+            // (~1h) because for a small-operator router the
+            // recursive path is the only resolver in the path
+            // and a stale NXDOMAIN/NODATA strands clients until
+            // the entry expires. Operators can raise this in
+            // `dns.cache.max_negative_ttl` if they have a reason.
+            cache_cfg.max_negative_ttl.unwrap_or(600),
         ))
     }
 

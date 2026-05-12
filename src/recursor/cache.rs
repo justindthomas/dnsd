@@ -49,16 +49,35 @@ pub struct DnsCache {
     inner: MokaCache<CacheKey, Entry>,
     min_ttl: u32,
     max_ttl: u32,
+    /// Used as the fallback negative TTL when the upstream NXDOMAIN /
+    /// NoData response carries no SOA record to derive a MINIMUM from.
     negative_ttl: u32,
+    /// Hard upper bound on cached negative-response lifetime, applied
+    /// after the SOA MINIMUM is consulted. Distinct from `max_ttl`
+    /// (the positive-cache cap) because operationally the cost of a
+    /// stale negative is much higher than a stale positive: a stale
+    /// positive resolves to a working IP (worst case: traffic to the
+    /// wrong host briefly); a stale negative blackholes new clients
+    /// (they get NXDOMAIN/NODATA and stop trying). Every mainstream
+    /// resolver — Unbound, BIND, PowerDNS Recursor — caps this
+    /// separately around the 1-hour mark by default.
+    max_negative_ttl: u32,
 }
 
 impl DnsCache {
-    pub fn new(max_entries: u64, min_ttl: u32, max_ttl: u32, negative_ttl: u32) -> Self {
+    pub fn new(
+        max_entries: u64,
+        min_ttl: u32,
+        max_ttl: u32,
+        negative_ttl: u32,
+        max_negative_ttl: u32,
+    ) -> Self {
         Self {
             inner: MokaCache::builder().max_capacity(max_entries).build(),
             min_ttl,
             max_ttl,
             negative_ttl,
+            max_negative_ttl,
         }
     }
 
@@ -113,7 +132,10 @@ impl DnsCache {
                         None
                     })
                     .unwrap_or(self.negative_ttl);
-                soa_min.min(self.max_ttl).max(self.min_ttl)
+                // Use `max_negative_ttl` (not the positive
+                // `max_ttl`) for the upper bound — see the field
+                // doc-comment on why those are different caps.
+                soa_min.min(self.max_negative_ttl).max(self.min_ttl)
             }
             ResponseCode::NoError => {
                 // Positive cache: min TTL across answer section
@@ -208,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn hit_miss_and_expiry() {
-        let cache = DnsCache::new(100, 0, 3600, 60);
+        let cache = DnsCache::new(100, 0, 3600, 60, 600);
         let (msg, bytes) = build_positive();
         let key = CacheKey::new(
             &Name::from_ascii("example.com.").unwrap(),
@@ -231,9 +253,48 @@ mod tests {
         assert_eq!(&bytes[2..], &before[..]);
     }
 
+    /// SOA MINIMUM of 1 day must be capped by max_negative_ttl, not
+    /// by max_ttl (the positive cache cap). Without this cap an
+    /// upstream NODATA carrying a high SOA MINIMUM (common — many
+    /// zones set MINIMUM to 1 day) would strand IPv6-only clients on
+    /// stale AAAA "no record" answers far beyond any practical
+    /// outage window.
+    #[test]
+    fn negative_ttl_capped_by_max_negative_ttl() {
+        use hickory_proto::rr::{rdata::SOA, RData, Record};
+
+        // max_ttl=604800 (7d), max_negative_ttl=600 (10min),
+        // soa.minimum=86400 (1d). Expect the 10-min cap to win.
+        let cache = DnsCache::new(100, 0, 604_800, 3_600, 600);
+
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError; // NoData
+        let soa = SOA::new(
+            Name::from_ascii("example.com.").unwrap(),
+            Name::from_ascii("hostmaster.example.com.").unwrap(),
+            1,
+            7200,
+            3600,
+            1_209_600,
+            86_400,
+        );
+        let soa_rec = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            86_400,
+            RData::SOA(soa),
+        );
+        msg.add_authority(soa_rec);
+
+        let ttl = cache.compute_ttl(&msg);
+        assert_eq!(
+            ttl, 600,
+            "SOA MINIMUM of 86400 must be capped to max_negative_ttl=600, not max_ttl=604800"
+        );
+    }
+
     #[tokio::test]
     async fn servfail_not_cached() {
-        let cache = DnsCache::new(100, 0, 3600, 60);
+        let cache = DnsCache::new(100, 0, 3600, 60, 600);
         let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
         msg.metadata.response_code = ResponseCode::ServFail;
         let bytes = msg.to_vec().unwrap();

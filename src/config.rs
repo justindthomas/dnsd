@@ -243,7 +243,19 @@ pub struct Cache {
     pub max_entries: Option<u32>,
     pub min_ttl: Option<u32>,
     pub max_ttl: Option<u32>,
+    /// Fallback negative-cache TTL — applied when an upstream
+    /// NXDOMAIN/NoData response doesn't carry a SOA the resolver can
+    /// derive a MINIMUM field from.
     pub negative_ttl: Option<u32>,
+    /// Hard cap on cached negative-response lifetime. Distinct from
+    /// `max_ttl` (the positive-cache cap) because the operational
+    /// cost of a stale negative — a client repeatedly being told
+    /// "this host does not exist" — is much higher than a stale
+    /// positive. Default is 600s; raise only if you have a specific
+    /// reason. Mirrors Unbound's `cache-max-negative-ttl` /
+    /// BIND9's `max-ncache-ttl` / PowerDNS Recursor's
+    /// `max-negative-ttl`, all of which default to roughly an hour.
+    pub max_negative_ttl: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
