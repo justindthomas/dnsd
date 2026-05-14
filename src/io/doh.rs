@@ -231,11 +231,19 @@ async fn accept_loop(
                             alpn = %alpn_display,
                             "DoH conn done",
                         ),
-                        Err(e) => tracing::warn!(
-                            %peer,
-                            alpn = %alpn_display,
-                            "DoH serve: {e}",
-                        ),
+                        Err(e) => {
+                            // {:#} on anyhow::Error walks the
+                            // source chain — hyper's top-level
+                            // Display is often just "connection
+                            // error", with the actual io::Error /
+                            // parse error one or two `source()`
+                            // levels down.
+                            tracing::warn!(
+                                %peer,
+                                alpn = %alpn_display,
+                                "DoH serve error: {e:#}",
+                            );
+                        }
                     }
                 }
                 Err(e) => {
