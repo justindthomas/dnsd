@@ -29,7 +29,7 @@ rustls-pki-types = "1"
 # DoH HTTP server
 axum = { version = "0.7", features = ["http2"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tower = "0.5"
 
 # ACME
@@ -69,6 +69,10 @@ libc = "0.2"
 bytes = "1"
 base64 = "0.22"
 data-encoding = "2"
+# Cert inspection for the `tls` control command — pull the leaf
+# Subject / Issuer / NotAfter / SAN so operators can verify what
+# DoT/DoH is presenting without scping the PEM off the router.
+x509-parser = "0.16"
 arc-swap = "1"
 rand = "0.10"
 http = "1"
@@ -93,6 +97,10 @@ kernel-sockets = []
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# Self-signed cert generation for the TlsInfo extractor test.
+# rcgen is already pulled in transitively via rustls-acme so this
+# costs nothing in compile time.
+rcgen = "0.13"
 
 [lib]
 name = "dnsd"

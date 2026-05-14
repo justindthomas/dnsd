@@ -12,6 +12,10 @@
 //!    "name":"foo.com","rrtype":"A"}` — cache inspection + flush.
 //! - `{"command":"forwarders"}` — configured forwarders + live RTT
 //!   (RTT populated once recursor health checks land).
+//! - `{"command":"listeners"}` — currently-bound listeners (post
+//!   reload diff). One row per (address, port, proto).
+//! - `{"command":"tls"}` — effective TLS materials in use by DoT /
+//!   DoH listeners: cert source, subject, issuer, not_after.
 //! - `{"command":"reload"}` — SIGHUP-equivalent reconfigure.
 //! - `{"command":"upstream","name":"..."}` — resolution trace.
 
@@ -42,6 +46,8 @@ pub enum ControlRequest {
         rrtype: Option<String>,
     },
     Forwarders,
+    Listeners,
+    Tls,
     Reload,
     Upstream { name: String },
 }
@@ -59,6 +65,10 @@ pub enum ControlResponse {
     Forwarders {
         forwarders: Vec<ForwarderInfo>,
     },
+    Listeners {
+        listeners: Vec<ListenerInfo>,
+    },
+    Tls(TlsInfo),
     Ok {
         message: String,
     },
@@ -76,6 +86,46 @@ pub struct ForwarderInfo {
     pub servers: Vec<String>,
 }
 
+/// One row in the `listeners` response — the live bind set after any
+/// SIGHUP-driven diff. Mirrors what the operator put in router.yaml
+/// but reflects what actually came up (e.g. a DoT listener listed in
+/// config but skipped because no TLS materials are loaded won't
+/// appear).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenerInfo {
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    pub protocol: String,
+    /// CIDRs from `allow_from`. Empty means the listener accepts
+    /// from any peer.
+    pub allow_from: Vec<String>,
+    pub dns64: bool,
+}
+
+/// Snapshot of the TLS materials in effect for DoT/DoH. `present` is
+/// false when no `dns.tls:` block is configured (DoT/DoH listeners
+/// won't bind).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TlsInfo {
+    pub present: bool,
+    /// `"file"` | `"acme"` (matches `dns.tls.cert_source`). Empty
+    /// string when `present == false`.
+    pub cert_source: String,
+    /// X.509 Subject DN of the leaf cert, if loaded.
+    pub subject: Option<String>,
+    /// X.509 Issuer DN of the leaf cert.
+    pub issuer: Option<String>,
+    /// `notAfter` rendered as RFC 3339. Operators consume this to
+    /// notice an expiring cert before clients start failing.
+    pub not_after: Option<String>,
+    /// SubjectAltName DNS / IP entries from the leaf cert, if any.
+    pub sans: Vec<String>,
+    /// ALPN list advertised on the handshake (e.g. `dot`, `h2`,
+    /// `http/1.1`).
+    pub alpn: Vec<String>,
+}
+
 /// Read-only view of state the control socket needs. Built once by
 /// `main.rs`. The forwarders pointer is wrapped in `ArcSwap` so a
 /// SIGHUP-triggered reload can publish a fresh forwarder table
@@ -86,6 +136,16 @@ pub struct ControlState {
     pub metrics: Arc<Metrics>,
     pub cache: Arc<DnsCache>,
     pub forwarders: Arc<arc_swap::ArcSwap<Forwarders>>,
+    /// Listener bind snapshot. Same hot-swap pattern as `forwarders`:
+    /// main.rs publishes a fresh `Vec<ListenerInfo>` after the
+    /// initial bind and after every SIGHUP-driven diff. Empty until
+    /// the first publish (control socket starts before listeners).
+    pub listeners: Arc<arc_swap::ArcSwap<Vec<ListenerInfo>>>,
+    /// Live TLS materials. `TlsInfo { present: false, .. }` when no
+    /// `dns.tls:` is configured. Updated on reload so an operator
+    /// rotating certs sees the new subject/expiry without a daemon
+    /// restart.
+    pub tls: Arc<arc_swap::ArcSwap<TlsInfo>>,
 }
 
 pub struct ControlServer {
@@ -196,6 +256,10 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 .collect();
             ControlResponse::Forwarders { forwarders }
         }
+        ControlRequest::Listeners => ControlResponse::Listeners {
+            listeners: state.listeners.load_full().as_ref().clone(),
+        },
+        ControlRequest::Tls => ControlResponse::Tls(state.tls.load_full().as_ref().clone()),
         ControlRequest::Reload => {
             // SIGHUP self — main.rs's signal loop picks it up the
             // same way as an external `pkill -HUP`. Keeps the reload
@@ -234,4 +298,62 @@ pub async fn send_request(socket: &Path, req: &ControlRequest) -> Result<Control
     let mut line = String::new();
     rx.read_line(&mut line).await?;
     Ok(serde_json::from_str(line.trim())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listeners_request_round_trips() {
+        // The new {"command":"listeners"} shape must serde
+        // cleanly — clients (imp-dnsd-query, impd's
+        // query_imp_dnsd) build this by hand.
+        let req: ControlRequest =
+            serde_json::from_str(r#"{"command":"listeners"}"#).unwrap();
+        assert!(matches!(req, ControlRequest::Listeners));
+        assert_eq!(
+            serde_json::to_string(&ControlRequest::Listeners).unwrap(),
+            r#"{"command":"listeners"}"#
+        );
+    }
+
+    #[test]
+    fn tls_request_round_trips() {
+        let req: ControlRequest =
+            serde_json::from_str(r#"{"command":"tls"}"#).unwrap();
+        assert!(matches!(req, ControlRequest::Tls));
+        assert_eq!(
+            serde_json::to_string(&ControlRequest::Tls).unwrap(),
+            r#"{"command":"tls"}"#
+        );
+    }
+
+    #[test]
+    fn listeners_response_shape() {
+        let info = ListenerInfo {
+            name: "lan".into(),
+            address: "192.0.2.1".into(),
+            port: 853,
+            protocol: "dot".into(),
+            allow_from: vec!["192.0.2.0/24".into()],
+            dns64: false,
+        };
+        let resp = ControlResponse::Listeners {
+            listeners: vec![info],
+        };
+        let j = serde_json::to_value(&resp).unwrap();
+        assert_eq!(j["type"], "listeners");
+        assert_eq!(j["listeners"][0]["protocol"], "dot");
+        assert_eq!(j["listeners"][0]["port"], 853);
+    }
+
+    #[test]
+    fn tls_info_default_is_absent() {
+        let resp = ControlResponse::Tls(TlsInfo::default());
+        let j = serde_json::to_value(&resp).unwrap();
+        assert_eq!(j["type"], "tls");
+        assert_eq!(j["present"], false);
+        assert_eq!(j["cert_source"], "");
+    }
 }

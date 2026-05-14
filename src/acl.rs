@@ -21,6 +21,13 @@ impl ClientAcl {
     pub fn allows(&self, peer: IpAddr) -> bool {
         self.allow.iter().any(|cidr| cidr.contains(&peer))
     }
+
+    /// Read-only view of the configured CIDRs. The `listeners`
+    /// control command surfaces this so operators can verify the
+    /// allow-list matches what's in router.yaml after a reload.
+    pub fn cidrs(&self) -> &[IpNet] {
+        &self.allow
+    }
 }
 
 #[cfg(test)]

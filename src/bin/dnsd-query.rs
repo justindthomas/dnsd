@@ -24,6 +24,11 @@ enum Cmd {
     Stats,
     /// Configured forwarders + live RTT (once health checks land).
     Forwarders,
+    /// Currently-bound listeners (post-reload diff).
+    Listeners,
+    /// TLS materials in effect for DoT/DoH (cert source, subject,
+    /// not-after, SAN, ALPN).
+    Tls,
     /// SIGHUP-equivalent reconfigure.
     Reload,
     /// Cache stats / flush / dump.
@@ -45,6 +50,8 @@ async fn main() -> Result<()> {
     let req = match args.cmd {
         Cmd::Stats => ControlRequest::Stats,
         Cmd::Forwarders => ControlRequest::Forwarders,
+        Cmd::Listeners => ControlRequest::Listeners,
+        Cmd::Tls => ControlRequest::Tls,
         Cmd::Reload => ControlRequest::Reload,
         Cmd::Cache { op, name, rrtype } => ControlRequest::Cache { op, name, rrtype },
         Cmd::Upstream { name } => ControlRequest::Upstream { name },

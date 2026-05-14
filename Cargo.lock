@@ -637,6 +637,7 @@ dependencies = [
  "nix",
  "proptest",
  "rand 0.10.1",
+ "rcgen",
  "rustls",
  "rustls-acme",
  "rustls-pki-types",
@@ -652,6 +653,7 @@ dependencies = [
  "tracing-subscriber",
  "vcl-rs",
  "vpp-api",
+ "x509-parser",
 ]
 
 [[package]]

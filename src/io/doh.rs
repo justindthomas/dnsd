@@ -15,9 +15,12 @@
 //! alpn-01 ACME challenges is done by the `rustls-acme` wrapper
 //! when `dns.tls.cert_source` is `acme`.
 //!
-//! Today only HTTP/1.1 is handled (hyper::server::conn::http1). HTTP/2
-//! over axum-rustls needs a bit more plumbing (hyper::server::conn::
-//! http2::Builder + GracefulShutdown) and will follow up.
+//! Protocol selection is driven by ALPN: hyper-util's auto Builder
+//! reads the negotiated ALPN off the TLS handshake and dispatches
+//! to its http1 or http2 path. Most DoH clients (Firefox, curl,
+//! dns-over-https libraries) negotiate h2 by default — h1.1 stays
+//! available for kdig, simple shell clients, and anyone behind a
+//! middlebox that strips ALPN.
 //!
 //! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
 //! tcp.rs and udp.rs for the pattern). The ACL is checked at TCP
@@ -41,7 +44,8 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::Request;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
@@ -133,7 +137,10 @@ async fn accept_loop(
                         async move { svc.call(req).await }
                     });
                     let io = TokioIo::new(tls_stream);
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    // ALPN-driven HTTP/1.1 vs HTTP/2 selection. The
+                    // auto Builder peeks at the negotiated ALPN and
+                    // hands off to the matching hyper protocol path.
+                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
                         .serve_connection(io, service)
                         .await
                     {

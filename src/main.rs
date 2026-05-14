@@ -25,7 +25,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 use dnsd::acl::ClientAcl;
 use dnsd::acme;
 use dnsd::config::{DnsConfig, Listener as ListenerCfg, DEFAULT_MAX_INFLIGHT};
-use dnsd::control::{ControlServer, ControlState, DEFAULT_SOCKET};
+use dnsd::control::{ControlServer, ControlState, ListenerInfo, TlsInfo, DEFAULT_SOCKET};
 use dnsd::handler::{AclSwap, CtxSwap, ListenerContext, LiveHandler, SharedHandler};
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
@@ -233,6 +233,10 @@ async fn run_control_only(args: Args, cfg: DnsConfig) -> Result<()> {
         metrics,
         cache,
         forwarders: Arc::new(arc_swap::ArcSwap::new(forwarders)),
+        // Disabled mode has no bound listeners and no TLS materials;
+        // operator queries still get a well-formed empty response.
+        listeners: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::<ListenerInfo>::new())),
+        tls: Arc::new(arc_swap::ArcSwap::from_pointee(TlsInfo::default())),
     };
     let control = ControlServer::new(args.control_socket.clone(), state);
     tokio::spawn(async move {
@@ -280,6 +284,16 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
     let forwarders_swap: Arc<arc_swap::ArcSwap<Forwarders>> =
         Arc::new(arc_swap::ArcSwap::new(forwarders_initial.clone()));
 
+    // Same hot-swap pattern for the listener bind set and the TLS
+    // materials snapshot. Both start empty; main publishes a fresh
+    // value after the initial bind and after every SIGHUP-driven
+    // diff, so the control socket reads the live state without
+    // coordinating with the listener loop.
+    let listeners_swap: Arc<arc_swap::ArcSwap<Vec<ListenerInfo>>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    let tls_swap: Arc<arc_swap::ArcSwap<TlsInfo>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(TlsInfo::default()));
+
     // Control socket first so the impd supervisor's Ready::Socket gate
     // unblocks; we don't want the whole startup to stall behind VCL
     // init if something is wrong with VPP.
@@ -288,6 +302,8 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
         metrics: metrics.clone(),
         cache: cache.clone(),
         forwarders: forwarders_swap.clone(),
+        listeners: listeners_swap.clone(),
+        tls: tls_swap.clone(),
     };
     let control = ControlServer::new(control_path.clone(), state);
     tokio::spawn(async move {
@@ -362,9 +378,14 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
     let live: Arc<LiveHandler<RecursorHandler>> = Arc::new(LiveHandler::new(initial_recursor));
     let handler: SharedHandler = live.clone();
 
-    // TLS config is shared between DoT and DoH. None means
-    // cert_source is 'acme' (not yet wired) or no TLS listeners.
-    let tls_config = acme::server_config_from_dns(&cfg).context("loading TLS config")?;
+    // TLS materials shared by DoT and DoH. `None` means no
+    // `dns.tls:` block (DoT/DoH listeners will be skipped at bind
+    // time with a warning).
+    let tls_setup = acme::build_tls(&cfg).context("loading TLS config")?;
+    let tls_config = tls_setup.as_ref().map(|s| s.server_config.clone());
+    if let Some(s) = &tls_setup {
+        tls_swap.store(Arc::new(s.info.clone()));
+    }
 
     let mut listeners: LiveListeners = HashMap::new();
     bind_listener_set_with_retry(
@@ -385,6 +406,7 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
     } else {
         tracing::info!(n = listeners.len(), "listeners bound");
     }
+    listeners_swap.store(Arc::new(snapshot_listeners(&listeners)));
 
     wait_for_exit_with_reload(
         WaitArgs {
@@ -397,6 +419,8 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
             live,
             tls_config,
             forwarders_swap,
+            listeners_swap,
+            tls_swap,
             discovered_v6_source: discovered_v6,
             discovered_v4_source: discovered_v4,
             anchor_dir: args.data_dir.join("anchor"),
@@ -405,6 +429,37 @@ async fn async_main(args: Args, cfg: DnsConfig) -> Result<()> {
     )
     .await;
     Ok(())
+}
+
+/// Render the live listener map into the shape consumed by the
+/// control socket. Called after every bind/diff so
+/// `imp-dnsd-query listeners` always reflects the current state.
+fn snapshot_listeners(listeners: &LiveListeners) -> Vec<ListenerInfo> {
+    let mut out: Vec<ListenerInfo> = listeners
+        .iter()
+        .map(|(key, live)| {
+            let acl_snap = live.acl.load();
+            let ctx_snap = live.ctx.load();
+            let allow_from: Vec<String> =
+                acl_snap.cidrs().iter().map(|c| c.to_string()).collect();
+            ListenerInfo {
+                name: live.name.clone(),
+                address: key.addr.to_string(),
+                port: key.port,
+                protocol: key.proto.to_string(),
+                allow_from,
+                dns64: ctx_snap.dns64,
+            }
+        })
+        .collect();
+    // Stable sort so the operator-facing output is reproducible
+    // across calls and across reloads — same (addr, port, proto)
+    // always lands in the same row.
+    out.sort_by(|a, b| {
+        (a.address.as_str(), a.port, a.protocol.as_str())
+            .cmp(&(b.address.as_str(), b.port, b.protocol.as_str()))
+    });
+    out
 }
 
 // ---- listener-spawn helpers ------------------------------------
@@ -615,6 +670,14 @@ struct WaitArgs {
     /// fresh Forwarders here so `dnsd-query forwarders` sees the
     /// new table immediately.
     forwarders_swap: Arc<arc_swap::ArcSwap<Forwarders>>,
+    /// Listener bind snapshot published after every diff — drives
+    /// `imp-dnsd-query listeners`.
+    listeners_swap: Arc<arc_swap::ArcSwap<Vec<ListenerInfo>>>,
+    /// TLS materials snapshot published when `dns.tls:` is built.
+    /// Rebuilt on SIGHUP so an operator who rotated certs (or
+    /// flipped cert_source) sees the change without a daemon
+    /// restart.
+    tls_swap: Arc<arc_swap::ArcSwap<TlsInfo>>,
     /// VPP-discovered global v6 source IP, captured once at startup.
     /// Re-used across SIGHUP reloads so the same source binds across
     /// the whole process lifetime — interface addresses don't
@@ -764,6 +827,28 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
     )
     .await;
     let added = listeners.len().saturating_sub(before);
+
+    // Publish the post-diff bind state for the `listeners` control
+    // command. ACL/ctx hot-swaps already applied to the kept
+    // listeners are reflected because we read straight off the live
+    // ArcSwaps via `snapshot_listeners`.
+    args.listeners_swap
+        .store(Arc::new(snapshot_listeners(listeners)));
+
+    // Re-build the TlsInfo snapshot from the new config. The
+    // running ServerConfig itself is captured at startup and *not*
+    // hot-swapped (rebinding TLS listeners with a new cert
+    // requires more orchestration than reload currently does), so
+    // a cert-source change here is informational only — operators
+    // who rotate certs out from under dnsd should restart the
+    // daemon. What the snapshot does help with is showing the
+    // *configured* cert source / domains after a cert_source flip
+    // in router.yaml, so the GUI's DNS tab matches the YAML.
+    match acme::build_tls(&new_cfg) {
+        Ok(Some(s)) => args.tls_swap.store(Arc::new(s.info)),
+        Ok(None) => args.tls_swap.store(Arc::new(TlsInfo::default())),
+        Err(e) => tracing::warn!("reload: TlsInfo rebuild skipped: {e}"),
+    }
 
     tracing::info!(
         active = listeners.len(),
