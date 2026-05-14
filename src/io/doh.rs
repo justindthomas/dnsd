@@ -15,12 +15,17 @@
 //! alpn-01 ACME challenges is done by the `rustls-acme` wrapper
 //! when `dns.tls.cert_source` is `acme`.
 //!
-//! Protocol selection is driven by ALPN: hyper-util's auto Builder
-//! reads the negotiated ALPN off the TLS handshake and dispatches
-//! to its http1 or http2 path. Most DoH clients (Firefox, curl,
-//! dns-over-https libraries) negotiate h2 by default — h1.1 stays
-//! available for kdig, simple shell clients, and anyone behind a
-//! middlebox that strips ALPN.
+//! Protocol selection is driven by the **TLS-negotiated ALPN**, not
+//! by hyper-util's auto Builder. The auto Builder picks h1 vs h2 by
+//! peeking the first ~24 bytes of application data after the TLS
+//! handshake; under VCL/libvppcom, that initial application-data
+//! read never returns and the connection wedges. ALPN already
+//! carries the protocol selection (`h2` vs `http/1.1`) — read it
+//! straight off the rustls ServerConnection and dispatch to the
+//! matching hyper builder explicitly. Most DoH clients (Firefox,
+//! curl, dns-over-https libs) negotiate h2; kdig / simple shell
+//! clients stay on h1.1. If a client connects without ALPN (rare),
+//! we fall back to http/1.1 — the safest default.
 //!
 //! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
 //! tcp.rs and udp.rs for the pattern). The ACL is checked at TCP
@@ -44,8 +49,8 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::Request;
+use hyper::server::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
@@ -122,6 +127,29 @@ async fn accept_loop(
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
+                    // Read the TLS-negotiated ALPN before handing the
+                    // stream to hyper. `get_ref().1` is the inner
+                    // rustls ServerConnection; its `alpn_protocol()`
+                    // returns the bytes we advertised in
+                    // ServerConfig.alpn_protocols that the client
+                    // accepted. None means the client didn't speak
+                    // ALPN at all (kdig-style minimal client) — fall
+                    // back to http/1.1.
+                    let alpn = tls_stream
+                        .get_ref()
+                        .1
+                        .alpn_protocol()
+                        .map(|b| b.to_vec());
+                    let alpn_display = alpn
+                        .as_deref()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .unwrap_or_else(|| "(none)".into());
+                    tracing::debug!(
+                        %peer,
+                        alpn = %alpn_display,
+                        "DoH TLS handshake complete, dispatching",
+                    );
+
                     let state = AppState {
                         handler,
                         metrics,
@@ -138,14 +166,29 @@ async fn accept_loop(
                         async move { svc.call(req).await }
                     });
                     let io = TokioIo::new(tls_stream);
-                    // ALPN-driven HTTP/1.1 vs HTTP/2 selection. The
-                    // auto Builder peeks at the negotiated ALPN and
-                    // hands off to the matching hyper protocol path.
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        tracing::debug!(%peer, "DoH serve: {e}");
+
+                    let result = match alpn.as_deref() {
+                        Some(b"h2") => {
+                            http2::Builder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e))
+                        }
+                        // Default to HTTP/1.1: explicit "http/1.1"
+                        // ALPN, no ALPN at all (kdig-style), or any
+                        // unknown ALPN we shouldn't try to speak h2
+                        // on (e.g. acme-tls/1 — the rustls-acme
+                        // resolver serves the challenge cert *and*
+                        // closes the connection after the
+                        // handshake; serve_connection will return
+                        // Ok immediately).
+                        _ => http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e)),
+                    };
+                    if let Err(e) = result {
+                        tracing::debug!(%peer, alpn = %alpn_display, "DoH serve: {e}");
                     }
                 }
                 Err(e) => {

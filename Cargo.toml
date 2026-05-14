@@ -29,7 +29,7 @@ rustls-pki-types = "1"
 # DoH HTTP server
 axum = { version = "0.7", features = ["http2"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
 tower = "0.5"
 
 # ACME
