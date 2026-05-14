@@ -109,6 +109,7 @@ async fn accept_loop(
         };
         if !acl.load().allows(peer.ip()) {
             metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%peer, listener = %ctx.load().name, "DoH: ACL denied pre-handshake");
             drop(stream);
             continue;
         }

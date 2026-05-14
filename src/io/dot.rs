@@ -78,6 +78,11 @@ async fn accept_loop(
         };
         if !acl.load().allows(peer.ip()) {
             metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+            // debug, not warn — operators don't need to see every
+            // rejected scan packet at info, but blind-debugging a
+            // TLS-handshake-cut-short symptom is much easier when
+            // the dropped peer IP is one grep away.
+            tracing::debug!(%peer, listener = %ctx.load().name, "DoT: ACL denied pre-handshake");
             drop(stream);
             continue;
         }

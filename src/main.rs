@@ -749,6 +749,34 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
         }
     };
 
+    // Rebuild TLS materials from the new config. If the operator
+    // *added* a `dns.tls:` block on this reload, we need the fresh
+    // ServerConfig in hand before the listener-bind path runs so
+    // newly-declared DoT/DoH listeners actually bind. Without this
+    // path, the bind would fall back to `args.tls_config` (captured
+    // at startup) and silently skip the DoT/DoH protocols with
+    // "DoT requested but no TLS config available". Already-bound
+    // listeners stay on the original ServerConfig — hot-swapping a
+    // running rustls::ServerConfig across in-flight handshakes is
+    // not something rustls exposes; cert rotation still needs a
+    // process restart.
+    let new_tls_setup = match acme::build_tls(&new_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("reload: TLS rebuild failed: {e}");
+            None
+        }
+    };
+    let effective_tls = new_tls_setup
+        .as_ref()
+        .map(|s| s.server_config.clone())
+        .or_else(|| args.tls_config.clone());
+    let new_tls_info = new_tls_setup
+        .as_ref()
+        .map(|s| s.info.clone())
+        .unwrap_or_default();
+    args.tls_swap.store(Arc::new(new_tls_info));
+
     // Atomic swap. In-flight queries finish on the old handler;
     // new ones see the new handler.
     new_recursor.spawn_dnssec_prewarm();
@@ -821,7 +849,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
         &args.reactor,
         &handler,
         &args.metrics,
-        args.tls_config.as_ref(),
+        effective_tls.as_ref(),
         listeners,
         Duration::from_secs(5), // post-startup: VPP should be ready
     )
@@ -834,21 +862,6 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
     // ArcSwaps via `snapshot_listeners`.
     args.listeners_swap
         .store(Arc::new(snapshot_listeners(listeners)));
-
-    // Re-build the TlsInfo snapshot from the new config. The
-    // running ServerConfig itself is captured at startup and *not*
-    // hot-swapped (rebinding TLS listeners with a new cert
-    // requires more orchestration than reload currently does), so
-    // a cert-source change here is informational only — operators
-    // who rotate certs out from under dnsd should restart the
-    // daemon. What the snapshot does help with is showing the
-    // *configured* cert source / domains after a cert_source flip
-    // in router.yaml, so the GUI's DNS tab matches the YAML.
-    match acme::build_tls(&new_cfg) {
-        Ok(Some(s)) => args.tls_swap.store(Arc::new(s.info)),
-        Ok(None) => args.tls_swap.store(Arc::new(TlsInfo::default())),
-        Err(e) => tracing::warn!("reload: TlsInfo rebuild skipped: {e}"),
-    }
 
     tracing::info!(
         active = listeners.len(),
