@@ -151,7 +151,10 @@ async fn accept_loop(
                         .as_deref()
                         .map(|b| String::from_utf8_lossy(b).into_owned())
                         .unwrap_or_else(|| "(none)".into());
-                    tracing::debug!(
+                    // info-level so it shows up in journalctl by
+                    // default; debugging the real-network DoH
+                    // hang depends on seeing this per connection.
+                    tracing::info!(
                         %peer,
                         alpn = %alpn_display,
                         "DoH TLS handshake complete, dispatching",
@@ -172,7 +175,35 @@ async fn accept_loop(
                         let mut svc = app.clone();
                         async move { svc.call(req).await }
                     });
-                    let io = TokioIo::new(tls_stream);
+                    // Wrap the TLS stream in tokio's BufStream
+                    // before handing it to hyper. Two reasons:
+                    //
+                    // 1. Reads — BufStream coalesces small `poll_read`
+                    //    calls (hyper's HTTP/1 parser reads request
+                    //    line, then headers, then body in separate
+                    //    operations). Under VCL/libvppcom the per-
+                    //    poll-read wakeup machinery has only been
+                    //    proven for one-shot reads (DoT works with
+                    //    `read_exact`); the multi-step pattern hyper
+                    //    uses against the bare TlsStream lost the
+                    //    request on the real-network path. Buffering
+                    //    keeps the wakeup count to one per arriving
+                    //    chunk and lets hyper drain a full request
+                    //    in one go.
+                    // 2. Writes — same coalescing on the way out:
+                    //    hyper writes headers then body as separate
+                    //    operations, which produces two TLS records
+                    //    and (more importantly) two VCL writes; the
+                    //    second one was visible-on-the-wire-as-
+                    //    missing in pcap before the buffer.
+                    //
+                    // 8 KiB each way is enough for any sane DoH
+                    // request and a typical DNS reply, which run
+                    // hundreds of bytes max.
+                    let buffered = tokio::io::BufStream::with_capacity(
+                        8192, 8192, tls_stream,
+                    );
+                    let io = TokioIo::new(buffered);
 
                     let result = match alpn.as_deref() {
                         Some(b"h2") => {
@@ -194,8 +225,17 @@ async fn accept_loop(
                             .await
                             .map_err(|e| anyhow::anyhow!(e)),
                     };
-                    if let Err(e) = result {
-                        tracing::debug!(%peer, alpn = %alpn_display, "DoH serve: {e}");
+                    match &result {
+                        Ok(_) => tracing::info!(
+                            %peer,
+                            alpn = %alpn_display,
+                            "DoH conn done",
+                        ),
+                        Err(e) => tracing::warn!(
+                            %peer,
+                            alpn = %alpn_display,
+                            "DoH serve: {e}",
+                        ),
                     }
                 }
                 Err(e) => {
@@ -215,6 +255,7 @@ async fn handle_get(
     State(state): State<AppState>,
     Query(q): Query<DnsQuery>,
 ) -> Response {
+    tracing::info!(peer = %state.peer, dns_len = q.dns.len(), "DoH GET /dns-query");
     if !state.acl.load().allows(state.peer) {
         state.metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::FORBIDDEN, "ACL").into_response();
@@ -234,6 +275,7 @@ async fn handle_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    tracing::info!(peer = %state.peer, body_len = body.len(), "DoH POST /dns-query");
     if !state.acl.load().allows(state.peer) {
         state.metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::FORBIDDEN, "ACL").into_response();
