@@ -1995,9 +1995,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-acme"
-version = "0.11.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d05fdb718e53ad511fa6477187f43f5dcd01b88f39e64ec16d6afc7363767d6"
+checksum = "7dcdaa66cd3bf55140f4061b0bb596650d5e8f7f0183cd263fba2a57cf740b96"
 dependencies = [
  "async-io",
  "async-trait",
@@ -2015,8 +2015,8 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
- "webpki-roots 0.26.11",
+ "thiserror 2.0.18",
+ "webpki-roots 1.0.7",
  "x509-parser",
 ]
 
