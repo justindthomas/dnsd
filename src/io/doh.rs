@@ -396,7 +396,7 @@ impl<S> PrefixedStream<S> {
 impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut StdContext<'_>,
+        _cx: &mut StdContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if self.pos < self.prefix.len() {
@@ -406,7 +406,29 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
             self.pos += take;
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        // After the prefix is exhausted, signal EOF rather than
+        // delegating to the live inner stream. Two reasons:
+        //
+        // 1. Hyper's HTTP/1.1 read path does a follow-up poll_read
+        //    after parsing the request to look for a next request
+        //    on a keep-alive connection. Under libvppcom that
+        //    follow-up Pending never wakes up (the same bug that
+        //    motivated the explicit drain in the first place), and
+        //    hyper never gets to write the response — even though
+        //    the request is fully parsed.
+        // 2. Our typical DoH client sends "Connection: close" and
+        //    one request per TCP connection; there is no second
+        //    request to wait for. EOF-after-one-request is the
+        //    correct close-mode behavior.
+        //
+        // Caveat: this breaks keep-alive (every connection gets one
+        // request) and would break long-bodied POSTs whose body
+        // extends past the initial drain. POST bodies for DoH are
+        // tiny (a few hundred bytes of DNS wire), well inside the
+        // 8 KiB drain buffer, so in practice this is fine. Real
+        // keep-alive + the long-body case both need the libvppcom
+        // wakeup bug fixed upstream.
+        Poll::Ready(Ok(()))
     }
 }
 
