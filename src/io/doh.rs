@@ -18,14 +18,21 @@
 //! Protocol selection is driven by the **TLS-negotiated ALPN**, not
 //! by hyper-util's auto Builder. The auto Builder picks h1 vs h2 by
 //! peeking the first ~24 bytes of application data after the TLS
-//! handshake; under VCL/libvppcom, that initial application-data
-//! read never returns and the connection wedges. ALPN already
+//! handshake; under VCL/libvppcom that peek wedged the connection
+//! (no observed bytes through, no error logged). ALPN already
 //! carries the protocol selection (`h2` vs `http/1.1`) — read it
 //! straight off the rustls ServerConnection and dispatch to the
 //! matching hyper builder explicitly. Most DoH clients (Firefox,
 //! curl, dns-over-https libs) negotiate h2; kdig / simple shell
 //! clients stay on h1.1. If a client connects without ALPN (rare),
-//! we fall back to http/1.1 — the safest default.
+//! fall back to http/1.1 — the safest default.
+//!
+//! Testing note: under LD_PRELOAD'd libvppcom on the router host
+//! itself, `curl` hangs after sending the request regardless of
+//! HTTP version (h1 or h2). `openssl s_client -quiet -ign_eof` over
+//! the same LD_PRELOAD path works fine for h1. Real LAN clients
+//! using kernel sockets aren't affected — this is a curl ↔
+//! libvppcom recv/select quirk, not a server bug.
 //!
 //! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
 //! tcp.rs and udp.rs for the pattern). The ACL is checked at TCP

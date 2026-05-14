@@ -208,15 +208,12 @@ fn build_acme_tls_alpn_01(_cfg: &DnsConfig, acme: &crate::config::Acme) -> Resul
 
     // Same ALPN set as the file-cert path, plus `acme-tls/1` so the
     // resolver can serve challenge certs when the ACME CA connects.
-    // Same ALPN as the file-cert path: `dot` + `http/1.1` (h2 is
-    // intentionally NOT advertised — see the file-cert branch for
-    // the libvppcom-h2 explanation), plus `acme-tls/1` for the
-    // tls-alpn-01 challenge handshake.
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     server_config.alpn_protocols = vec![
         b"dot".to_vec(),
+        b"h2".to_vec(),
         b"http/1.1".to_vec(),
         b"acme-tls/1".to_vec(),
     ];
@@ -295,19 +292,9 @@ fn load_file_pair(
         .with_single_cert(certs, key)
         .context("building ServerConfig")?;
 
-    // ALPN: `dot` for DoT, `http/1.1` for DoH. h2 is *not*
-    // advertised today — hyper's HTTP/2 implementation hangs the
-    // first SETTINGS write under libvppcom (TCP handshake +
-    // rustls handshake complete, ALPN negotiates h2 cleanly, then
-    // the post-handshake read never returns). HTTP/1.1 over the
-    // same VCL transport works fine. Most modern DoH clients
-    // (Firefox, curl --http2, dns-over-https libs) gracefully
-    // fall back to http/1.1 when h2 isn't advertised. The h2
-    // dispatch path in io/doh.rs is left in place for when the
-    // libvppcom interaction is fixed; flipping `h2` back on here
-    // is the only change needed at that point.
     cfg.alpn_protocols = vec![
         b"dot".to_vec(),
+        b"h2".to_vec(),
         b"http/1.1".to_vec(),
     ];
     Ok((Arc::new(cfg), leaf_der))
