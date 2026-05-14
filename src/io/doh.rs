@@ -1,9 +1,18 @@
 //! DNS-over-HTTPS (RFC 8484) listener.
 //!
-//! `DnsTcpListener` (transport-backend-selected) accepts TCP/443.
-//! Each connection is
-//! wrapped in rustls and then in hyper via `axum` for the HTTP
-//! plumbing. We serve both modes per RFC 8484:
+//! TLS via tokio-rustls, then a *minimal* HTTP/1.1 parser written
+//! against the same `read_exact` / `write_all` primitives that the
+//! DoT listener uses. There's no hyper, no axum. We tried both:
+//! under VCL/libvppcom the hyper read pattern wedges (request bytes
+//! arrive at TCP, server ACKs them, but `poll_read` returns Pending
+//! and never wakes — DoT works on the same substrate because its
+//! `read_exact` calls happen to retrieve the buffered plaintext
+//! while hyper's multi-step parser does not). Re-implementing a
+//! shaped-by-RFC-8484 subset of HTTP/1.1 is ~120 lines and behaves
+//! exactly like DoT's framing loop, so we get the same proven
+//! wakeup behavior.
+//!
+//! Supported HTTP shape:
 //!
 //!   GET  /dns-query?dns=<base64url-wire>
 //!   POST /dns-query        body=application/dns-message
@@ -11,72 +20,44 @@
 //! Response content-type is always `application/dns-message`; the
 //! upstream cache's TTL feeds into `Cache-Control: max-age=<ttl>`.
 //!
-//! ALPN includes `h2` and `http/1.1`. Adding `acme-tls/1` for tls-
-//! alpn-01 ACME challenges is done by the `rustls-acme` wrapper
-//! when `dns.tls.cert_source` is `acme`.
-//!
-//! Protocol selection is driven by the **TLS-negotiated ALPN**, not
-//! by hyper-util's auto Builder. The auto Builder picks h1 vs h2 by
-//! peeking the first ~24 bytes of application data after the TLS
-//! handshake; under VCL/libvppcom that peek wedged the connection
-//! (no observed bytes through, no error logged). ALPN already
-//! carries the protocol selection (`h2` vs `http/1.1`) — read it
-//! straight off the rustls ServerConnection and dispatch to the
-//! matching hyper builder explicitly. Most DoH clients (Firefox,
-//! curl, dns-over-https libs) negotiate h2; kdig / simple shell
-//! clients stay on h1.1. If a client connects without ALPN (rare),
-//! fall back to http/1.1 — the safest default.
-//!
-//! Testing note: under LD_PRELOAD'd libvppcom on the router host
-//! itself, `curl` hangs after sending the request regardless of
-//! HTTP version (h1 or h2). `openssl s_client -quiet -ign_eof` over
-//! the same LD_PRELOAD path works fine for h1. Real LAN clients
-//! using kernel sockets aren't affected — this is a curl ↔
-//! libvppcom recv/select quirk, not a server bug.
+//! ALPN advertises `h2` and `http/1.1`. We only serve HTTP/1.1
+//! today — if a client negotiates h2 we close the connection
+//! cleanly (clients fall back to h1 on the next attempt). HTTP/2
+//! support is a follow-up; it'd require a frame-level parser of
+//! similar shape.
 //!
 //! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
-//! tcp.rs and udp.rs for the pattern). The ACL is checked at TCP
-//! accept time AND on every HTTP request (since axum routes after
-//! the per-connection handshake) so a SIGHUP that drops a CIDR
-//! takes effect on the next request even on already-open
-//! connections.
+//! tcp.rs and udp.rs for the pattern). The ACL is checked once at
+//! TCP accept time AND on every HTTP request, so a SIGHUP that
+//! drops a CIDR takes effect on the next request.
 
-use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::{Context as StdContext, Poll};
 
-use anyhow::{Context, Result};
-use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::Router;
+use anyhow::{anyhow, Context, Result};
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use hyper::body::Incoming;
-use hyper::Request;
-use hyper::server::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use serde::Deserialize;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
-use tower::Service;
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::io::transport::{DnsTcpListener, ReactorCtx};
 use crate::metrics::Metrics;
 
-#[derive(Clone)]
-struct AppState {
-    handler: SharedHandler,
-    metrics: Arc<Metrics>,
-    ctx: CtxSwap,
-    acl: AclSwap,
-    peer: std::net::IpAddr,
-}
+/// Max bytes we'll consume looking for the end of HTTP headers.
+/// DoH requests are tiny (small base64url GET query string, or a
+/// few-hundred-byte POST body); cap to avoid a misbehaving client
+/// pinning a coroutine on us with a slow header drip.
+const MAX_HEADER_BYTES: usize = 8192;
+/// Max POST body size we'll accept. DNS message wire format caps
+/// at 65535 for TCP-style framing; UDP rarely exceeds 1232 with
+/// EDNS. 65535 is the right cap for parity with the DoT
+/// MAX_TCP_MESSAGE.
+const MAX_BODY_BYTES: usize = 65535;
+/// Hard cap on how long we'll wait for the first request line +
+/// headers. Clients that haven't sent within this window are
+/// probing / leaking sockets / abandoned half-open connections.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub struct DohListener;
 
@@ -136,150 +117,30 @@ async fn accept_loop(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
-                Ok(mut tls_stream) => {
-                    // Read the TLS-negotiated ALPN before handing the
-                    // stream to hyper. `get_ref().1` is the inner
-                    // rustls ServerConnection; its `alpn_protocol()`
-                    // returns the bytes we advertised in
-                    // ServerConfig.alpn_protocols that the client
-                    // accepted. None means the client didn't speak
-                    // ALPN at all (kdig-style minimal client) — fall
-                    // back to http/1.1.
+                Ok(tls_stream) => {
+                    // Read the TLS-negotiated ALPN. If the client
+                    // picked h2, close cleanly — we don't speak it
+                    // yet and a client will fall back to h1.1 on
+                    // retry. Real clients (curl, Firefox) honour
+                    // the close.
                     let alpn = tls_stream
                         .get_ref()
                         .1
                         .alpn_protocol()
                         .map(|b| b.to_vec());
-                    let alpn_display = alpn
-                        .as_deref()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .unwrap_or_else(|| "(none)".into());
-                    // info-level so it shows up in journalctl by
-                    // default; debugging the real-network DoH
-                    // hang depends on seeing this per connection.
-                    tracing::info!(
-                        %peer,
-                        alpn = %alpn_display,
-                        "DoH TLS handshake complete, dispatching",
-                    );
-
-                    let state = AppState {
-                        handler,
-                        metrics,
-                        ctx,
-                        acl,
-                        peer: peer.ip(),
-                    };
-                    let app = Router::new()
-                        .route("/dns-query", get(handle_get))
-                        .route("/dns-query", post(handle_post))
-                        .with_state(state);
-                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let mut svc = app.clone();
-                        async move { svc.call(req).await }
-                    });
-                    // Drain the first chunk of plaintext from the TLS
-                    // stream BEFORE handing to hyper. Under VCL the
-                    // request bytes are already in the FIFO by the
-                    // time we reach here (handshake completion timing
-                    // pairs with the client's first Application Data
-                    // record), but hyper's `serve_connection` does a
-                    // poll_read pattern that for-some-reason fails to
-                    // see those buffered bytes — the wedge symptom is
-                    // a connection that sits idle for the client's
-                    // timeout then errors with rustls' "peer closed
-                    // without close_notify". DoT works on the same
-                    // VCL substrate because it uses `read_exact`,
-                    // which loops on poll_read with a fresh waker
-                    // each iteration. We do the same `read()` here
-                    // (bounded by a short timeout — if no data is
-                    // ready, the operator is just probing or doing
-                    // an idle keep-alive, so we hand a bare stream
-                    // to hyper without buffered bytes).
-                    let mut peek_buf = vec![0u8; 8192];
-                    let drained_n = match tokio::time::timeout(
-                        Duration::from_secs(3),
-                        tls_stream.read(&mut peek_buf),
+                    if alpn.as_deref() == Some(b"h2") {
+                        tracing::debug!(
+                            %peer,
+                            "DoH: h2 ALPN selected but server only speaks h1.1; closing",
+                        );
+                        return;
+                    }
+                    if let Err(e) = serve_one(
+                        tls_stream, peer, handler, metrics, acl, ctx,
                     )
                     .await
                     {
-                        Ok(Ok(0)) => {
-                            tracing::debug!(
-                                %peer,
-                                alpn = %alpn_display,
-                                "DoH peer closed before first request",
-                            );
-                            return;
-                        }
-                        Ok(Ok(n)) => {
-                            tracing::info!(
-                                %peer,
-                                alpn = %alpn_display,
-                                peeked = n,
-                                "DoH drained first chunk",
-                            );
-                            n
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                %peer,
-                                alpn = %alpn_display,
-                                "DoH peek read failed: {e}",
-                            );
-                            return;
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                %peer,
-                                alpn = %alpn_display,
-                                "DoH peek read timeout (3s); client never sent",
-                            );
-                            return;
-                        }
-                    };
-                    peek_buf.truncate(drained_n);
-                    let prefixed = PrefixedStream::new(peek_buf, tls_stream);
-                    let io = TokioIo::new(prefixed);
-
-                    let result = match alpn.as_deref() {
-                        Some(b"h2") => {
-                            http2::Builder::new(TokioExecutor::new())
-                                .serve_connection(io, service)
-                                .await
-                                .map_err(|e| anyhow::anyhow!(e))
-                        }
-                        // Default to HTTP/1.1: explicit "http/1.1"
-                        // ALPN, no ALPN at all (kdig-style), or any
-                        // unknown ALPN we shouldn't try to speak h2
-                        // on (e.g. acme-tls/1 — the rustls-acme
-                        // resolver serves the challenge cert *and*
-                        // closes the connection after the
-                        // handshake; serve_connection will return
-                        // Ok immediately).
-                        _ => http1::Builder::new()
-                            .serve_connection(io, service)
-                            .await
-                            .map_err(|e| anyhow::anyhow!(e)),
-                    };
-                    match &result {
-                        Ok(_) => tracing::info!(
-                            %peer,
-                            alpn = %alpn_display,
-                            "DoH conn done",
-                        ),
-                        Err(e) => {
-                            // {:#} on anyhow::Error walks the
-                            // source chain — hyper's top-level
-                            // Display is often just "connection
-                            // error", with the actual io::Error /
-                            // parse error one or two `source()`
-                            // levels down.
-                            tracing::warn!(
-                                %peer,
-                                alpn = %alpn_display,
-                                "DoH serve error: {e:#}",
-                            );
-                        }
+                        tracing::debug!(%peer, "DoH: {e:#}");
                     }
                 }
                 Err(e) => {
@@ -290,74 +151,282 @@ async fn accept_loop(
     }
 }
 
-#[derive(Deserialize)]
-struct DnsQuery {
-    dns: String,
-}
+/// Serve one HTTP/1.1 request, then close. RFC 8484 DoH clients
+/// open a new TCP+TLS connection per query in practice (browsers
+/// pool but reuse only inside one navigation), and skipping
+/// keep-alive lets us mirror DoT's "read_exact then write_all"
+/// pattern that the VCL substrate is happy with.
+async fn serve_one<S>(
+    mut stream: tokio_rustls::server::TlsStream<S>,
+    peer: SocketAddr,
+    handler: SharedHandler,
+    metrics: Arc<Metrics>,
+    acl: AclSwap,
+    ctx: CtxSwap,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // ---- Read headers (request line + headers, up to \r\n\r\n) ----
+    let mut header_buf = Vec::with_capacity(1024);
+    let body_in_buf = {
+        let end = tokio::time::timeout(
+            REQUEST_READ_TIMEOUT,
+            read_until_double_crlf(&mut stream, &mut header_buf),
+        )
+        .await
+        .map_err(|_| anyhow!("request header timeout"))??;
+        // Anything past the header terminator is the start of the
+        // body (matters for POST when body fits in the first read).
+        header_buf.split_off(end)
+    };
 
-async fn handle_get(
-    State(state): State<AppState>,
-    Query(q): Query<DnsQuery>,
-) -> Response {
-    tracing::info!(peer = %state.peer, dns_len = q.dns.len(), "DoH GET /dns-query");
-    if !state.acl.load().allows(state.peer) {
-        state.metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
-        return (StatusCode::FORBIDDEN, "ACL").into_response();
+    let (method, path, headers) = parse_request_head(&header_buf)
+        .context("HTTP/1.1 request head")?;
+
+    if !acl.load().allows(peer.ip()) {
+        metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+        return send_simple(&mut stream, 403, "Forbidden", b"ACL\n").await;
     }
-    state.metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
-    let wire = match BASE64_URL_SAFE_NO_PAD.decode(q.dns.as_bytes()) {
-        Ok(b) => b,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "invalid dns= parameter").into_response()
+
+    let wire = match method {
+        "GET" => match parse_get_dns_param(path) {
+            Some(b) => b,
+            None => {
+                return send_simple(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    b"missing or malformed dns= parameter\n",
+                )
+                .await
+            }
+        },
+        "POST" => {
+            if !content_type_is_dns_message(&headers) {
+                return send_simple(
+                    &mut stream,
+                    415,
+                    "Unsupported Media Type",
+                    b"expected application/dns-message\n",
+                )
+                .await;
+            }
+            let content_length = content_length(&headers).ok_or_else(|| {
+                anyhow!("DoH POST missing Content-Length")
+            })?;
+            if content_length > MAX_BODY_BYTES {
+                return send_simple(
+                    &mut stream,
+                    413,
+                    "Payload Too Large",
+                    b"DoH body cap\n",
+                )
+                .await;
+            }
+            let mut body = body_in_buf;
+            body.reserve(content_length.saturating_sub(body.len()));
+            while body.len() < content_length {
+                let mut chunk = vec![0u8; content_length - body.len()];
+                let n = stream
+                    .read(&mut chunk)
+                    .await
+                    .context("reading POST body")?;
+                if n == 0 {
+                    return Err(anyhow!("EOF mid-POST-body"));
+                }
+                chunk.truncate(n);
+                body.extend_from_slice(&chunk);
+            }
+            body
+        }
+        // Only GET/POST defined for /dns-query in RFC 8484.
+        other => {
+            tracing::debug!(%peer, method = %other, "DoH: rejecting non-GET/POST");
+            return send_simple(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                b"GET or POST\n",
+            )
+            .await;
         }
     };
-    dispatch(state, wire).await
-}
 
-async fn handle_post(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    tracing::info!(peer = %state.peer, body_len = body.len(), "DoH POST /dns-query");
-    if !state.acl.load().allows(state.peer) {
-        state.metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
-        return (StatusCode::FORBIDDEN, "ACL").into_response();
+    // Only /dns-query is defined. Anything else is 404.
+    let path_only = path.split('?').next().unwrap_or("/");
+    if path_only != "/dns-query" {
+        return send_simple(&mut stream, 404, "Not Found", b"\n").await;
     }
-    state.metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
-    if headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        != "application/dns-message"
-    {
-        return (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "expected application/dns-message",
+
+    metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
+
+    let ctx_snap = ctx.load_full();
+    let Some(response) =
+        handler.handle_bytes(&wire, peer.ip(), &ctx_snap).await
+    else {
+        return send_simple(
+            &mut stream,
+            400,
+            "Bad Request",
+            b"malformed DNS query\n",
         )
-            .into_response();
-    }
-    dispatch(state, body.to_vec()).await
-}
-
-async fn dispatch(state: AppState, wire: Vec<u8>) -> Response {
-    let ctx_snap = state.ctx.load_full();
-    let Some(response) = state.handler.handle_bytes(&wire, state.peer, &ctx_snap).await else {
-        return (StatusCode::BAD_REQUEST, "malformed DNS query").into_response();
+        .await;
     };
     let ttl = min_ttl_from_response(&response).unwrap_or(0);
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "application/dns-message".parse().unwrap(),
-    );
-    if ttl > 0 {
-        headers.insert(
-            header::CACHE_CONTROL,
-            format!("max-age={ttl}").parse().unwrap(),
-        );
+    send_dns_response(&mut stream, &response, ttl).await
+}
+
+/// Drain bytes from `stream` into `buf` until the `\r\n\r\n` end-
+/// of-headers marker is seen. Returns the byte offset of the first
+/// byte past the marker — i.e., where the body starts.
+async fn read_until_double_crlf<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+) -> Result<usize>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let needle = b"\r\n\r\n";
+    let mut tmp = [0u8; 1024];
+    let mut search_from = 0usize;
+    loop {
+        if let Some(pos) = find_subsequence(&buf[search_from..], needle) {
+            return Ok(search_from + pos + needle.len());
+        }
+        // Roll the search window so we never miss a needle that
+        // straddles a read boundary.
+        search_from = buf.len().saturating_sub(needle.len() - 1);
+        if buf.len() >= MAX_HEADER_BYTES {
+            return Err(anyhow!(
+                "HTTP/1.1 request headers exceeded {MAX_HEADER_BYTES} bytes"
+            ));
+        }
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .context("reading request headers")?;
+        if n == 0 {
+            return Err(anyhow!("EOF before HTTP/1.1 headers terminated"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
     }
-    (StatusCode::OK, headers, response).into_response()
+}
+
+fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse `METHOD PATH HTTP/1.1\r\n<header-lines>\r\n` into the
+/// method (uppercased, ASCII), the raw path (including any
+/// query-string), and a `Vec<(name, value)>` of headers. Header
+/// names are lowercased for case-insensitive matching downstream.
+fn parse_request_head(
+    bytes: &[u8],
+) -> Result<(&str, &str, Vec<(String, String)>)> {
+    let text = std::str::from_utf8(bytes)
+        .context("non-UTF-8 HTTP/1.1 request head")?;
+    let mut lines = text.split("\r\n");
+    let first = lines.next().ok_or_else(|| anyhow!("empty request head"))?;
+    let mut it = first.split(' ');
+    let method = it.next().ok_or_else(|| anyhow!("no method"))?;
+    let path = it.next().ok_or_else(|| anyhow!("no path"))?;
+    let version = it.next().ok_or_else(|| anyhow!("no HTTP version"))?;
+    if !version.starts_with("HTTP/1.") {
+        return Err(anyhow!("unsupported HTTP version: {version}"));
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+    Ok((method, path, headers))
+}
+
+fn parse_get_dns_param(path: &str) -> Option<Vec<u8>> {
+    let qs = path.split_once('?')?.1;
+    for kv in qs.split('&') {
+        if let Some(val) = kv.strip_prefix("dns=") {
+            return BASE64_URL_SAFE_NO_PAD.decode(val.as_bytes()).ok();
+        }
+    }
+    None
+}
+
+fn content_length(headers: &[(String, String)]) -> Option<usize> {
+    headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok())
+}
+
+fn content_type_is_dns_message(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(k, v)| k == "content-type" && v == "application/dns-message")
+}
+
+async fn send_simple<S>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let mut out = Vec::with_capacity(128 + body.len());
+    out.extend_from_slice(
+        format!(
+            "HTTP/1.1 {status} {reason}\r\n\
+             content-type: text/plain\r\n\
+             content-length: {len}\r\n\
+             connection: close\r\n\
+             \r\n",
+            len = body.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(body);
+    stream.write_all(&out).await.context("HTTP error write")?;
+    stream.flush().await.ok();
+    Ok(())
+}
+
+async fn send_dns_response<S>(
+    stream: &mut S,
+    body: &[u8],
+    ttl: u32,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let cache_line = if ttl > 0 {
+        format!("cache-control: max-age={ttl}\r\n")
+    } else {
+        String::new()
+    };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         content-type: application/dns-message\r\n\
+         content-length: {len}\r\n\
+         {cache_line}\
+         connection: close\r\n\
+         \r\n",
+        len = body.len()
+    );
+    // Single write_all coalesces headers + body into one VCL
+    // write — the same pattern DoT uses on the response side.
+    let mut out = Vec::with_capacity(header.len() + body.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(body);
+    stream.write_all(&out).await.context("DoH response write")?;
+    stream.flush().await.ok();
+    Ok(())
 }
 
 /// Inspect the answer section just enough to extract the minimum TTL
@@ -370,88 +439,47 @@ fn min_ttl_from_response(bytes: &[u8]) -> Option<u32> {
     msg.answers.iter().map(|r| r.ttl).min()
 }
 
-#[allow(dead_code)]
-fn drop_io_error(e: io::Error) -> anyhow::Error {
-    anyhow::anyhow!(e)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// A tokio AsyncRead+AsyncWrite that yields a fixed `prefix` of
-/// bytes from its read path before deferring to the inner stream.
-/// The write path passes straight through. Used by the DoH accept
-/// loop to feed hyper the request bytes that were drained with an
-/// explicit `read()` after the TLS handshake — see the comment at
-/// the call site for why that's necessary under libvppcom.
-struct PrefixedStream<S> {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: S,
-}
-
-impl<S> PrefixedStream<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self { prefix, pos: 0, inner }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut StdContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.pos < self.prefix.len() {
-            let remaining = &self.prefix[self.pos..];
-            let take = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..take]);
-            self.pos += take;
-            return Poll::Ready(Ok(()));
-        }
-        // After the prefix is exhausted, signal EOF rather than
-        // delegating to the live inner stream. Two reasons:
-        //
-        // 1. Hyper's HTTP/1.1 read path does a follow-up poll_read
-        //    after parsing the request to look for a next request
-        //    on a keep-alive connection. Under libvppcom that
-        //    follow-up Pending never wakes up (the same bug that
-        //    motivated the explicit drain in the first place), and
-        //    hyper never gets to write the response — even though
-        //    the request is fully parsed.
-        // 2. Our typical DoH client sends "Connection: close" and
-        //    one request per TCP connection; there is no second
-        //    request to wait for. EOF-after-one-request is the
-        //    correct close-mode behavior.
-        //
-        // Caveat: this breaks keep-alive (every connection gets one
-        // request) and would break long-bodied POSTs whose body
-        // extends past the initial drain. POST bodies for DoH are
-        // tiny (a few hundred bytes of DNS wire), well inside the
-        // 8 KiB drain buffer, so in practice this is fine. Real
-        // keep-alive + the long-body case both need the libvppcom
-        // wakeup bug fixed upstream.
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut StdContext<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+    #[test]
+    fn parse_basic_get() {
+        let raw = b"GET /dns-query?dns=abc HTTP/1.1\r\n\
+                    Host: dns.example.com\r\n\
+                    Accept: application/dns-message\r\n\
+                    \r\n";
+        let (method, path, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/dns-query?dns=abc");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0, "host");
+        assert_eq!(headers[0].1, "dns.example.com");
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut StdContext<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    #[test]
+    fn parse_dns_param_finds_value() {
+        // example.com A, base64url
+        let path = "/dns-query?dns=q80BAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE";
+        let wire = parse_get_dns_param(path).expect("decoded");
+        assert!(wire.len() >= 12, "DNS wire too short: {wire:?}");
+        // first 2 bytes are txid 0xabcd
+        assert_eq!(wire[0], 0xab);
+        assert_eq!(wire[1], 0xcd);
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut StdContext<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    #[test]
+    fn parse_dns_param_missing_returns_none() {
+        assert!(parse_get_dns_param("/dns-query").is_none());
+        assert!(parse_get_dns_param("/dns-query?other=1").is_none());
+    }
+
+    #[test]
+    fn content_length_lookup() {
+        let h = vec![
+            ("host".into(), "x".into()),
+            ("content-length".into(), "42".into()),
+        ];
+        assert_eq!(content_length(&h), Some(42));
     }
 }
