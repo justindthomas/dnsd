@@ -118,16 +118,35 @@ async fn accept_loop(
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    // Read the TLS-negotiated ALPN. If the client
-                    // picked h2, close cleanly — we don't speak it
-                    // yet and a client will fall back to h1.1 on
-                    // retry. Real clients (curl, Firefox) honour
-                    // the close.
+                    // Read the TLS-negotiated ALPN. Three early-exit
+                    // paths here:
+                    //   - `acme-tls/1`: the tls-alpn-01 challenge.
+                    //     rustls-acme's resolver already served the
+                    //     challenge cert during the handshake; the
+                    //     handshake completion IS the challenge
+                    //     response. Close the connection — no
+                    //     application data follows. Without this
+                    //     branch our HTTP/1.1 parser would try to
+                    //     read a request, time out, and the LE
+                    //     validator would see a quirky log line.
+                    //   - `h2`: we advertise it for forward-compat
+                    //     but only speak h1.1. Close so the client
+                    //     retries with h1.1 (curl, Firefox do this
+                    //     transparently).
+                    //   - Anything else: HTTP/1.1 (or absent ALPN,
+                    //     treated as h1.1).
                     let alpn = tls_stream
                         .get_ref()
                         .1
                         .alpn_protocol()
                         .map(|b| b.to_vec());
+                    if alpn.as_deref() == Some(b"acme-tls/1") {
+                        tracing::info!(
+                            %peer,
+                            "DoH: acme-tls/1 challenge handshake completed",
+                        );
+                        return;
+                    }
                     if alpn.as_deref() == Some(b"h2") {
                         tracing::debug!(
                             %peer,
