@@ -43,8 +43,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context as StdContext, Poll};
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
@@ -60,6 +62,7 @@ use hyper::server::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Deserialize;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
@@ -133,7 +136,7 @@ async fn accept_loop(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
+                Ok(mut tls_stream) => {
                     // Read the TLS-negotiated ALPN before handing the
                     // stream to hyper. `get_ref().1` is the inner
                     // rustls ServerConnection; its `alpn_protocol()`
@@ -175,35 +178,68 @@ async fn accept_loop(
                         let mut svc = app.clone();
                         async move { svc.call(req).await }
                     });
-                    // Wrap the TLS stream in tokio's BufStream
-                    // before handing it to hyper. Two reasons:
-                    //
-                    // 1. Reads — BufStream coalesces small `poll_read`
-                    //    calls (hyper's HTTP/1 parser reads request
-                    //    line, then headers, then body in separate
-                    //    operations). Under VCL/libvppcom the per-
-                    //    poll-read wakeup machinery has only been
-                    //    proven for one-shot reads (DoT works with
-                    //    `read_exact`); the multi-step pattern hyper
-                    //    uses against the bare TlsStream lost the
-                    //    request on the real-network path. Buffering
-                    //    keeps the wakeup count to one per arriving
-                    //    chunk and lets hyper drain a full request
-                    //    in one go.
-                    // 2. Writes — same coalescing on the way out:
-                    //    hyper writes headers then body as separate
-                    //    operations, which produces two TLS records
-                    //    and (more importantly) two VCL writes; the
-                    //    second one was visible-on-the-wire-as-
-                    //    missing in pcap before the buffer.
-                    //
-                    // 8 KiB each way is enough for any sane DoH
-                    // request and a typical DNS reply, which run
-                    // hundreds of bytes max.
-                    let buffered = tokio::io::BufStream::with_capacity(
-                        8192, 8192, tls_stream,
-                    );
-                    let io = TokioIo::new(buffered);
+                    // Drain the first chunk of plaintext from the TLS
+                    // stream BEFORE handing to hyper. Under VCL the
+                    // request bytes are already in the FIFO by the
+                    // time we reach here (handshake completion timing
+                    // pairs with the client's first Application Data
+                    // record), but hyper's `serve_connection` does a
+                    // poll_read pattern that for-some-reason fails to
+                    // see those buffered bytes — the wedge symptom is
+                    // a connection that sits idle for the client's
+                    // timeout then errors with rustls' "peer closed
+                    // without close_notify". DoT works on the same
+                    // VCL substrate because it uses `read_exact`,
+                    // which loops on poll_read with a fresh waker
+                    // each iteration. We do the same `read()` here
+                    // (bounded by a short timeout — if no data is
+                    // ready, the operator is just probing or doing
+                    // an idle keep-alive, so we hand a bare stream
+                    // to hyper without buffered bytes).
+                    let mut peek_buf = vec![0u8; 8192];
+                    let drained_n = match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        tls_stream.read(&mut peek_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) => {
+                            tracing::debug!(
+                                %peer,
+                                alpn = %alpn_display,
+                                "DoH peer closed before first request",
+                            );
+                            return;
+                        }
+                        Ok(Ok(n)) => {
+                            tracing::info!(
+                                %peer,
+                                alpn = %alpn_display,
+                                peeked = n,
+                                "DoH drained first chunk",
+                            );
+                            n
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                %peer,
+                                alpn = %alpn_display,
+                                "DoH peek read failed: {e}",
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                %peer,
+                                alpn = %alpn_display,
+                                "DoH peek read timeout (3s); client never sent",
+                            );
+                            return;
+                        }
+                    };
+                    peek_buf.truncate(drained_n);
+                    let prefixed = PrefixedStream::new(peek_buf, tls_stream);
+                    let io = TokioIo::new(prefixed);
 
                     let result = match alpn.as_deref() {
                         Some(b"h2") => {
@@ -337,4 +373,63 @@ fn min_ttl_from_response(bytes: &[u8]) -> Option<u32> {
 #[allow(dead_code)]
 fn drop_io_error(e: io::Error) -> anyhow::Error {
     anyhow::anyhow!(e)
+}
+
+/// A tokio AsyncRead+AsyncWrite that yields a fixed `prefix` of
+/// bytes from its read path before deferring to the inner stream.
+/// The write path passes straight through. Used by the DoH accept
+/// loop to feed hyper the request bytes that were drained with an
+/// explicit `read()` after the TLS handshake — see the comment at
+/// the call site for why that's necessary under libvppcom.
+struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self { prefix, pos: 0, inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut StdContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let remaining = &self.prefix[self.pos..];
+            let take = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..take]);
+            self.pos += take;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut StdContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut StdContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut StdContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
