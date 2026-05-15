@@ -106,6 +106,16 @@ pub struct RecursorHandler {
     /// cache (which the leader populated) and serve the cached
     /// bytes instead of walking themselves.
     in_flight: Arc<InFlightMap>,
+    /// Startup readiness gate. Set to `true` only after at least one
+    /// of the prewarm queries successfully resolves end-to-end —
+    /// proves external connectivity AND that the iterative path
+    /// works AND (when validation is on) the DNSSEC validator can
+    /// fetch DNSKEYs. Until then, `handle_bytes` answers REFUSED
+    /// to every client query so callers fail fast and retry once
+    /// dnsd is actually able to serve them, instead of timing out
+    /// against a half-initialized resolver. Visible via the control
+    /// socket as `stats.ready`.
+    ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const IN_FLIGHT_CAP: usize = 4096;
@@ -223,14 +233,36 @@ impl RecursorHandler {
     /// startup pays 2-4 DNSKEY round-trips serially before the answer
     /// can come back; afterward the cache stays warm. No-op when
     /// validation is off or the iterative recursor isn't built.
+    /// True once the startup prewarm has confirmed external
+    /// resolution works. Before this, `handle_bytes` answers
+    /// REFUSED so clients see a hard failure quickly instead of
+    /// waiting on a partially-initialised resolver.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn spawn_dnssec_prewarm(&self) {
+        let ready_flag = self.ready.clone();
         let iter = match self.iterative.as_ref() {
             Some(i) => i.clone(),
-            None => return,
+            None => {
+                // Iterative resolver disabled in this build/config;
+                // nothing to warm. Mark ready immediately so we
+                // don't gate forwarder-only deployments forever.
+                ready_flag.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
         };
         let validator = match self.validator.as_ref() {
             Some(v) => v.clone(),
-            None => return,
+            None => {
+                // DNSSEC validation off. Nothing to warm and no
+                // external connectivity proof to wait on at this
+                // layer; the prewarm names would still resolve but
+                // there's no point spending the budget. Mark ready.
+                ready_flag.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
         };
         // Names chosen to cover the top signed gTLDs + a handful of
         // popular ccTLDs without hitting NSes that we know are
@@ -252,38 +284,85 @@ impl RecursorHandler {
         ];
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let mut joins = Vec::with_capacity(PREWARM_NAMES.len());
-            for name in PREWARM_NAMES {
-                let iter = iter.clone();
-                let validator = validator.clone();
-                joins.push(tokio::spawn(async move {
-                    let parsed = match hickory_proto::rr::Name::from_ascii(name) {
-                        Ok(n) => n,
-                        Err(_) => return,
-                    };
-                    let mut q = Message::new(0, MessageType::Query, OpCode::Query);
-                    q.metadata.recursion_desired = true;
-                    q.add_query(Query::query(parsed, RecordType::A));
-                    match iter.resolve_with_chain(&q).await {
-                        Ok((bytes, chain)) => {
-                            if let Ok(resp) = Message::from_bytes(&bytes) {
-                                let _ = validator.validate_walk(&chain, &resp).await;
-                                tracing::debug!(name = %name, "DNSKEY prewarm done");
+            // Retry loop. Each pass fires all 8 prewarm names in
+            // parallel and waits for them. As soon as ANY one
+            // resolves we flip `ready=true` and exit — even partial
+            // upstream connectivity proves the listener path is
+            // viable. If everything fails this pass, wait `backoff`
+            // and retry. Without this loop, a transient upstream
+            // glitch during dnsd start pins us in REFUSED-mode
+            // forever; with it, we self-heal once connectivity
+            // returns. No upper bound on retries: an operator
+            // looking at `imp-dnsd-query stats` will see
+            // `ready=false` and can escalate; rather that than
+            // dnsd silently starting to answer queries it can't
+            // actually resolve.
+            let backoff = std::time::Duration::from_secs(5);
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                let successes =
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut joins = Vec::with_capacity(PREWARM_NAMES.len());
+                for name in PREWARM_NAMES {
+                    let iter = iter.clone();
+                    let validator = validator.clone();
+                    let successes = successes.clone();
+                    joins.push(tokio::spawn(async move {
+                        let parsed = match hickory_proto::rr::Name::from_ascii(name) {
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
+                        q.metadata.recursion_desired = true;
+                        q.add_query(Query::query(parsed, RecordType::A));
+                        let started = std::time::Instant::now();
+                        match iter.resolve_with_chain(&q).await {
+                            Ok((bytes, chain)) => {
+                                if let Ok(resp) = Message::from_bytes(&bytes) {
+                                    let _ = validator.validate_walk(&chain, &resp).await;
+                                    successes
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::info!(
+                                        name = %name,
+                                        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                        "prewarm sub-resolve ok"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    name = %name,
+                                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "prewarm sub-resolve failed: {e:#}"
+                                );
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!(name = %name, "DNSKEY prewarm failed: {e:#}");
-                        }
-                    }
-                }));
+                    }));
+                }
+                for j in joins {
+                    let _ = j.await;
+                }
+                let ok = successes.load(std::sync::atomic::Ordering::Relaxed);
+                if ok > 0 {
+                    ready_flag.store(true, std::sync::atomic::Ordering::Release);
+                    tracing::info!(
+                        attempt,
+                        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        successes = ok,
+                        total = PREWARM_NAMES.len(),
+                        "DNSSEC prewarm + readiness gate passed; serving queries"
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    attempt,
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    backoff_ms = backoff.as_millis() as u64,
+                    "prewarm attempt failed (zero successes); will retry — clients REFUSED until then"
+                );
+                tokio::time::sleep(backoff).await;
             }
-            for j in joins {
-                let _ = j.await;
-            }
-            tracing::info!(
-                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "DNSSEC cache prewarm complete"
-            );
         });
     }
 
@@ -608,9 +687,21 @@ impl RecursorHandler {
             iterative,
             neg_resolve_cache: Arc::new(NegResolveCache::new()),
             in_flight: Arc::new(InFlightMap::new()),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 }
+
+/// Hard wall-clock budget for processing one client query end-to-
+/// end. Includes parse, cache lookup, coalescer wait, iterative
+/// walk, DNSSEC validation, DNS64 synthesis, and response build.
+/// 8s is well past macOS's 5s resolver retry and below most other
+/// clients' practical patience; anything that takes longer is
+/// almost certainly hung on an upstream that won't respond, and
+/// holding the handler task alive past that point starves the
+/// runtime and pushes the listener's FIFO into overflow. Returning
+/// SERVFAIL frees the inflight permit and lets the client retry.
+const QUERY_BUDGET: Duration = Duration::from_secs(8);
 
 #[async_trait]
 impl DnsHandler for RecursorHandler {
@@ -620,6 +711,53 @@ impl DnsHandler for RecursorHandler {
         peer: IpAddr,
         ctx: &ListenerContext,
     ) -> Option<Vec<u8>> {
+        match tokio::time::timeout(
+            QUERY_BUDGET,
+            self.handle_bytes_inner(query, peer, ctx),
+        )
+        .await
+        {
+            Ok(opt) => opt,
+            Err(_) => {
+                // Budget exceeded. Build a SERVFAIL mirroring the
+                // client's TXID/question so the resolver knows to
+                // give up rather than retry against us. If the
+                // query is unparseable at this point, silently
+                // drop (same convention as a malformed query).
+                let parsed = Message::from_bytes(query).ok()?;
+                let qname = parsed
+                    .queries
+                    .first()
+                    .map(|q| q.name().to_string())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    %qname,
+                    budget_ms = QUERY_BUDGET.as_millis() as u64,
+                    "query budget exceeded → SERVFAIL"
+                );
+                Some(servfail(&parsed))
+            }
+        }
+    }
+}
+
+impl RecursorHandler {
+    async fn handle_bytes_inner(
+        &self,
+        query: &[u8],
+        peer: IpAddr,
+        ctx: &ListenerContext,
+    ) -> Option<Vec<u8>> {
+        // Startup readiness gate. Before the prewarm has proved we
+        // can resolve at least one name, refuse all client queries
+        // outright. Clients see REFUSED immediately and retry
+        // (macOS resolver falls back to the next configured DNS),
+        // instead of timing out at 5s on a half-initialised
+        // resolver — and dnsd doesn't accumulate inflight handler
+        // tasks waiting on upstream that hasn't connected yet.
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return crate::handler::build_refused(query);
+        }
         // Per-query latency log. Drop runs at every return point and
         // emits a single line per query. Logged at info for queries
         // ≥ 50 ms (slow path: walks, coalescer waits, validation),
