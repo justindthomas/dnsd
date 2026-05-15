@@ -191,6 +191,11 @@ impl UpstreamUdpChannel {
         // the libvppcom write happens on the thread that owns the
         // socket. The oneshot we await is pure-Rust signaling — the
         // main runtime thread parks freely while vcl-io sends.
+        // DIAG: `send_ms` measures dispatch→send-complete (how long
+        // the vcl-io worker took to pick up + run the send task);
+        // `wait_ms` measures send-complete→response (the demux
+        // path). Split tells us which side stalls under load.
+        let send_t0 = std::time::Instant::now();
         #[cfg(feature = "vcl")]
         {
             let sock_for_send = sock.clone();
@@ -212,8 +217,25 @@ impl UpstreamUdpChannel {
                 .await
                 .map_err(|e| anyhow!("upstream UDP send to {peer}: {e:?}"))?;
         }
+        let send_ms = send_t0.elapsed().as_millis() as u64;
 
-        let (resp, from) = match tokio::time::timeout(timeout, rx).await {
+        let wait_t0 = std::time::Instant::now();
+        let timed = tokio::time::timeout(timeout, rx).await;
+        let wait_ms = wait_t0.elapsed().as_millis() as u64;
+        if send_ms + wait_ms >= 500 {
+            tracing::info!(
+                %peer,
+                send_ms,
+                wait_ms,
+                outcome = match &timed {
+                    Ok(Ok(_)) => "ok",
+                    Ok(Err(_)) => "chan-closed",
+                    Err(_) => "timeout",
+                },
+                "DIAG upstream-udp: slow channel query",
+            );
+        }
+        let (resp, from) = match timed {
             Ok(Ok(pair)) => pair,
             Ok(Err(_)) => {
                 return Err(anyhow!("upstream UDP {peer}: response channel closed"));
@@ -397,7 +419,15 @@ async fn recv_demux_loop(
     pending: Arc<Mutex<PendingMap>>,
 ) {
     let mut buf = vec![0u8; 4096];
+    // DIAG: track demux wake cadence. `last_wake` measures the gap
+    // between successive drain passes — if it balloons, the demux
+    // task is being starved on its worker thread (responses sit in
+    // the FIFO unread). `total_drained` accumulates between log
+    // lines so we see throughput.
+    let mut last_wake = std::time::Instant::now();
     loop {
+        let wake_gap_ms = last_wake.elapsed().as_millis() as u64;
+        last_wake = std::time::Instant::now();
         // Drain greedily before yielding. The default
         // `sock.recv_from(...).await` checkpoints on every
         // datagram, and tokio's current_thread scheduler may
@@ -462,6 +492,19 @@ async fn recv_demux_loop(
                     break;
                 }
             }
+        }
+        // DIAG: log a wake only when it looks pathological — the
+        // demux went >100ms between drains (starved) or pulled a
+        // big batch (>8, implying it fell behind). A healthy demux
+        // wakes every ~10ms (the reactor tick) draining 0-1.
+        let total = drained;
+        if wake_gap_ms >= 100 || total > 8 {
+            tracing::info!(
+                family,
+                wake_gap_ms,
+                drained = total,
+                "DIAG demux: wake",
+            );
         }
         if let Err(e) = sock.wait_readable().await {
             tracing::warn!(family, "upstream UDP wait_readable: {e:?}");
@@ -787,7 +830,19 @@ impl UpstreamClient {
             tcp_out[0..2].copy_from_slice(&tcp_txid.to_be_bytes());
             let tcp_mask = super::zeroxtwenty::encode(&mut tcp_out)
                 .context("0x20 encode TCP retry")?;
-            self.query_one_tcp(peer, &tcp_out, tcp_txid, &tcp_mask).await?
+            // DIAG: time the TCP fallback. DNSKEY responses are
+            // large and almost always TC=1, so this path dominates
+            // DNSSEC-validation latency. `ok` distinguishes a slow
+            // success from a slow failure.
+            let tcp_t0 = std::time::Instant::now();
+            let r = self.query_one_tcp(peer, &tcp_out, tcp_txid, &tcp_mask).await;
+            tracing::info!(
+                %peer,
+                tcp_ms = tcp_t0.elapsed().as_millis() as u64,
+                ok = r.is_ok(),
+                "DIAG upstream-tcp: TC=1 fallback",
+            );
+            r?
         } else {
             udp_resp
         };

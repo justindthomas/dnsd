@@ -229,30 +229,44 @@ impl VclIoExecutor {
         })
     }
 
-    /// Every worker's `(handle, reactor)` pair. The upstream
-    /// forwarder builds one UDP channel (v4+v6 socket pair + demux)
-    /// per worker from this list and round-robins queries across
-    /// them — so upstream UDP throughput scales with the pool
-    /// instead of funneling through a single thread. Outbound TCP
-    /// (DNSKEY fetches, TC=1 retries) round-robins the same set.
-    pub fn workers(&self) -> Vec<(Handle, ReactorCtx)> {
-        self.workers
-            .iter()
-            .map(|w| (w.handle.clone(), w.reactor.clone()))
-            .collect()
+    /// Workers reserved exclusively for the upstream forwarder
+    /// (UDP demux + send, outbound TCP). Worker 0 is reserved; no
+    /// listeners are ever bound on it.
+    ///
+    /// Why isolate: each vcl-io worker is a `current_thread`
+    /// runtime that runs tasks to completion. A libvppcom call
+    /// drains VPP's per-worker message queue, and under load that
+    /// MQ accumulates a backlog large enough that a single
+    /// `vppcom_session_read` blocks for *tens of seconds* draining
+    /// it — freezing the whole worker runtime. If the upstream
+    /// demux / send tasks share a worker with DoH listener TLS
+    /// reads, one such freeze on a TLS read takes upstream I/O
+    /// down with it, and recursive walks stall for 30s+ while the
+    /// thread sits blocked in one FFI call. A worker hosting ONLY
+    /// upstream sockets never builds that backlog: its demux drains
+    /// continuously in bounded bursts, so no single call faces a
+    /// giant MQ. The reserved worker keeps upstream I/O responsive
+    /// regardless of what listener workers are doing.
+    ///
+    /// With a pool of 1 (degenerate), worker 0 serves both roles.
+    pub fn upstream_workers(&self) -> Vec<(Handle, ReactorCtx)> {
+        let w = &self.workers[0];
+        vec![(w.handle.clone(), w.reactor.clone())]
     }
 
-    /// Pick a worker by round-robin over the whole pool. Used per
-    /// listener bind: the accept loop + every per-connection serve
-    /// task it spawns inherit that worker's runtime. Listeners and
-    /// upstream channels both span all workers — the upstream load
-    /// (the heavy part, ~10 round-trips per recursive query) is
-    /// spread N ways, and the lighter listener work co-locates
-    /// without meaningfully contending.
+    /// Pick a listener worker by round-robin over workers 1..N
+    /// (worker 0 is upstream-reserved — see `upstream_workers`).
+    /// With a pool of 1, falls back to worker 0. The accept loop +
+    /// every per-connection serve task it spawns inherit that
+    /// worker's runtime.
     pub fn pick_listener(&self) -> (Handle, ReactorCtx) {
-        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.workers.len();
-        let w = &self.workers[i];
+        let idx = if self.workers.len() > 1 {
+            1 + self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % (self.workers.len() - 1)
+        } else {
+            0
+        };
+        let w = &self.workers[idx];
         (w.handle.clone(), w.reactor.clone())
     }
 

@@ -399,7 +399,7 @@ async fn async_main(
 
     // Under vcl, every reactor lives inside the vcl-io pool — the
     // recursor's upstream client builds its channels from
-    // `vcl_io.workers()`, and listener binds pick a worker each.
+    // `vcl_io.upstream_workers()`, and listener binds pick a worker each.
     // No standalone reactor needed here. Kernel-sockets builds one.
     #[cfg(not(feature = "vcl"))]
     let reactor = transport::new_reactor().with_context(|| "transport::new_reactor")?;
@@ -464,7 +464,7 @@ async fn async_main(
         discovered_v4,
         Some(args.data_dir.join("anchor")),
         #[cfg(feature = "vcl")]
-        vcl_io.workers(),
+        vcl_io.upstream_workers(),
     )
     .await
     .context("RecursorHandler init")?;
@@ -841,7 +841,7 @@ struct WaitArgs {
     #[cfg(not(feature = "vcl"))]
     reactor: ReactorCtx,
     /// The vcl-io worker pool. Reload rebuilds the recursor from
-    /// `vcl_io.workers()` and re-binds listeners via `pick_listener`.
+    /// `vcl_io.upstream_workers()` and re-binds listeners via `pick_listener`.
     #[cfg(feature = "vcl")]
     vcl_io: std::sync::Arc<VclIoExecutor>,
     metrics: Arc<Metrics>,
@@ -925,7 +925,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
         args.discovered_v4_source,
         Some(args.anchor_dir.clone()),
         #[cfg(feature = "vcl")]
-        args.vcl_io.workers(),
+        args.vcl_io.upstream_workers(),
     )
     .await
     {

@@ -341,13 +341,33 @@ impl IterativeResolver {
                 })
         };
 
+        // DIAG: per-hop timing for the upstream-tail-latency
+        // investigation. `walk_t0` anchors the whole walk; `hop`
+        // counts referral descents. Each `query_ns_set` /
+        // `resolve_ns_ips` stage is timed so a slow walk shows
+        // exactly which hop and which stage blocked.
+        let walk_t0 = std::time::Instant::now();
+        let mut hop: u32 = 0;
+
         loop {
+            hop += 1;
             // Send the query to one of the current NS IPs. The
             // existing UpstreamClient already handles TCP fallback,
             // 0x20, and TXID hygiene per-hop.
+            let qns_t0 = std::time::Instant::now();
             let resp = self
                 .query_ns_set(&ns_ips, qname, qtype, qclass, budget)
                 .await?;
+            tracing::info!(
+                qname = %qname,
+                qtype = ?qtype,
+                zone = %current_zone,
+                hop,
+                ns_count = ns_ips.len(),
+                stage_ms = qns_t0.elapsed().as_millis() as u64,
+                walk_ms = walk_t0.elapsed().as_millis() as u64,
+                "DIAG walk: query_ns_set done",
+            );
 
             match classify(&resp, qname, qtype) {
                 Classification::Answer => return Ok(resp),
@@ -419,9 +439,21 @@ impl IterativeResolver {
 
                     // Resolve NS addresses — prefer glue, fall back
                     // to a sub-resolution for out-of-bailiwick NS.
+                    let rni_t0 = std::time::Instant::now();
                     ns_ips = self
                         .resolve_ns_ips(&ns_records, &glue, qclass, budget)
                         .await?;
+                    tracing::info!(
+                        qname = %qname,
+                        zone = %current_zone,
+                        hop,
+                        ns_records = ns_records.len(),
+                        glue_count = glue.len(),
+                        ns_resolved = ns_ips.len(),
+                        stage_ms = rni_t0.elapsed().as_millis() as u64,
+                        walk_ms = walk_t0.elapsed().as_millis() as u64,
+                        "DIAG walk: resolve_ns_ips done",
+                    );
                     if ns_ips.is_empty() {
                         return Err(anyhow!(
                             "referral to {current_zone} yielded no usable NS addresses"
@@ -491,7 +523,17 @@ impl IterativeResolver {
             let upstream = upstream.clone();
             let wire = wire.clone();
             Box::pin(async move {
+                // DIAG: per-NS-IP timing. `upstream.query` does
+                // UDP (round-robined channel) + TCP fallback on
+                // TC=1; this measures the whole per-NS attempt.
+                let t0 = std::time::Instant::now();
                 let res = upstream.query(&[ip], &wire[..]).await;
+                tracing::info!(
+                    ns_ip = %ip,
+                    ms = t0.elapsed().as_millis() as u64,
+                    ok = res.is_ok(),
+                    "DIAG walk: ns query",
+                );
                 (ip, res)
             })
         };

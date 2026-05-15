@@ -895,7 +895,20 @@ impl RecursorHandler {
         // followers wait, then the recheck below picks up the
         // cached / negative-cached result instead of walking again.
         let coalesce_lock = self.in_flight.lock_for(&q.name, q.query_type());
+        // DIAG: time spent waiting on the per-key coalesce mutex.
+        // A follower behind a slow leader shows up as a large
+        // coalesce_wait_ms here.
+        let coalesce_t0 = Instant::now();
         let _coalesce_guard = coalesce_lock.lock().await;
+        let coalesce_wait_ms = coalesce_t0.elapsed().as_millis() as u64;
+        if coalesce_wait_ms >= 50 {
+            tracing::info!(
+                qname = %&q.name,
+                qtype = ?q.query_type(),
+                coalesce_wait_ms,
+                "DIAG handle: waited on in_flight coalesce lock",
+            );
+        }
         if let Some(cached) = self.cache.get(&key).await {
             if let Some(resp) = self
                 .build_from_cache_value(&msg, &q, cached, ctx)
@@ -1081,6 +1094,11 @@ impl RecursorHandler {
             Some(q) => q.clone(),
             None => return ResolveOutcome::WalkFailed,
         };
+        // DIAG: split the walk from DNSSEC validation. The walk's
+        // own per-hop DIAG lines show it completing fast; if
+        // resolve_validate_cache is nonetheless slow, the time is
+        // in validate_walk (DNSKEY fetches) — measured below.
+        let walk_t0 = Instant::now();
         let (bytes, walk_chain) = match iter.resolve_with_chain(msg).await {
             Ok(v) => v,
             Err(e) => {
@@ -1088,6 +1106,7 @@ impl RecursorHandler {
                 return ResolveOutcome::WalkFailed;
             }
         };
+        let walk_ms = walk_t0.elapsed().as_millis() as u64;
         let mut parsed = match Message::from_bytes(&bytes) {
             Ok(m) => m,
             Err(_) => {
@@ -1099,7 +1118,20 @@ impl RecursorHandler {
         };
 
         if let Some(validator) = self.validator.as_ref() {
-            match validator.validate_walk(&walk_chain, &parsed).await {
+            let val_t0 = Instant::now();
+            let status = validator.validate_walk(&walk_chain, &parsed).await;
+            let val_ms = val_t0.elapsed().as_millis() as u64;
+            if walk_ms + val_ms >= 200 {
+                tracing::info!(
+                    qname = %&q.name,
+                    qtype = ?q.query_type(),
+                    walk_ms,
+                    val_ms,
+                    chain_steps = walk_chain.steps.len(),
+                    "DIAG resolve: walk + validate",
+                );
+            }
+            match status {
                 dnssec::ValidationStatus::Secure => {
                     self.metrics
                         .dnssec_validated
