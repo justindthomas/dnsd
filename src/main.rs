@@ -434,24 +434,12 @@ async fn async_main(
     .context("RecursorHandler init")?;
     initial_recursor.spawn_dnssec_prewarm();
     let live: Arc<LiveHandler<RecursorHandler>> = Arc::new(LiveHandler::new(initial_recursor));
-    // Under the frontend worker pool, wrap the handler in
-    // `MainPinnedHandler` so listener tasks running on frontend
-    // workers dispatch `handle_bytes` (which runs upstream UDP/TCP
-    // queries against sockets bound on main = vcl_worker_0) back to
-    // the main runtime. Without this, the upstream `sendto` runs
-    // with the frontend worker's VCL context and returns EINVAL
-    // because the session doesn't exist in that worker's pool.
-    // N=1 path keeps the raw handler — no cross-worker hop needed.
-    #[cfg(feature = "vcl")]
-    let handler: SharedHandler = if worker_pool.is_some() {
-        Arc::new(dnsd::worker::MainPinnedHandler::new(
-            live.clone(),
-            tokio::runtime::Handle::current(),
-        ))
-    } else {
-        live.clone()
-    };
-    #[cfg(not(feature = "vcl"))]
+    // Under VLS the handler can run on any frontend worker thread —
+    // VLS auto-registers calling threads and takes the process-wide
+    // lock during each session op, so `sock.send_to(...)` works
+    // from any thread regardless of where the socket was created.
+    // The MainPinnedHandler dispatch shim from the pre-VLS port is
+    // gone (commit before the VLS migration).
     let handler: SharedHandler = live.clone();
 
     // TLS materials shared by DoT and DoH. `None` means no
@@ -1071,22 +1059,6 @@ async fn reload<'a>(args: &WaitArgs<'a>, listeners: &mut LiveListeners) {
         }
     }
 
-    // Same wrapper rule as the initial bind path: when a worker
-    // pool is active, route handler calls back to main so upstream
-    // sockets (bound on main = vcl_worker_0) get the right VCL
-    // context. New listeners added by this reload pick up the
-    // wrapped handler; already-bound listeners keep their original
-    // SharedHandler clone (still wrapped from the initial bind).
-    #[cfg(feature = "vcl")]
-    let handler: SharedHandler = if args.worker_pool.is_some() {
-        Arc::new(dnsd::worker::MainPinnedHandler::new(
-            args.live.clone(),
-            tokio::runtime::Handle::current(),
-        ))
-    } else {
-        args.live.clone()
-    };
-    #[cfg(not(feature = "vcl"))]
     let handler: SharedHandler = args.live.clone();
     let before = listeners.len();
     #[cfg(feature = "vcl")]
