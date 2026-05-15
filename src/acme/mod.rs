@@ -211,9 +211,12 @@ fn build_acme_tls_alpn_01(_cfg: &DnsConfig, acme: &crate::config::Acme) -> Resul
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    // Same ALPN list as the file-cert path (no h2; we only speak
+    // HTTP/1.1 — see that branch for the rationale), plus
+    // `acme-tls/1` so this resolver can serve the tls-alpn-01
+    // challenge cert during cert issuance / renewal.
     server_config.alpn_protocols = vec![
         b"dot".to_vec(),
-        b"h2".to_vec(),
         b"http/1.1".to_vec(),
         b"acme-tls/1".to_vec(),
     ];
@@ -292,9 +295,16 @@ fn load_file_pair(
         .with_single_cert(certs, key)
         .context("building ServerConfig")?;
 
+    // ALPN: `dot` for DoT, `http/1.1` for DoH. `h2` is intentionally
+    // NOT advertised — our DoH server (src/io/doh.rs) is a hand-
+    // rolled HTTP/1.1 implementation with no HTTP/2 framing layer.
+    // Advertising h2 would cause modern clients (Firefox TRR, curl
+    // by default) to negotiate h2, then see us close the connection
+    // immediately after handshake, then treat the resolver as
+    // broken (they do NOT retry with h1.1 transparently). With h2
+    // absent, clients negotiate http/1.1 directly and DoH works.
     cfg.alpn_protocols = vec![
         b"dot".to_vec(),
-        b"h2".to_vec(),
         b"http/1.1".to_vec(),
     ];
     Ok((Arc::new(cfg), leaf_der))

@@ -129,10 +129,16 @@ async fn accept_loop(
                     //     branch our HTTP/1.1 parser would try to
                     //     read a request, time out, and the LE
                     //     validator would see a quirky log line.
-                    //   - `h2`: we advertise it for forward-compat
-                    //     but only speak h1.1. Close so the client
-                    //     retries with h1.1 (curl, Firefox do this
-                    //     transparently).
+                    //   - `h2`: defensive branch only — we no longer
+                    //     advertise h2 in `acme::*::alpn_protocols`,
+                    //     so this is unreachable from a well-behaved
+                    //     client. If somehow a client gets here
+                    //     (e.g. they upgraded the ALPN out-of-band),
+                    //     close cleanly. Browsers and curl do NOT
+                    //     retry with h1.1 when the server speaks h2
+                    //     then closes — Firefox TRR marks the
+                    //     resolver broken, curl errors with HTTP/2
+                    //     framing layer. Hence the ALPN omission.
                     //   - Anything else: HTTP/1.1 (or absent ALPN,
                     //     treated as h1.1).
                     let alpn = tls_stream
