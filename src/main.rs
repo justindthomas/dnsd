@@ -222,6 +222,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "vcl")]
     let worker_pool = {
         let n = effective_worker_count(cfg.tcp_workers);
+        tracing::info!(
+            tcp_workers_cfg = ?cfg.tcp_workers,
+            tcp_workers_env = ?std::env::var("DNSD_TCP_WORKERS").ok(),
+            available_parallelism = ?std::thread::available_parallelism().ok().map(|n| n.get()),
+            effective_n = n,
+            "frontend worker count resolved",
+        );
         if n > 1 {
             let pool = WorkerPool::spawn(n)
                 .context("spawning VCL frontend worker pool")?;
