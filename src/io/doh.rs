@@ -38,11 +38,31 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio_rustls::TlsAcceptor;
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::io::transport::{DnsTcpListener, ReactorCtx};
 use crate::metrics::Metrics;
+
+/// TLS-layer read/write buffer capacities for the BufStream that
+/// sits between rustls and the VclStream.
+///
+/// Each `vppcom_session_read` costs ~1ms inside libvppcom's
+/// `svm_msg_q_timedwait` MQ-drain regardless of byte count, so
+/// rustls's many small reads (a 5-byte record header, then the
+/// body, then the next header, etc.) inflate the per-connection
+/// libvppcom call rate to a level that saturates the single-thread
+/// tokio runtime under steady-state Firefox-style DoH load.
+/// BufStream coalesces those into one large refill: one libvppcom
+/// call fills the buffer, all subsequent rustls reads come out of
+/// memory until the buffer drains.
+///
+/// 16 KiB is chosen to fit a full TLS application_data record
+/// (RFC 8446 §5.1 caps records at 2^14 ciphertext, +21 bytes of
+/// framing/MAC overhead, well under 16 KiB in practice). Most DoH
+/// requests + responses fit in one record, so one refill per
+/// message is typical.
+const TLS_BUF_BYTES: usize = 16 * 1024;
 
 /// Max bytes we'll consume looking for the end of HTTP headers.
 /// DoH requests are tiny (small base64url GET query string, or a
@@ -139,6 +159,16 @@ async fn accept_loop(
         let ctx = ctx.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            // Wrap the raw VclStream in a BufStream BEFORE handing
+            // to tokio-rustls. rustls deframes TLS records in many
+            // small reads (5-byte record header, then the body,
+            // etc.); without buffering, every one of those bumps
+            // into libvppcom's per-call ~1ms MQ-drain cost. With
+            // buffering, one underlying VclStream::read fills the
+            // 16 KiB buffer and rustls drains it from memory.
+            // Writes are buffered symmetrically and flushed by
+            // rustls's normal write/flush cadence.
+            let stream = BufStream::with_capacity(TLS_BUF_BYTES, TLS_BUF_BYTES, stream);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     // Read the TLS-negotiated ALPN. Three early-exit

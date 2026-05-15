@@ -24,13 +24,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio_rustls::TlsAcceptor;
 use crate::handler::{AclSwap, CtxSwap, SharedHandler};
 use crate::io::transport::{DnsTcpListener, ReactorCtx};
 use crate::metrics::Metrics;
 
 const MAX_TCP_MESSAGE: usize = 65535;
+
+/// TLS-layer read/write buffer capacities — see doh.rs for the
+/// rationale. Same value here so DoT and DoH share one tuning
+/// knob if we ever need to revisit.
+const TLS_BUF_BYTES: usize = 16 * 1024;
 
 pub struct DotListener;
 
@@ -98,6 +103,12 @@ async fn accept_loop(
         let ctx = ctx.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            // BufStream wrap before TLS — see doh.rs accept_loop
+            // for why: rustls's many small reads cost ~1ms each
+            // inside libvppcom's MQ-drain, so coalescing them into
+            // one buffer refill per ~16 KiB of TLS traffic
+            // dramatically reduces per-connection runtime load.
+            let stream = BufStream::with_capacity(TLS_BUF_BYTES, TLS_BUF_BYTES, stream);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     if let Err(e) =
