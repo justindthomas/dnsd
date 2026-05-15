@@ -286,6 +286,17 @@ where
 
     metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
 
+    // One info log per served DoH request so the journal shows
+    // per-query traffic for operators tracking which clients are
+    // actually using the resolver (and which aren't).
+    tracing::info!(
+        %peer,
+        method = %method,
+        path = %path.split('?').next().unwrap_or(""),
+        wire_bytes = wire.len(),
+        "DoH request",
+    );
+
     let ctx_snap = ctx.load_full();
     let Some(response) =
         handler.handle_bytes(&wire, peer.ip(), &ctx_snap).await
