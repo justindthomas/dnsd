@@ -206,8 +206,26 @@ where
         header_buf.split_off(end)
     };
 
-    let (method, path, headers) = parse_request_head(&header_buf)
+    // header_buf currently holds everything up to and including the
+    // \r\n\r\n terminator. Strip the trailing 4-byte terminator so
+    // the parser sees a clean sequence of lines with no trailing
+    // empty.
+    let head_end = header_buf
+        .len()
+        .checked_sub(4)
+        .ok_or_else(|| anyhow!("header buffer shorter than CRLF terminator"))?;
+    let (method, path, headers) = parse_request_head(&header_buf[..head_end])
         .context("HTTP/1.1 request head")?;
+
+    // RFC 9112 §6 / PortSwigger "HTTP/1 must die" — strict
+    // framing-header validation. Reject the constructs that enable
+    // request-smuggling desync (TE, duplicate CL, mixed framing).
+    // We're a single-implementation origin so the classic smuggling
+    // attack chain doesn't apply directly, but accepting these
+    // tokens means our parser is part of a future chain that could
+    // be vulnerable. Refuse upfront, no response (closing on
+    // malformed input minimises information leakage).
+    validate_framing(&headers)?;
 
     if !acl.load().allows(peer.ip()) {
         metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
@@ -357,30 +375,119 @@ fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// method (uppercased, ASCII), the raw path (including any
 /// query-string), and a `Vec<(name, value)>` of headers. Header
 /// names are lowercased for case-insensitive matching downstream.
+/// RFC 7230 §3.2.6 token chars — set of bytes valid in HTTP/1.1
+/// header names and the request-line method field. Anything else is
+/// rejected as malformed.
+fn is_token_char(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+        | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
+/// Strict HTTP/1.1 request-line + header-block parser. Rejects:
+///
+/// - non-UTF-8 bytes anywhere
+/// - request line not exactly `METHOD SP PATH SP HTTP/1.1\r\n` (no
+///   extra whitespace, no extra tokens, no HTTP/1.0 — we don't
+///   support it for DoH and accepting it widens the parsing surface
+///   for no useful clients)
+/// - method containing non-token bytes
+/// - path containing CTL bytes (0x00–0x1F, 0x7F), CR, LF, NUL
+/// - obsolete line-folded headers (RFC 7230 §3.2.4 deprecated)
+/// - mid-block empty lines (header block ends at the first \r\n\r\n
+///   which the caller strips; embedded empties are smuggling
+///   shapes)
+/// - header name containing non-token bytes (catches e.g. trailing
+///   OWS in the name, which would otherwise allow attacks like
+///   `Transfer-Encoding : chunked` slipping past a TE-check that
+///   looks for the canonical name)
+/// - header value containing CR, LF, or NUL (header injection)
 fn parse_request_head(
     bytes: &[u8],
 ) -> Result<(&str, &str, Vec<(String, String)>)> {
     let text = std::str::from_utf8(bytes)
         .context("non-UTF-8 HTTP/1.1 request head")?;
     let mut lines = text.split("\r\n");
+
     let first = lines.next().ok_or_else(|| anyhow!("empty request head"))?;
-    let mut it = first.split(' ');
-    let method = it.next().ok_or_else(|| anyhow!("no method"))?;
-    let path = it.next().ok_or_else(|| anyhow!("no path"))?;
-    let version = it.next().ok_or_else(|| anyhow!("no HTTP version"))?;
-    if !version.starts_with("HTTP/1.") {
+    let mut parts = first.split(' ');
+    let method = parts.next().ok_or_else(|| anyhow!("no method"))?;
+    let path = parts.next().ok_or_else(|| anyhow!("no path"))?;
+    let version = parts.next().ok_or_else(|| anyhow!("no HTTP version"))?;
+    if parts.next().is_some() {
+        return Err(anyhow!("malformed request line: extra tokens"));
+    }
+    // We only accept HTTP/1.1 — HTTP/1.0 lacks Host/keep-alive
+    // semantics we'd otherwise have to special-case, and no real
+    // DoH client speaks it.
+    if version != "HTTP/1.1" {
         return Err(anyhow!("unsupported HTTP version: {version}"));
     }
+    if method.is_empty() || method.bytes().any(|b| !is_token_char(b)) {
+        return Err(anyhow!("invalid method: {method:?}"));
+    }
+    if path.is_empty() || path.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(anyhow!("invalid path"));
+    }
+
     let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
-            continue;
+            // The terminator \r\n\r\n is already stripped before we
+            // get here; any empty line in the middle is malformed.
+            return Err(anyhow!("empty line in header block"));
         }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(anyhow!("obsolete line-folded header"));
         }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(anyhow!("header missing colon: {line:?}"));
+        };
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the
+        // header field-name and colon." We enforce that by
+        // requiring the name pass the token-char check verbatim,
+        // not after trim. Catches `Content-Length : 5` which a
+        // permissive parser would normalise to `Content-Length`.
+        if name.is_empty() || name.bytes().any(|b| !is_token_char(b)) {
+            return Err(anyhow!("invalid header name: {name:?}"));
+        }
+        // Strip OWS around the value (RFC 7230 §3.2.4 allows it),
+        // then forbid CTL bytes in what remains. We don't accept
+        // \r or \n in values: header injection.
+        let value = value
+            .trim_start_matches(|c| c == ' ' || c == '\t')
+            .trim_end_matches(|c| c == ' ' || c == '\t');
+        if value.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n') {
+            return Err(anyhow!("CTL char in header value"));
+        }
+        headers.push((name.to_ascii_lowercase(), value.to_string()));
     }
     Ok((method, path, headers))
+}
+
+/// Reject header sets that enable HTTP/1.1 request smuggling.
+/// Called after parse_request_head, before any dispatch. Returns
+/// Err to close the connection without responding.
+fn validate_framing(headers: &[(String, String)]) -> Result<()> {
+    // Transfer-Encoding implies chunked / compressed framing we
+    // don't support; accepting the header at all is a smuggling
+    // shape (CL+TE desync). Reject outright.
+    if headers.iter().any(|(k, _)| k == "transfer-encoding") {
+        return Err(anyhow!("Transfer-Encoding header not allowed"));
+    }
+    if headers.iter().any(|(k, _)| k == "trailer") {
+        return Err(anyhow!("Trailer header not allowed"));
+    }
+    // RFC 7230 §3.3.2 allows merging multiple Content-Length
+    // headers iff their values are identical, but real-world
+    // parsers diverge here and an attacker who can inject a
+    // second CL has the desync. Reject any duplication.
+    let cl_count = headers.iter().filter(|(k, _)| k == "content-length").count();
+    if cl_count > 1 {
+        return Err(anyhow!("multiple Content-Length headers"));
+    }
+    Ok(())
 }
 
 fn parse_get_dns_param(path: &str) -> Option<Vec<u8>> {
@@ -393,11 +500,20 @@ fn parse_get_dns_param(path: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Strict Content-Length lookup. Returns None for missing OR
+/// malformed values; the caller treats "no CL" the same as "bad
+/// CL" since POSTs without a usable CL are rejected.
 fn content_length(headers: &[(String, String)]) -> Option<usize> {
-    headers
-        .iter()
-        .find(|(k, _)| k == "content-length")
-        .and_then(|(_, v)| v.parse().ok())
+    let (_, v) = headers.iter().find(|(k, _)| k == "content-length")?;
+    // Already OWS-trimmed by parse_request_head. Require ASCII
+    // digits only — no leading '+', no embedded whitespace, no
+    // hex/octal markers. usize::parse already rejects all of
+    // those, but the explicit byte-check guards against future
+    // refactors that swap parsers.
+    if v.is_empty() || v.bytes().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse().ok()
 }
 
 fn content_type_is_dns_message(headers: &[(String, String)]) -> bool {
@@ -479,12 +595,14 @@ fn min_ttl_from_response(bytes: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// All these tests call `parse_request_head` with the bytes the
+    /// caller would pass after stripping the trailing \r\n\r\n
+    /// terminator — i.e., no trailing empty line.
     #[test]
     fn parse_basic_get() {
         let raw = b"GET /dns-query?dns=abc HTTP/1.1\r\n\
                     Host: dns.example.com\r\n\
-                    Accept: application/dns-message\r\n\
-                    \r\n";
+                    Accept: application/dns-message";
         let (method, path, headers) = parse_request_head(raw).unwrap();
         assert_eq!(method, "GET");
         assert_eq!(path, "/dns-query?dns=abc");
@@ -517,5 +635,103 @@ mod tests {
             ("content-length".into(), "42".into()),
         ];
         assert_eq!(content_length(&h), Some(42));
+    }
+
+    // ---- hardening: each of these should be rejected ----
+
+    #[test]
+    fn rejects_http_1_0() {
+        let raw = b"GET / HTTP/1.0\r\nHost: x";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_request_line_extra_tokens() {
+        let raw = b"GET / HTTP/1.1 extra\r\nHost: x";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_double_space_in_request_line() {
+        let raw = b"GET  / HTTP/1.1\r\nHost: x";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_obsolete_line_fold() {
+        // Header continuation via leading SP — RFC 7230 §3.2.4 deprecated.
+        let raw = b"GET / HTTP/1.1\r\nX-Test: a\r\n  b";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_before_colon() {
+        // `Content-Length : 5` — the token-char check on the
+        // unmodified name catches the trailing space before the
+        // colon.
+        let raw = b"GET / HTTP/1.1\r\nContent-Length : 5";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_nul_in_header_value() {
+        let raw = b"GET / HTTP/1.1\r\nX-Test: a\x00b";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_method_token() {
+        let raw = b"GE T / HTTP/1.1\r\nHost: x";
+        assert!(parse_request_head(raw).is_err());
+    }
+
+    #[test]
+    fn validate_framing_rejects_transfer_encoding() {
+        let h = vec![
+            ("host".into(), "x".into()),
+            ("transfer-encoding".into(), "chunked".into()),
+        ];
+        assert!(validate_framing(&h).is_err());
+    }
+
+    #[test]
+    fn validate_framing_rejects_trailer() {
+        let h = vec![
+            ("host".into(), "x".into()),
+            ("trailer".into(), "x-checksum".into()),
+        ];
+        assert!(validate_framing(&h).is_err());
+    }
+
+    #[test]
+    fn validate_framing_rejects_duplicate_content_length() {
+        let h = vec![
+            ("host".into(), "x".into()),
+            ("content-length".into(), "5".into()),
+            ("content-length".into(), "5".into()),
+        ];
+        assert!(validate_framing(&h).is_err());
+    }
+
+    #[test]
+    fn validate_framing_accepts_normal_headers() {
+        let h = vec![
+            ("host".into(), "dns.example.com".into()),
+            ("content-length".into(), "42".into()),
+            ("content-type".into(), "application/dns-message".into()),
+        ];
+        assert!(validate_framing(&h).is_ok());
+    }
+
+    #[test]
+    fn content_length_rejects_garbage() {
+        let cases = ["", "+5", "-1", "5x", " 5", "5 ", "0x10", "FF"];
+        for c in cases {
+            let h = vec![("content-length".into(), c.to_string())];
+            assert!(
+                content_length(&h).is_none(),
+                "should reject Content-Length={c:?}"
+            );
+        }
     }
 }
