@@ -192,8 +192,17 @@ impl NegResolveCache {
     }
 
     fn insert(&self, name: hickory_proto::rr::Name, rtype: RecordType) {
+        self.insert_with_ttl(name, rtype, NEG_RESOLVE_TTL);
+    }
+
+    fn insert_with_ttl(
+        &self,
+        name: hickory_proto::rr::Name,
+        rtype: RecordType,
+        ttl: Duration,
+    ) {
         let key = (name.to_lowercase(), rtype);
-        let expiry = Instant::now() + NEG_RESOLVE_TTL;
+        let expiry = Instant::now() + ttl;
         let mut map = self.entries.write().unwrap();
         if map.len() >= NEG_RESOLVE_CAP && !map.contains_key(&key) {
             let now = Instant::now();
@@ -399,14 +408,29 @@ impl RecursorHandler {
         Forwarders::new(&cfg.forwarders).map(Arc::new)
     }
 
-    pub fn from_config(
+    pub async fn from_config(
         cfg: &DnsConfig,
-        reactor: ReactorCtx,
+        #[cfg(not(feature = "vcl"))] reactor: ReactorCtx,
         metrics: Arc<Metrics>,
+        #[cfg(feature = "vcl")] workers: Vec<(tokio::runtime::Handle, ReactorCtx)>,
     ) -> anyhow::Result<Self> {
         let cache = Self::build_cache_from_config(cfg);
         let forwarders = Self::build_forwarders_from_config(cfg)?;
-        Self::from_parts(cfg, reactor, metrics, cache, forwarders, None, None, None, None)
+        Self::from_parts(
+            cfg,
+            #[cfg(not(feature = "vcl"))]
+            reactor,
+            metrics,
+            cache,
+            forwarders,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "vcl")]
+            workers,
+        )
+        .await
     }
 
     /// Build a RecursorHandler using a pre-constructed cache +
@@ -414,9 +438,9 @@ impl RecursorHandler {
     /// the control socket. `root_hints_path`, when set, lets the
     /// iterative recursor persist the primed root set across
     /// restarts (e.g. `/persistent/data/dnsd/root-hints` on imp).
-    pub fn from_parts(
+    pub async fn from_parts(
         cfg: &DnsConfig,
-        reactor: ReactorCtx,
+        #[cfg(not(feature = "vcl"))] reactor: ReactorCtx,
         metrics: Arc<Metrics>,
         cache: Arc<DnsCache>,
         forwarders: Arc<Forwarders>,
@@ -424,6 +448,7 @@ impl RecursorHandler {
         discovered_v6_source: Option<std::net::Ipv6Addr>,
         discovered_v4_source: Option<std::net::Ipv4Addr>,
         anchor_dir: Option<std::path::PathBuf>,
+        #[cfg(feature = "vcl")] workers: Vec<(tokio::runtime::Handle, ReactorCtx)>,
     ) -> anyhow::Result<Self> {
         let upstream_timeout_ms = cfg
             .recursion
@@ -440,13 +465,20 @@ impl RecursorHandler {
         // ACK gets punted to Linux). Binding directly to the wan IP
         // sidesteps NAT entirely; UDP works the same way.
         //
-        // v6: priority order is explicit config > v6 listener address
-        // > VPP-discovered global v6. There's no NAT for v6, so the
-        // source has to be globally routable; binding `::` causes
-        // packets to leave with src=:: and the wire drops them. The
-        // VCL API can't tell us VPP's FIB-derived source (only echoes
-        // the bound address), so the discovery happens via VPP's
-        // binary API in `async_main` and gets passed here.
+        // v6: priority order is explicit config > VPP-discovered
+        // global v6 > v6 listener address — mirroring the v4
+        // priority below. The point is *egress-interface
+        // consistency*: v4 upstream queries source from the wan
+        // interface IP, so v6 should too. The discovered value is
+        // the wan interface's global v6 (found via VPP's binary API
+        // in `async_main`). A v6 listener address on an internal
+        // prefix is perfectly routable for egress once BGP
+        // advertises that prefix — but sourcing upstream traffic
+        // from it means the two families leave via different
+        // interfaces, which complicates firewall rules, return-path
+        // routing, and reasoning about the system. Keep both
+        // families egressing from wan; the listener address is only
+        // a fallback for when VPP discovery fails entirely.
         let mut listener_v4: Option<std::net::Ipv4Addr> = None;
         let mut listener_v6: Option<std::net::Ipv6Addr> = None;
         for l in &cfg.listeners {
@@ -461,11 +493,20 @@ impl RecursorHandler {
             }
         }
         let configured_v6 = cfg.recursion.as_ref().and_then(|r| r.source_v6);
-        let source_v6 = configured_v6.or(listener_v6).or(discovered_v6_source);
+        let source_v6 = configured_v6.or(discovered_v6_source).or(listener_v6);
         let source_v4 = discovered_v4_source.or(listener_v4);
         let upstream = Arc::new(
-            UpstreamClient::new(reactor, upstream_timeout_ms, source_v4, source_v6)
-                .context("UpstreamClient::new")?,
+            UpstreamClient::new(
+                #[cfg(not(feature = "vcl"))]
+                reactor,
+                upstream_timeout_ms,
+                source_v4,
+                source_v6,
+                #[cfg(feature = "vcl")]
+                workers,
+            )
+            .await
+            .context("UpstreamClient::new")?,
         );
 
         // Build a DNS64 policy if any listener has dns64 enabled,
@@ -692,17 +733,6 @@ impl RecursorHandler {
     }
 }
 
-/// Hard wall-clock budget for processing one client query end-to-
-/// end. Includes parse, cache lookup, coalescer wait, iterative
-/// walk, DNSSEC validation, DNS64 synthesis, and response build.
-/// 8s is well past macOS's 5s resolver retry and below most other
-/// clients' practical patience; anything that takes longer is
-/// almost certainly hung on an upstream that won't respond, and
-/// holding the handler task alive past that point starves the
-/// runtime and pushes the listener's FIFO into overflow. Returning
-/// SERVFAIL frees the inflight permit and lets the client retry.
-const QUERY_BUDGET: Duration = Duration::from_secs(8);
-
 #[async_trait]
 impl DnsHandler for RecursorHandler {
     fn is_ready(&self) -> bool {
@@ -715,33 +745,17 @@ impl DnsHandler for RecursorHandler {
         peer: IpAddr,
         ctx: &ListenerContext,
     ) -> Option<Vec<u8>> {
-        match tokio::time::timeout(
-            QUERY_BUDGET,
-            self.handle_bytes_inner(query, peer, ctx),
-        )
-        .await
-        {
-            Ok(opt) => opt,
-            Err(_) => {
-                // Budget exceeded. Build a SERVFAIL mirroring the
-                // client's TXID/question so the resolver knows to
-                // give up rather than retry against us. If the
-                // query is unparseable at this point, silently
-                // drop (same convention as a malformed query).
-                let parsed = Message::from_bytes(query).ok()?;
-                let qname = parsed
-                    .queries
-                    .first()
-                    .map(|q| q.name().to_string())
-                    .unwrap_or_default();
-                tracing::warn!(
-                    %qname,
-                    budget_ms = QUERY_BUDGET.as_millis() as u64,
-                    "query budget exceeded → SERVFAIL"
-                );
-                Some(servfail(&parsed))
-            }
-        }
+        // No outer timeout wrap. A prior version wrapped this in a
+        // tokio::time::timeout(QUERY_BUDGET, …) but under runtime
+        // starvation that timer fired 20-40 s late — the wall-clock
+        // budget became misleading rather than protective. With the
+        // dedicated VCL I/O thread architecture the recursor and
+        // its timers run on a runtime that's free of libvppcom
+        // blocking, so an inner-walk timeout will fire on time if
+        // one is needed; for now we rely on per-NS upstream timeouts
+        // inside the iterative walk and on neg_resolve_cache (5 min)
+        // to bound retry storms.
+        self.handle_bytes_inner(query, peer, ctx).await
     }
 }
 

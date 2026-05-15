@@ -32,7 +32,7 @@ use dnsd::metrics::Metrics;
 use dnsd::recursor::{DnsCache, Forwarders, RecursorHandler};
 use dnsd::io::transport::{self, ReactorCtx};
 #[cfg(feature = "vcl")]
-use dnsd::worker::{effective_worker_count, Worker, WorkerPool};
+use dnsd::worker::{effective_worker_count, MainDispatchHandler, VclIoExecutor};
 #[cfg(feature = "vcl")]
 use vcl_rs::VclApp;
 
@@ -203,49 +203,57 @@ fn main() -> Result<()> {
     let vcl_app = VclApp::init("dnsd")
         .with_context(|| "VclApp::init — is VPP up and vcl.conf readable?")?;
 
-    // Optional VCL frontend worker pool. When `dns.tcp_workers > 1`,
-    // spawn N std::thread workers each registered as its own VCL
-    // app-worker, each owning a dedicated reactor + current_thread
-    // tokio runtime. TCP/DoT/DoH listeners get bound on every worker
-    // (VPP load-balances incoming connections across the N listener
-    // instances), pinning each session to an app-worker that runs
-    // on its own OS thread. With `tcp_workers = 1` (the default), no
-    // pool is spawned and the main thread alone handles everything —
-    // the original behavior, kept as the safe rollout default.
-    //
-    // Spawn the pool BEFORE the main runtime so the workers have
-    // their VCL contexts registered against the same `vcm->workers`
-    // pool that VclApp::init grew worker-0 into. Drop order at exit:
-    // runtime → worker_pool → vcl_app, so worker tasks abort first,
-    // then worker threads join, then vppcom_app_destroy runs with
-    // every session already closed.
+    // Dedicated VCL I/O thread. Owns the VclReactor + every
+    // libvppcom call (listener accept/serve loops, upstream UDP
+    // socket binds, upstream send/recv). Created before the main
+    // multi_thread runtime so its tokio Handle + ReactorCtx are
+    // available at the moment the main runtime starts servicing
+    // async_main. Drop order at exit: main runtime drops first
+    // (tasks abort, dispatches into vcl-io's oneshots fail
+    // cleanly), then vcl_io drops (its runtime tears down,
+    // listeners close, sessions Drop), then vcl_app drops
+    // (vppcom_app_destroy).
+    // Pool size mirrors the main tokio runtime's worker count. The
+    // vcl-io pool's job is to spread libvppcom-touching tasks
+    // (listener accept/serve loops, upstream UDP demux, response
+    // send_to) across multiple threads so a busy DoH connection on
+    // one thread can't starve recv_demux for upstream UDP responses
+    // on another. VLS still serializes the actual libvppcom
+    // syscalls, but each thread runs Rust code (rustls, HTTP parse,
+    // response build) between syscalls — so while thread A is
+    // parked in `svm_msg_q_timedwait`, thread B is free to do
+    // useful non-libvppcom work AND, when it does need libvppcom,
+    // gets its slice on the VLS lock without queueing behind a
+    // dozen of thread A's pending operations.
     #[cfg(feature = "vcl")]
-    let worker_pool = {
+    let vcl_io_pool_size = {
         let n = effective_worker_count(cfg.tcp_workers);
-        tracing::info!(
-            tcp_workers_cfg = ?cfg.tcp_workers,
-            tcp_workers_env = ?std::env::var("DNSD_TCP_WORKERS").ok(),
-            available_parallelism = ?std::thread::available_parallelism().ok().map(|n| n.get()),
-            effective_n = n,
-            "frontend worker count resolved",
-        );
-        if n > 1 {
-            let pool = WorkerPool::spawn(n)
-                .context("spawning VCL frontend worker pool")?;
-            Some(pool)
-        } else {
-            None
-        }
+        tracing::info!(vcl_io_threads = n, "vcl-io pool size");
+        n
     };
-    #[cfg(not(feature = "vcl"))]
-    let _worker_pool: Option<()> = None;
+    #[cfg(feature = "vcl")]
+    let vcl_io = std::sync::Arc::new(
+        VclIoExecutor::spawn(vcl_io_pool_size).context("spawning vcl-io pool")?,
+    );
 
-    // Single-threaded runtime so the main thread (worker-0,
-    // registered implicitly by VclApp::init above) owns the UDP
-    // listener + control-socket tasks for the whole process. When
-    // `tcp_workers = 1`, this same thread also owns TCP/DoT/DoH.
-    // Upstream queries don't run on this runtime's thread — see
-    // UpstreamClient's worker pool.
+    // Multi-thread tokio runtime sized from `dns.tcp_workers`
+    // (env override `DNSD_TCP_WORKERS`). Under VLS every libvppcom
+    // call takes a process-wide lock and auto-registers the calling
+    // thread, so tokio's worker threads are free to do work-stealing
+    // and ANY thread can drive ANY session — sessions are no longer
+    // pinned to a single OS thread. This is the whole point of the
+    // VLS port: under classic libvppcom the runtime had to be
+    // single-threaded so sessions stayed on `__vcl_worker_index=0`;
+    // under VLS we can size the runtime to the workload, and a slow
+    // libvppcom call on one worker thread no longer blocks timers
+    // and other tasks from making progress on the others.
+    //
+    // The old per-worker pool (`WorkerPool`) bound listeners on each
+    // worker's own VCL app-worker context, with cross-worker
+    // listener replication via VPP's session layer. Under VLS that
+    // is unnecessary: a single set of listeners, with accepted
+    // sessions dispatched by tokio's work-stealing scheduler, gives
+    // the same parallelism without doubling VPP-side fifo segments.
     //
     // max_blocking_threads is capped to a small number so a
     // misbehaving caller can't fan out hundreds of spawn_blocking
@@ -257,13 +265,32 @@ fn main() -> Result<()> {
     // VCL-registered. dnsd itself doesn't intentionally use
     // spawn_blocking for VCL ops (see UPSTREAM_WORKERS), so 16 is
     // enough headroom for tokio internals + tokio-rustls handshakes.
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    #[cfg(feature = "vcl")]
+    let worker_threads = {
+        let n = effective_worker_count(cfg.tcp_workers);
+        tracing::info!(
+            tcp_workers_cfg = ?cfg.tcp_workers,
+            tcp_workers_env = ?std::env::var("DNSD_TCP_WORKERS").ok(),
+            available_parallelism = ?std::thread::available_parallelism().ok().map(|n| n.get()),
+            effective_n = n,
+            "tokio worker count resolved",
+        );
+        n
+    };
+    #[cfg(not(feature = "vcl"))]
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .max_blocking_threads(16)
+        .thread_name("dnsd-tokio")
         .build()
         .context("building tokio runtime")?;
     #[cfg(feature = "vcl")]
-    let result = runtime.block_on(async_main(args, cfg, worker_pool.as_ref()));
+    let result = runtime.block_on(async_main(args, cfg, vcl_io.clone()));
     #[cfg(not(feature = "vcl"))]
     let result = runtime.block_on(async_main(args, cfg));
     // Explicit drops to make the order obvious to a future reader
@@ -271,7 +298,7 @@ fn main() -> Result<()> {
     // local between `vcl_app` and `runtime`.
     drop(runtime);
     #[cfg(feature = "vcl")]
-    drop(worker_pool);
+    drop(vcl_io);
     #[cfg(feature = "vcl")]
     drop(vcl_app);
     result
@@ -312,7 +339,7 @@ async fn run_control_only(args: Args, cfg: DnsConfig) -> Result<()> {
 async fn async_main(
     args: Args,
     cfg: DnsConfig,
-    #[cfg(feature = "vcl")] worker_pool: Option<&WorkerPool>,
+    #[cfg(feature = "vcl")] vcl_io: std::sync::Arc<VclIoExecutor>,
 ) -> Result<()> {
     let metrics = Arc::new(Metrics::default());
 
@@ -370,6 +397,11 @@ async fn async_main(
         }
     });
 
+    // Under vcl, every reactor lives inside the vcl-io pool — the
+    // recursor's upstream client builds its channels from
+    // `vcl_io.workers()`, and listener binds pick a worker each.
+    // No standalone reactor needed here. Kernel-sockets builds one.
+    #[cfg(not(feature = "vcl"))]
     let reactor = transport::new_reactor().with_context(|| "transport::new_reactor")?;
 
     // Ask VPP for a globally-routable v6 source IP. Used as the
@@ -422,6 +454,7 @@ async fn async_main(
     // we update with a fresh RecursorHandler.
     let initial_recursor = RecursorHandler::from_parts(
         &cfg,
+        #[cfg(not(feature = "vcl"))]
         reactor.clone(),
         metrics.clone(),
         cache.clone(),
@@ -430,27 +463,29 @@ async fn async_main(
         discovered_v6,
         discovered_v4,
         Some(args.data_dir.join("anchor")),
+        #[cfg(feature = "vcl")]
+        vcl_io.workers(),
     )
+    .await
     .context("RecursorHandler init")?;
     initial_recursor.spawn_dnssec_prewarm();
     let live: Arc<LiveHandler<RecursorHandler>> = Arc::new(LiveHandler::new(initial_recursor));
-    // Under the frontend worker pool, wrap the handler in
-    // `MainPinnedHandler` so listener tasks running on frontend
-    // workers dispatch `handle_bytes` (which runs upstream UDP/TCP
-    // queries against sockets bound on main = vcl_worker_0) back to
-    // the main runtime. Without this, the upstream `sendto` runs
-    // with the frontend worker's VCL context and returns EINVAL
-    // because the session doesn't exist in that worker's pool.
-    // N=1 path keeps the raw handler — no cross-worker hop needed.
+    // Listener tasks run on the vcl-io thread (so all libvppcom
+    // calls funnel through one OS thread, keeping the main multi_
+    // thread runtime free of libvppcom contention). The actual
+    // recursor work (cache lookup, iterative walk, DNSSEC,
+    // response build) should run on the *main* runtime instead so
+    // it can use multiple worker threads in parallel. Wrap the
+    // handler in `MainDispatchHandler`: each listener-side
+    // `handle_bytes` call dispatches the work to main and awaits
+    // the result via oneshot. While the dispatch is in flight, the
+    // vcl-io listener task is parked — vcl-io is free to service
+    // its other listeners, the MQ drain, accept loops, etc.
     #[cfg(feature = "vcl")]
-    let handler: SharedHandler = if worker_pool.is_some() {
-        Arc::new(dnsd::worker::MainPinnedHandler::new(
-            live.clone(),
-            tokio::runtime::Handle::current(),
-        ))
-    } else {
-        live.clone()
-    };
+    let handler: SharedHandler = Arc::new(MainDispatchHandler::new(
+        live.clone(),
+        tokio::runtime::Handle::current(),
+    ));
     #[cfg(not(feature = "vcl"))]
     let handler: SharedHandler = live.clone();
 
@@ -464,27 +499,17 @@ async fn async_main(
     }
 
     let mut listeners: LiveListeners = HashMap::new();
-    #[cfg(feature = "vcl")]
     bind_listener_set_with_retry(
         &cfg,
+        #[cfg(not(feature = "vcl"))]
         &reactor,
-        worker_pool,
+        #[cfg(feature = "vcl")]
+        vcl_io.as_ref(),
         &handler,
         &metrics,
         tls_config.as_ref(),
         &mut listeners,
         Duration::from_secs(20), // initial bind: VPP may still be settling
-    )
-    .await;
-    #[cfg(not(feature = "vcl"))]
-    bind_listener_set_with_retry(
-        &cfg,
-        &reactor,
-        &handler,
-        &metrics,
-        tls_config.as_ref(),
-        &mut listeners,
-        Duration::from_secs(20),
     )
     .await;
 
@@ -502,11 +527,10 @@ async fn async_main(
             control_socket: args.control_socket.clone(),
             config_path: args.config.clone(),
             root_hints_path,
+            #[cfg(not(feature = "vcl"))]
             reactor,
             #[cfg(feature = "vcl")]
-            worker_pool,
-            #[cfg(not(feature = "vcl"))]
-            _phantom: std::marker::PhantomData,
+            vcl_io: vcl_io.clone(),
             metrics: metrics.clone(),
             cache,
             live,
@@ -648,51 +672,6 @@ enum BindOutcome {
     Skipped,
 }
 
-/// Run `try_bind_one` on a frontend worker's runtime instead of the
-/// caller's. The worker's `register_worker_thread` ran on its own OS
-/// thread, so VCL session ops (bind, listen, accept) inside the
-/// listener task must run there too — `worker.handle.spawn` schedules
-/// the future onto the worker's current_thread runtime, which is
-/// pinned to that thread. We capture all the bind args by value (the
-/// future needs `'static`), then surface the result back via a
-/// oneshot.
-#[cfg(feature = "vcl")]
-async fn try_bind_one_on_worker(
-    worker: &Worker,
-    lc: &ListenerCfg,
-    proto: &'static str,
-    handler: &SharedHandler,
-    metrics: &Arc<Metrics>,
-    tls: Option<&Arc<rustls::ServerConfig>>,
-    acl: &AclSwap,
-    ctx: &CtxSwap,
-) -> Result<Option<JoinHandle<()>>> {
-    let reactor = worker.reactor.clone();
-    let lc = lc.clone();
-    let handler = handler.clone();
-    let metrics = metrics.clone();
-    let tls = tls.cloned();
-    let acl = acl.clone();
-    let ctx = ctx.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    worker.handle.spawn(async move {
-        let result =
-            try_bind_one(&lc, proto, &reactor, &handler, &metrics, tls.as_ref(), &acl, &ctx).await;
-        let _ = tx.send(result);
-    });
-    rx.await
-        .map_err(|_| anyhow::anyhow!("worker bind task dropped without result"))?
-}
-
-/// Returns `true` for protocols that should be bound across the
-/// frontend worker pool (when one exists). UDP stays on the main
-/// reactor regardless — its session pool is flat and the cross-
-/// worker pinning issue only affects connected sessions.
-#[cfg(feature = "vcl")]
-fn dispatch_to_worker_pool(proto: &str) -> bool {
-    matches!(proto, "tcp" | "dot" | "doh")
-}
-
 /// Bind every (listener, protocol) pair declared in `cfg` that's
 /// not already in `out`, retrying transient bind failures every
 /// 200ms until either everything is bound or `deadline` elapses.
@@ -703,14 +682,14 @@ fn dispatch_to_worker_pool(proto: &str) -> bool {
 /// (lc, proto) and reused across retries — the same Arc pointers
 /// land in `out` so reload's hot-swap path can find them later.
 ///
-/// When `worker_pool` is `Some` and `tcp_workers > 1`, TCP/DoT/DoH
-/// listeners are bound once per worker (VPP's session-layer load-
-/// balances incoming connections across the instances). UDP is
-/// always bound on the main reactor.
+/// Under VLS + multi-thread tokio, one bind per (addr, port, proto)
+/// is enough — tokio's work-stealing scheduler spreads accepted
+/// sessions across worker threads, and the VLS lock keeps libvppcom
+/// safe across threads.
 async fn bind_listener_set_with_retry(
     cfg: &DnsConfig,
-    reactor: &ReactorCtx,
-    #[cfg(feature = "vcl")] worker_pool: Option<&WorkerPool>,
+    #[cfg(not(feature = "vcl"))] reactor: &ReactorCtx,
+    #[cfg(feature = "vcl")] vcl_io: &VclIoExecutor,
     handler: &SharedHandler,
     metrics: &Arc<Metrics>,
     tls: Option<&Arc<rustls::ServerConfig>>,
@@ -765,72 +744,48 @@ async fn bind_listener_set_with_retry(
                 port: p.lc.port,
                 proto: p.proto,
             };
-            // Pick the bind target: main reactor for UDP (always) and
-            // for everything when no frontend pool is configured;
-            // otherwise dispatch TCP/DoT/DoH across the pool.
+            // Dispatch the bind onto a pool-picked vcl-io thread.
+            // The listener's accept loop (and every per-connection
+            // serve task it spawns) inherits that thread's runtime
+            // as ambient, so all subsequent libvppcom calls for
+            // sessions on this listener stay on that one thread.
+            // Different listeners pick different threads via the
+            // pool's round-robin, so e.g. bvi100-doh on one thread
+            // doesn't starve bvi100-v6-udp's recv_demux on another.
             #[cfg(feature = "vcl")]
-            let use_pool = worker_pool.is_some() && dispatch_to_worker_pool(p.proto);
+            let outcome: Result<BindOutcome> = {
+                let (vcl_handle, picked_reactor) = vcl_io.pick_listener();
+                let lc = p.lc.clone();
+                let proto = p.proto;
+                let handler = handler.clone();
+                let metrics = metrics.clone();
+                let tls = tls.cloned();
+                let acl = p.acl.clone();
+                let ctx = p.ctx.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                vcl_handle.spawn(async move {
+                    let result = try_bind_one(
+                        &lc, proto, &picked_reactor, &handler, &metrics, tls.as_ref(), &acl, &ctx,
+                    )
+                    .await;
+                    let _ = tx.send(result);
+                });
+                match rx.await {
+                    Ok(Ok(Some(h))) => Ok(BindOutcome::Bound(vec![h])),
+                    Ok(Ok(None)) => Ok(BindOutcome::Skipped),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(anyhow::anyhow!("vcl-io bind dispatch dropped")),
+                }
+            };
             #[cfg(not(feature = "vcl"))]
-            let use_pool = false;
-
-            let outcome: Result<BindOutcome> = if use_pool {
-                #[cfg(feature = "vcl")]
-                {
-                    let pool = worker_pool.expect("use_pool implies pool present");
-                    let mut handles = Vec::with_capacity(pool.len());
-                    let mut bind_err: Option<anyhow::Error> = None;
-                    let mut skipped_all = true;
-                    for worker in pool.workers() {
-                        match try_bind_one_on_worker(
-                            worker, &p.lc, p.proto, handler, metrics, tls, &p.acl, &p.ctx,
-                        )
-                        .await
-                        {
-                            Ok(Some(h)) => {
-                                handles.push(h);
-                                skipped_all = false;
-                            }
-                            Ok(None) => {
-                                // Permanent skip (no TLS, unknown proto)
-                                // — this is uniform across workers, so
-                                // record it and stop iterating.
-                                bind_err = None;
-                                break;
-                            }
-                            Err(e) => {
-                                bind_err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    match bind_err {
-                        Some(e) => {
-                            // Roll back: a partial bind across workers
-                            // leaves orphans listening. Abort what we
-                            // got so retry sees a clean slate.
-                            for h in handles {
-                                h.abort();
-                            }
-                            Err(e)
-                        }
-                        None if handles.is_empty() && skipped_all => Ok(BindOutcome::Skipped),
-                        None => Ok(BindOutcome::Bound(handles)),
-                    }
-                }
-                #[cfg(not(feature = "vcl"))]
-                {
-                    unreachable!("use_pool=true requires vcl feature");
-                }
-            } else {
-                match try_bind_one(
-                    &p.lc, p.proto, reactor, handler, metrics, tls, &p.acl, &p.ctx,
-                )
-                .await
-                {
-                    Ok(Some(h)) => Ok(BindOutcome::Bound(vec![h])),
-                    Ok(None) => Ok(BindOutcome::Skipped),
-                    Err(e) => Err(e),
-                }
+            let outcome: Result<BindOutcome> = match try_bind_one(
+                &p.lc, p.proto, reactor, handler, metrics, tls, &p.acl, &p.ctx,
+            )
+            .await
+            {
+                Ok(Some(h)) => Ok(BindOutcome::Bound(vec![h])),
+                Ok(None) => Ok(BindOutcome::Skipped),
+                Err(e) => Err(e),
             };
 
             match outcome {
@@ -877,17 +832,18 @@ async fn bind_listener_set_with_retry(
 
 // ---- SIGHUP reload ---------------------------------------------
 
-struct WaitArgs<'a> {
+struct WaitArgs {
     control_socket: PathBuf,
     config_path: PathBuf,
     root_hints_path: PathBuf,
-    reactor: ReactorCtx,
-    /// Borrowed across the wait loop's lifetime. Cleared by `main`'s
-    /// explicit `drop(worker_pool)` after the runtime tears down.
-    #[cfg(feature = "vcl")]
-    worker_pool: Option<&'a WorkerPool>,
+    /// Kernel-sockets backend: the lone reactor. Under vcl, reactors
+    /// live per-worker inside `vcl_io` and there's no standalone one.
     #[cfg(not(feature = "vcl"))]
-    _phantom: std::marker::PhantomData<&'a ()>,
+    reactor: ReactorCtx,
+    /// The vcl-io worker pool. Reload rebuilds the recursor from
+    /// `vcl_io.workers()` and re-binds listeners via `pick_listener`.
+    #[cfg(feature = "vcl")]
+    vcl_io: std::sync::Arc<VclIoExecutor>,
     metrics: Arc<Metrics>,
     cache: Arc<DnsCache>,
     live: Arc<LiveHandler<RecursorHandler>>,
@@ -924,7 +880,7 @@ struct WaitArgs<'a> {
 /// config — abort listeners that no longer exist or whose address/
 /// port/proto changed, leave unchanged listeners alone, spawn the
 /// new ones. Cache is shared across the swap (no flush).
-async fn reload<'a>(args: &WaitArgs<'a>, listeners: &mut LiveListeners) {
+async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
     tracing::info!(config = %args.config_path.display(), "SIGHUP — reloading");
 
     let new_cfg = match DnsConfig::load(&args.config_path) {
@@ -959,6 +915,7 @@ async fn reload<'a>(args: &WaitArgs<'a>, listeners: &mut LiveListeners) {
     // re-init VCL.
     let new_recursor = match RecursorHandler::from_parts(
         &new_cfg,
+        #[cfg(not(feature = "vcl"))]
         args.reactor.clone(),
         args.metrics.clone(),
         args.cache.clone(),
@@ -967,7 +924,11 @@ async fn reload<'a>(args: &WaitArgs<'a>, listeners: &mut LiveListeners) {
         args.discovered_v6_source,
         args.discovered_v4_source,
         Some(args.anchor_dir.clone()),
-    ) {
+        #[cfg(feature = "vcl")]
+        args.vcl_io.workers(),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("reload aborted, recursor init failed: {e}");
@@ -1071,45 +1032,28 @@ async fn reload<'a>(args: &WaitArgs<'a>, listeners: &mut LiveListeners) {
         }
     }
 
-    // Same wrapper rule as the initial bind path: when a worker
-    // pool is active, route handler calls back to main so upstream
-    // sockets (bound on main = vcl_worker_0) get the right VCL
-    // context. New listeners added by this reload pick up the
-    // wrapped handler; already-bound listeners keep their original
-    // SharedHandler clone (still wrapped from the initial bind).
+    // Wrap handler for vcl-io→main dispatch, same as initial bind.
+    // Already-bound listeners hold their original wrapped handler;
+    // newly-bound ones get this fresh wrap with the same target.
     #[cfg(feature = "vcl")]
-    let handler: SharedHandler = if args.worker_pool.is_some() {
-        Arc::new(dnsd::worker::MainPinnedHandler::new(
-            args.live.clone(),
-            tokio::runtime::Handle::current(),
-        ))
-    } else {
-        args.live.clone()
-    };
+    let handler: SharedHandler = Arc::new(MainDispatchHandler::new(
+        args.live.clone(),
+        tokio::runtime::Handle::current(),
+    ));
     #[cfg(not(feature = "vcl"))]
     let handler: SharedHandler = args.live.clone();
     let before = listeners.len();
-    #[cfg(feature = "vcl")]
     bind_listener_set_with_retry(
         &new_cfg,
+        #[cfg(not(feature = "vcl"))]
         &args.reactor,
-        args.worker_pool,
+        #[cfg(feature = "vcl")]
+        args.vcl_io.as_ref(),
         &handler,
         &args.metrics,
         effective_tls.as_ref(),
         listeners,
         Duration::from_secs(5), // post-startup: VPP should be ready
-    )
-    .await;
-    #[cfg(not(feature = "vcl"))]
-    bind_listener_set_with_retry(
-        &new_cfg,
-        &args.reactor,
-        &handler,
-        &args.metrics,
-        effective_tls.as_ref(),
-        listeners,
-        Duration::from_secs(5),
     )
     .await;
     let added = listeners.len().saturating_sub(before);
@@ -1130,7 +1074,7 @@ async fn reload<'a>(args: &WaitArgs<'a>, listeners: &mut LiveListeners) {
     );
 }
 
-async fn wait_for_exit_with_reload<'a>(args: WaitArgs<'a>, mut listeners: LiveListeners) {
+async fn wait_for_exit_with_reload(args: WaitArgs, mut listeners: LiveListeners) {
     let mut sigterm = signal(SignalKind::terminate()).expect("sigterm");
     let mut sigint = signal(SignalKind::interrupt()).expect("sigint");
     let mut sighup = signal(SignalKind::hangup()).expect("sighup");

@@ -493,15 +493,31 @@ where
     );
 
     let ctx_snap = ctx.load_full();
+    let t0 = std::time::Instant::now();
     let Some(response) =
         handler.handle_bytes(&wire, peer.ip(), &ctx_snap).await
     else {
+        tracing::info!(%peer, "DIAG doh: handler returned None");
         send_simple(stream, 400, "Bad Request", b"malformed DNS query\n", true)
             .await?;
         return Err(anyhow!("malformed DNS — closing"));
     };
+    let handler_ms = t0.elapsed().as_millis() as u64;
     let ttl = min_ttl_from_response(&response).unwrap_or(0);
-    send_dns_response(stream, &response, ttl, close).await
+    let resp_len = response.len();
+    match send_dns_response(stream, &response, ttl, close).await {
+        Ok(()) => {
+            tracing::info!(
+                %peer, resp_bytes = resp_len, handler_ms, close,
+                "DIAG doh: response sent",
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::info!(%peer, "DIAG doh: response write failed: {e:#}");
+            Err(e)
+        }
+    }
 }
 
 /// Drain bytes from `stream` into `buf` until the `\r\n\r\n` end-

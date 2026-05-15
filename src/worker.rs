@@ -1,29 +1,31 @@
-//! VCL frontend worker pool.
+//! Dedicated VCL I/O thread.
 //!
-//! libvppcom pins every session to the OS thread whose worker
-//! context originated it. When we ran a single tokio current_thread
-//! runtime on the main thread (= app-worker-0), VPP's per-VPP-worker
-//! session distribution meant ESTABLISHED DoH/DoT sessions could
-//! land on a different VPP worker than the app worker driving them
-//! — event delivery cross-worker is unreliable and DoH keep-alive
-//! wedges. This module spawns N std::thread workers each registered
-//! as their own VCL app-worker, each with its own `VclReactor` and
-//! current_thread tokio runtime. The configured TCP/DoT/DoH listeners
-//! are bound on every worker (VPP's session-layer load-balances
-//! incoming connections across the listener instances), so a session
-//! always ends up at an app-worker with a co-located VCL context.
+//! Every libvppcom call (`vls_*`, `vppcom_*`) goes through this one
+//! std::thread. The thread runs a `current_thread` tokio runtime
+//! plus the `VclReactor`. Listener accept-loops, listener serve-
+//! loops, and the forwarder's upstream UDP/TCP sockets are spawned
+//! onto this thread's runtime via its `Handle`. The recursor
+//! itself (cache lookups, iterative walking logic, DNSSEC
+//! validation, response building) runs on the **main** multi-
+//! thread tokio runtime — listener tasks dispatch
+//! `handler.handle_bytes(...)` back to main via
+//! [`MainDispatchHandler`], and the forwarder's upstream
+//! [`UpstreamClient::query`] dispatches actual session ops back
+//! down to vcl-io via its `Handle`.
 //!
-//! UDP stays on the main thread (= app-worker-0): its session pool
-//! is flat and the cross-worker wedge doesn't apply.
+//! Why this split:
 //!
-//! Each worker exposes a `tokio::runtime::Handle` so the main
-//! thread's bind/diff/abort logic can schedule listener tasks onto
-//! the worker without doing VCL ops itself.
-//!
-//! Worker count comes from `dns.tcp_workers` (or env override
-//! `DNSD_TCP_WORKERS`), defaulting to `1`. Setting it higher trades
-//! VPP-side fifo segments (128 MB each by default) for connection-
-//! oriented parallelism.
+//! libvppcom's `svm_msg_q_timedwait` MQ-drain runs inside every
+//! session op and serializes through a per-process VLS lock when
+//! multiple threads are involved. If the recursor's tokio worker
+//! threads called libvppcom directly, they'd contend on the lock
+//! and the runtime's timer driver could be starved for tens of
+//! seconds — exactly the failure mode that made the multi_thread
+//! tokio + direct-libvppcom experiment wedge dnsd within ~30 s of
+//! traffic. Confining libvppcom to one dedicated thread keeps the
+//! main multi_thread runtime's threads free of any libvppcom call,
+//! so timers, signal handling, and recursor logic run promptly
+//! even when vcl-io is deep in a slow MQ drain.
 
 use std::net::IpAddr;
 use std::sync::mpsc as std_mpsc;
@@ -38,24 +40,19 @@ use tokio::sync::oneshot;
 use crate::handler::{DnsHandler, ListenerContext, SharedHandler};
 use crate::io::transport::{self, ReactorCtx};
 
-/// Resolve the effective worker count from config, env, and CPU
-/// availability. Order of precedence (highest wins):
+/// Resolve the effective tokio worker thread count for the **main**
+/// multi-thread runtime from config, env, and CPU availability.
+/// Order of precedence (highest wins):
 ///   1. `DNSD_TCP_WORKERS` env var
 ///   2. `dns.tcp_workers` from router.yaml
-///   3. Default `1` (current behavior — main thread alone handles
-///      every listener)
+///   3. Default `1` (single-worker main runtime — safe rollout
+///      default)
 ///
 /// The sentinel value `0` from either source means "auto" — use
-/// `std::thread::available_parallelism()`. This lets operators
-/// scale workers with the host's CPU count without rewriting config
-/// when dnsd is deployed across heterogeneous hardware (the router
-/// build has 8 logical CPUs; future Pi-class deployments might
-/// have 4).
-///
-/// Result is clamped to `[1, available_parallelism()]`. Going above
-/// the CPU count buys nothing (the workers contend on the same
-/// physical cores) and burns VPP-side fifo segments (default 128 MB
-/// each per registered VCL worker).
+/// `std::thread::available_parallelism()`. Result is clamped to
+/// `[1, available_parallelism()]`. Note this is *separate* from the
+/// vcl-io thread, which is always exactly one std::thread regardless
+/// of this setting.
 pub fn effective_worker_count(cfg_value: Option<u32>) -> usize {
     let cap = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -65,9 +62,9 @@ pub fn effective_worker_count(cfg_value: Option<u32>) -> usize {
         .and_then(|s| s.parse::<u32>().ok())
         .or(cfg_value);
     let n = match raw {
-        Some(0) => cap,       // explicit auto
-        Some(n) => n as usize, // explicit fixed
-        None => 1,            // unset → single-thread default
+        Some(0) => cap,
+        Some(n) => n as usize,
+        None => 1,
     };
     n.clamp(1, cap)
 }
@@ -86,7 +83,6 @@ mod tests {
 
     #[test]
     fn unset_defaults_to_single_worker() {
-        // The env var would override; assume tests don't set it.
         std::env::remove_var("DNSD_TCP_WORKERS");
         assert_eq!(effective_worker_count(None), 1);
     }
@@ -97,42 +93,39 @@ mod tests {
         let cap = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        // Below cap: passes through.
         assert_eq!(effective_worker_count(Some(2)), 2usize.min(cap));
-        // Above cap: clamped.
         assert_eq!(effective_worker_count(Some(9999)), cap);
     }
 }
 
-/// `DnsHandler` wrapper that dispatches `handle_bytes` to the main
-/// tokio runtime. Used to keep upstream UDP/TCP queries on the main
-/// thread (= vcl_worker_0), since `AsyncUdpUpstream`'s sockets are
-/// bound there. Without this wrapper, a DoH/DoT request accepted by
-/// a frontend worker would call `handler.handle_bytes(...).await`
-/// in the worker's runtime, whose poll runs on the worker's OS
-/// thread — and the upstream `sendto` would then look up the
-/// upstream session in the wrong VCL worker context, returning
-/// `VPPCOM_EINVAL (-22)`. Surfaced as ~27% upstream-UDP failures
-/// when N=4 first shipped.
+/// `DnsHandler` shim that dispatches `handle_bytes` to a different
+/// tokio runtime than the caller's. The listener tasks running on
+/// vcl-io call `handler.handle_bytes(...).await`; the inner handler
+/// is the real recursor on the main multi-thread runtime, and we
+/// want all of its work (cache lookups, iterative walks, DNSSEC
+/// validation, response builds) to run there rather than on vcl-io.
+/// vcl-io stays free to drain libvppcom MQ events and service
+/// listener I/O while main does the CPU work.
 ///
-/// The frontend worker still does TCP accept, TLS handshake, HTTP
-/// parsing, and the final response write — only the handler call
-/// (which is mostly upstream I/O) routes through main. So
-/// connection-level parallelism is preserved; the handler is a thin
-/// dispatch shim.
-pub struct MainPinnedHandler {
+/// Implementation: spawn the actual handler invocation on `target`,
+/// send the result back through a oneshot, await it on the caller's
+/// side. If the target runtime is shutting down (spawned task is
+/// dropped before it sends), surface `None` — the listener will
+/// silently drop the client connection, same convention as for a
+/// malformed query.
+pub struct MainDispatchHandler {
     inner: SharedHandler,
-    main_handle: Handle,
+    target: Handle,
 }
 
-impl MainPinnedHandler {
-    pub fn new(inner: SharedHandler, main_handle: Handle) -> Self {
-        Self { inner, main_handle }
+impl MainDispatchHandler {
+    pub fn new(inner: SharedHandler, target: Handle) -> Self {
+        Self { inner, target }
     }
 }
 
 #[async_trait]
-impl DnsHandler for MainPinnedHandler {
+impl DnsHandler for MainDispatchHandler {
     async fn handle_bytes(
         &self,
         query: &[u8],
@@ -143,138 +136,133 @@ impl DnsHandler for MainPinnedHandler {
         let query = query.to_vec();
         let ctx = ctx.clone();
         let (tx, rx) = oneshot::channel();
-        self.main_handle.spawn(async move {
+        self.target.spawn(async move {
             let resp = inner.handle_bytes(&query, peer, &ctx).await;
             let _ = tx.send(resp);
         });
-        // If the main runtime is shutting down, the task we spawned
-        // may be dropped before sending; surface as "no response"
-        // (the listener will drop the client connection silently,
-        // same as for a malformed query).
         rx.await.ok().flatten()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
     }
 }
 
-/// A spawned VCL worker thread plus the handles main needs to drive it.
-pub struct Worker {
-    pub id: usize,
-    /// Tokio runtime handle for the worker's current_thread runtime.
-    /// Use `handle.spawn(...)` from main to put a future onto this
-    /// worker. The future then runs on the worker's OS thread, where
-    /// VCL ops are valid against the worker's registered context.
-    pub handle: Handle,
-    /// Per-worker reactor. Clone freely — the clones share the
-    /// underlying `Arc<Mutex<ReactorInner>>` and `Arc<AsyncFd<MqFd>>`.
-    /// Critical caveat: VCL methods on this reactor (drain_events,
-    /// register, deregister) call `vppcom_epoll_*` which look up the
-    /// CURRENT thread's worker context. Only use the reactor from
-    /// inside a future that's running on this worker's runtime.
-    pub reactor: ReactorCtx,
+/// Pool of dedicated VCL I/O threads. Each thread runs a
+/// `current_thread` tokio runtime + its own `VclReactor` + its own
+/// MQ-epoll AsyncFd registration. Listener and forwarder tasks
+/// spread across the pool so a DoH connection saturating one
+/// thread's reads doesn't starve another thread's UDP recv_demux.
+///
+/// Under VLS, sessions are thread-agnostic at the libvppcom level
+/// — the lock + auto-register hooks make it safe to touch any
+/// session from any thread. The reason we still bind each session
+/// to a single pool thread is the reactor: the AsyncFd that wraps
+/// the MQ-epoll fd, plus the per-session waiter map, live on the
+/// specific runtime that created them. Tasks that spawn from
+/// inside another task inherit that runtime, which keeps each
+/// session's I/O lifecycle on one thread without needing explicit
+/// pinning.
+///
+/// VLS still serializes the actual libvppcom syscalls process-wide
+/// (one thread inside libvppcom at a time), so total libvppcom
+/// throughput doesn't scale linearly with pool size. The benefit
+/// is *parallelism opportunity*: while pool thread A is parked in
+/// `svm_msg_q_timedwait`, pool thread B can be doing Rust work
+/// (rustls deframe, HTTP parse, response build) instead of also
+/// blocking on libvppcom. That's enough to break the
+/// recv_demux-starvation pattern that the single-thread pool
+/// suffered under sustained DoH load.
+pub struct VclIoExecutor {
+    workers: Vec<VclIoWorker>,
+    /// Round-robin counter for `pick_handle`. Wraps freely; we
+    /// only care about distribution, not exact balance.
+    next: std::sync::atomic::AtomicUsize,
+}
+
+struct VclIoWorker {
+    handle: Handle,
+    reactor: ReactorCtx,
     join: Option<thread::JoinHandle<()>>,
-    /// One-shot to tell the worker thread to exit its `block_on`.
-    /// Dropping it before the worker's runtime tears down triggers
-    /// a graceful shutdown (the runtime aborts its tasks and drops
-    /// its reactor, which deregisters every listener / accepted
-    /// session via `Drop`).
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
-impl Worker {
-    /// Convenience: spawn `fut` on the worker's runtime and await
-    /// its result on the caller's side. Use this when main needs
-    /// the return value of a per-worker VCL op (e.g., bind result).
-    pub async fn run<F, T>(&self, fut: F) -> Result<T>
-    where
-        F: std::future::Future<Output = Result<T>> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = oneshot::channel();
-        self.handle.spawn(async move {
-            let result = fut.await;
-            let _ = tx.send(result);
-        });
-        rx.await
-            .map_err(|_| anyhow!("worker {} dropped task before completing", "?"))?
-    }
-}
-
-/// Pool of N VCL frontend workers. Worker 0 is the *first additional*
-/// worker — it is NOT app-worker-0 (that's the main thread, where
-/// UDP + control socket + signals run). I.e. when `tcp_workers = 4`,
-/// the process has 5 VCL app-workers total: main (worker-0) + four
-/// frontend workers.
-pub struct WorkerPool {
-    workers: Vec<Worker>,
-}
-
-impl WorkerPool {
-    /// Spawn `n` VCL worker threads. Each thread:
-    ///   1. Registers as a VCL app-worker (`register_worker_thread`).
-    ///   2. Builds a `VclReactor` (with its own MQ epoll fd).
-    ///   3. Builds a current_thread tokio runtime.
-    ///   4. Hands its `(handle, reactor)` back to main via the ready
-    ///      channel — main installs them into the Worker entry.
-    ///   5. Blocks on the shutdown receiver. When main drops the
-    ///      shutdown sender (or sends `()`), the worker's runtime
-    ///      tears down: in-flight listener tasks abort, every
-    ///      `VclListener`/`VclStream` drops, the reactor drops, and
-    ///      finally the worker thread exits.
-    ///
-    /// The thread name is `dnsd-vcl-<id>` so `top -H` /
-    /// `vppctl show app` shows the right thing.
-    ///
-    /// `VclApp::init` must already have run on the calling thread —
-    /// `vppcom_worker_register` requires the app to exist.
+impl VclIoExecutor {
+    /// Spawn `n` vcl-io threads and wait for each to register a VCL
+    /// worker, build a tokio runtime, and create its reactor. Caller
+    /// must have run `VclApp::init` first.
     pub fn spawn(n: usize) -> Result<Self> {
+        let n = n.max(1);
         let mut workers = Vec::with_capacity(n);
         for id in 0..n {
-            let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(Handle, ReactorCtx)>>(0);
+            let (ready_tx, ready_rx) =
+                std_mpsc::sync_channel::<Result<(Handle, ReactorCtx)>>(0);
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
             let join = thread::Builder::new()
-                .name(format!("dnsd-vcl-{id}"))
+                .name(format!("dnsd-vcl-io-{id}"))
                 .spawn(move || {
-                    worker_thread_main(id, shutdown_rx, ready_tx);
+                    vcl_io_thread_main(id, shutdown_rx, ready_tx);
                 })
-                .with_context(|| format!("spawning dnsd-vcl-{id}"))?;
-
+                .with_context(|| format!("spawning dnsd-vcl-io-{id}"))?;
             let (handle, reactor) = match ready_rx.recv() {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
-                    // Worker failed to register / build runtime. The
-                    // thread has already exited on its own; join to
-                    // reap it before returning.
                     let _ = join.join();
-                    return Err(e.context(format!("worker {id} startup")));
+                    return Err(e.context(format!("vcl-io-{id} startup")));
                 }
                 Err(_) => {
                     let _ = join.join();
-                    return Err(anyhow!("worker {id} panicked before reporting ready"));
+                    return Err(anyhow!("vcl-io-{id} panicked before reporting ready"));
                 }
             };
-            workers.push(Worker {
-                id,
+            workers.push(VclIoWorker {
                 handle,
                 reactor,
                 join: Some(join),
                 shutdown_tx: Some(shutdown_tx),
             });
         }
-        tracing::info!(workers = n, "VCL frontend worker pool ready");
-        Ok(WorkerPool { workers })
+        tracing::info!(threads = n, "vcl-io pool ready");
+        Ok(VclIoExecutor {
+            workers,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
-    pub fn workers(&self) -> &[Worker] {
-        &self.workers
+    /// Every worker's `(handle, reactor)` pair. The upstream
+    /// forwarder builds one UDP channel (v4+v6 socket pair + demux)
+    /// per worker from this list and round-robins queries across
+    /// them — so upstream UDP throughput scales with the pool
+    /// instead of funneling through a single thread. Outbound TCP
+    /// (DNSKEY fetches, TC=1 retries) round-robins the same set.
+    pub fn workers(&self) -> Vec<(Handle, ReactorCtx)> {
+        self.workers
+            .iter()
+            .map(|w| (w.handle.clone(), w.reactor.clone()))
+            .collect()
     }
 
+    /// Pick a worker by round-robin over the whole pool. Used per
+    /// listener bind: the accept loop + every per-connection serve
+    /// task it spawns inherit that worker's runtime. Listeners and
+    /// upstream channels both span all workers — the upstream load
+    /// (the heavy part, ~10 round-trips per recursive query) is
+    /// spread N ways, and the lighter listener work co-locates
+    /// without meaningfully contending.
+    pub fn pick_listener(&self) -> (Handle, ReactorCtx) {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.workers.len();
+        let w = &self.workers[i];
+        (w.handle.clone(), w.reactor.clone())
+    }
+
+    /// Number of vcl-io threads in the pool.
     pub fn len(&self) -> usize {
         self.workers.len()
     }
 
-    /// Initiate clean shutdown: send the shutdown signal to every
-    /// worker and join their OS threads. Joins are sequential. Each
-    /// worker tears down its tokio runtime (which aborts listener
-    /// tasks and drops the reactor) before its thread exits.
+    /// Signal all vcl-io threads to shut down and join them.
+    /// Idempotent.
     pub fn shutdown(&mut self) {
         for w in &mut self.workers {
             if let Some(tx) = w.shutdown_tx.take() {
@@ -283,116 +271,78 @@ impl WorkerPool {
         }
         for w in &mut self.workers {
             if let Some(j) = w.join.take() {
-                // Bound the join by a few seconds via a side thread;
-                // a wedged worker shouldn't block process exit. The
-                // VclApp drop after `WorkerPool::drop` returns will
-                // run `vppcom_app_destroy` and force-clean anything
-                // we left behind.
                 let _ = j.join();
             }
         }
     }
 }
 
-impl Drop for WorkerPool {
+impl Drop for VclIoExecutor {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn worker_thread_main(
+fn vcl_io_thread_main(
     id: usize,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: std_mpsc::SyncSender<Result<(Handle, ReactorCtx)>>,
 ) {
-    // Step 1: register this OS thread as a VCL app-worker. This is
-    // the call that pins this thread to its `__vcl_worker_index` TLS
-    // slot — every VCL session op on this thread thereafter resolves
-    // via this index. Without it, any vppcom_session_* would GP-fault
-    // on `vcm->workers[-1]`.
+    // Register with VLS up front. Under VLS this is technically lazy
+    // (any vls_* op auto-registers), but we want
+    // `vppcom_mq_epoll_fd` (called by `VclReactor::new`) to succeed
+    // on the first try.
     vcl_rs::register_worker_thread();
-    let widx = unsafe { vcl_rs::ffi::vppcom_worker_index() };
-    if widx < 0 {
-        let _ = ready_tx.send(Err(anyhow!(
-            "worker {id}: VCL worker registration failed (rc={widx}) — \
-             likely VPP-side fifo-segment exhaustion; see /Users/.../memory \
-             project_libvppcom_threading.md"
-        )));
-        return;
-    }
-    tracing::info!(worker.id = id, vcl_worker_idx = widx, "VCL worker registered");
 
-    // Step 2: current_thread tokio runtime. Single-threaded by
-    // design — every task scheduled on this runtime runs on this OS
-    // thread, which is the only thread with this worker's VCL context.
-    //
-    // Build the runtime BEFORE the reactor: `VclReactor::new` wraps
-    // the MQ eventfd in `tokio::io::unix::AsyncFd`, which panics if
-    // called outside a tokio runtime context. Entering the runtime
-    // via `Handle::enter()` gives us a guard valid for the rest of
-    // setup; the guard drops before we hand off to `block_on` so
-    // the runtime can take over.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .thread_name(format!("dnsd-vcl-{id}"))
+        .thread_name(format!("dnsd-vcl-io-{id}"))
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = ready_tx.send(Err(anyhow::Error::from(e)
-                .context(format!("worker {id} tokio runtime"))));
+            let _ = ready_tx.send(Err(
+                anyhow::Error::from(e).context(format!("vcl-io-{id} tokio runtime"))
+            ));
             return;
         }
     };
     let handle = rt.handle().clone();
 
-    // Step 3: per-worker reactor. Holds the worker's own MQ epoll
-    // fd, which is distinct from worker-0's. Tokio AsyncFd wraps it
-    // so the reactor wakes when VPP sends an event to THIS app-worker.
-    // Must be created with the runtime context active.
+    // Reactor must be created inside the tokio runtime context —
+    // `tokio::io::unix::AsyncFd::with_interest` panics otherwise.
     let reactor = {
         let _enter = handle.enter();
         match transport::new_reactor() {
             Ok(r) => r,
             Err(e) => {
-                let _ = ready_tx.send(Err(e.context(format!("worker {id} reactor"))));
+                let _ = ready_tx.send(Err(e.context(format!("vcl-io-{id} reactor"))));
                 return;
             }
         }
     };
 
-    // Hand handle + reactor back to main BEFORE entering the run
-    // loop. Main needs both to schedule listener tasks on this
-    // worker.
     if ready_tx.send(Ok((handle, reactor.clone()))).is_err() {
-        // Main has dropped the ready_rx — pool startup aborted. Just
-        // tear down and exit.
         drop(rt);
         return;
     }
 
-    // Step 4: park on shutdown_rx. The runtime stays alive (so any
-    // listener tasks main spawns onto it via `worker.handle.spawn`
-    // get to run) until shutdown fires. Bounded by 1s wake to allow
-    // the runtime to make periodic forward progress on timers / IO
-    // even when no shutdown signal arrives — current_thread runtime
-    // can't run tasks without `block_on` driving it. (`block_on`
-    // doesn't actually need this — it does drive its own poller —
-    // but a periodic wake costs nothing and is a defense if some
-    // future tokio version changes that assumption.)
+    // Park on shutdown_rx. The runtime stays alive (driving its
+    // spawned listener / forwarder tasks) until either the shutdown
+    // sender fires or is dropped. On wake, the runtime drops which
+    // aborts every spawned task; each task's `Drop` runs (closing
+    // sessions, deregistering reactor entries) before the runtime
+    // tears down.
     rt.block_on(async move {
-        // We're driving the runtime via this block_on; the
-        // shutdown_rx await is just a parking primitive. Once it
-        // fires (or its sender drops), we return and `rt` drops,
-        // which aborts every spawned task and lets every Drop run.
         let _ = shutdown_rx.await;
-        // Give in-flight listener tasks a brief window to notice
+        // Brief grace window: lets in-flight listener tasks notice
         // their abort and drop their VclListener / VclStream
-        // cleanly. Without this, the runtime tears down mid-poll
-        // and the reactor's deregister-on-drop racing with task
-        // cancellation can leak waiter entries (harmless but noisy).
+        // cleanly. Without this, the runtime tears down mid-poll and
+        // the reactor's deregister-on-drop racing with task
+        // cancellation can leak waiter entries (harmless but noisy
+        // in logs).
         tokio::time::sleep(Duration::from_millis(50)).await;
     });
 
-    tracing::info!(worker.id = id, "VCL worker thread exiting");
+    tracing::info!(vcl_io_id = id, "vcl-io thread exiting");
 }

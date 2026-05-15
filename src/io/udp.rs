@@ -87,11 +87,18 @@ async fn serve_loop(
         // VPP RX FIFO climbs into the kilobytes and clients time out
         // on queries that are sitting unread.
         //
-        // Per-spawn cap of 256 datagrams keeps the listener from
-        // starving the spawned handler tasks if a flood arrives.
+        // Per-spawn cap of 16 datagrams keeps the listener from
+        // starving the spawned handler tasks — and, critically,
+        // from monopolising the vcl-io thread when other libvppcom-
+        // touching tasks (the forwarder recv_demux_loop, sibling
+        // listeners, per-connection serve loops) need a slice. Each
+        // `try_recv_from` is a libvppcom call with a ~1 ms floor;
+        // 16 calls = ~16 ms between yields, plenty for `recv_demux`
+        // to interleave and drain upstream UDP responses before
+        // their 2.5 s upstream timeout fires.
         let mut drained = 0u32;
         loop {
-            if drained >= 256 {
+            if drained >= 16 {
                 tokio::task::yield_now().await;
                 drained = 0;
             }
