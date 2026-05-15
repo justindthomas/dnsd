@@ -58,6 +58,15 @@ const MAX_BODY_BYTES: usize = 65535;
 /// headers. Clients that haven't sent within this window are
 /// probing / leaking sockets / abandoned half-open connections.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long we'll keep a connection open between requests once
+/// keep-alive is in effect. Long enough for a browser to fire a
+/// burst of DNS lookups on one page load (typically 100ms apart),
+/// short enough that abandoned-but-not-closed sockets free quickly.
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on requests per connection. A well-behaved client will
+/// open a fresh connection well before hitting this; an adversarial
+/// pipeliner is denied the privilege of indefinite pinning.
+const MAX_REQS_PER_CONN: u32 = 1000;
 
 pub struct DohListener;
 
@@ -176,11 +185,20 @@ async fn accept_loop(
     }
 }
 
-/// Serve one HTTP/1.1 request, then close. RFC 8484 DoH clients
-/// open a new TCP+TLS connection per query in practice (browsers
-/// pool but reuse only inside one navigation), and skipping
-/// keep-alive lets us mirror DoT's "read_exact then write_all"
-/// pattern that the VCL substrate is happy with.
+/// Serve one or more HTTP/1.1 requests on a single TCP+TLS
+/// connection. HTTP/1.1 keep-alive is on by default (RFC 7230
+/// §6.3); we honor the client's `Connection: close` header to
+/// shut down after a given request, and self-close after
+/// `MAX_REQS_PER_CONN` requests or after `KEEP_ALIVE_IDLE_TIMEOUT`
+/// of idle. Error responses (4xx/5xx) close unconditionally —
+/// the client's request stream is suspect at that point.
+///
+/// Pipelined requests (client sends N requests in one batch and
+/// reads N responses) are supported: anything we over-read past
+/// the current request's body stays in `pending` and seeds the
+/// next iteration's header read. Browsers typically don't
+/// pipeline, but RFC 7230 §6.3.2 requires us to handle clients
+/// that do.
 async fn serve_one<S>(
     mut stream: tokio_rustls::server::TlsStream<S>,
     peer: SocketAddr,
@@ -192,114 +210,229 @@ async fn serve_one<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // ---- Read headers (request line + headers, up to \r\n\r\n) ----
-    let mut header_buf = Vec::with_capacity(1024);
-    let body_in_buf = {
-        let end = tokio::time::timeout(
-            REQUEST_READ_TIMEOUT,
-            read_until_double_crlf(&mut stream, &mut header_buf),
+    // Bytes already read but not yet consumed — carries over
+    // between requests when a client pipelines.
+    let mut pending: Vec<u8> = Vec::with_capacity(1024);
+    let mut req_count: u32 = 0;
+
+    loop {
+        req_count += 1;
+        if req_count > MAX_REQS_PER_CONN {
+            // The CLOSE is the signal — we deliberately don't
+            // burn a 503 response for the connection budget.
+            return Ok(());
+        }
+        // First request gets the standard "client hasn't started
+        // sending yet" timeout; subsequent requests get the
+        // shorter keep-alive idle timeout (clients on real
+        // browsers send the next query within a few ms when they
+        // need it).
+        let timeout = if req_count == 1 {
+            REQUEST_READ_TIMEOUT
+        } else {
+            KEEP_ALIVE_IDLE_TIMEOUT
+        };
+
+        // Find the end of headers (\r\n\r\n) — either already in
+        // `pending` from over-read, or after one or more reads.
+        let head_end = match tokio::time::timeout(
+            timeout,
+            read_until_double_crlf(&mut stream, &mut pending),
         )
         .await
-        .map_err(|_| anyhow!("request header timeout"))??;
-        // Anything past the header terminator is the start of the
-        // body (matters for POST when body fits in the first read).
-        header_buf.split_off(end)
-    };
+        {
+            Ok(Ok(end)) => end,
+            Ok(Err(e)) => {
+                // EOF on idle keep-alive is the normal close
+                // path — client disconnected cleanly between
+                // requests. Anything else is an error to surface.
+                if req_count > 1
+                    && e.to_string().contains("EOF before HTTP/1.1 headers")
+                {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            Err(_) => {
+                // Timeout. For the first request, propagate as
+                // an error (the client connected but didn't speak
+                // — probing or stuck). For subsequent requests,
+                // it's a clean idle-close.
+                if req_count == 1 {
+                    return Err(anyhow!("request header timeout"));
+                }
+                return Ok(());
+            }
+        };
 
-    // header_buf currently holds everything up to and including the
-    // \r\n\r\n terminator. Strip the trailing 4-byte terminator so
-    // the parser sees a clean sequence of lines with no trailing
-    // empty.
-    let head_end = header_buf
-        .len()
-        .checked_sub(4)
-        .ok_or_else(|| anyhow!("header buffer shorter than CRLF terminator"))?;
-    let (method, path, headers) = parse_request_head(&header_buf[..head_end])
-        .context("HTTP/1.1 request head")?;
+        // Split pending into [headers + \r\n\r\n][body...]. Body
+        // bytes already in pending are kept; we'll consume more
+        // from the stream if Content-Length requires it.
+        let post_terminator: Vec<u8> = pending.split_off(head_end);
+        let head_strip_end = pending
+            .len()
+            .checked_sub(4)
+            .ok_or_else(|| anyhow!("header buffer shorter than CRLF terminator"))?;
 
-    // RFC 9112 §6 / PortSwigger "HTTP/1 must die" — strict
-    // framing-header validation. Reject the constructs that enable
-    // request-smuggling desync (TE, duplicate CL, mixed framing).
-    // We're a single-implementation origin so the classic smuggling
-    // attack chain doesn't apply directly, but accepting these
-    // tokens means our parser is part of a future chain that could
-    // be vulnerable. Refuse upfront, no response (closing on
-    // malformed input minimises information leakage).
-    validate_framing(&headers)?;
+        // Parse + clone into owned strings so `pending` is no longer
+        // borrowed and `handle_request` can mutate it (to stash any
+        // over-read for the next iteration).
+        let (method, path, headers) = {
+            let (m, p, h) =
+                parse_request_head(&pending[..head_strip_end])
+                    .context("HTTP/1.1 request head")?;
+            validate_framing(&h)?;
+            (m.to_string(), p.to_string(), h)
+        };
+        // Now safe to drop the headers part of pending — we have an
+        // owned copy of everything we need. The body might still be
+        // in `post_terminator`.
+        pending.clear();
 
+        // RFC 7230 §6.1: Connection: close means "no more requests
+        // on this connection after the response."
+        let client_close = headers
+            .iter()
+            .any(|(k, v)| k == "connection" && v.eq_ignore_ascii_case("close"));
+        let last_allowed = req_count >= MAX_REQS_PER_CONN;
+        let close = client_close || last_allowed;
+
+        handle_request(
+            &mut stream,
+            peer,
+            &handler,
+            &metrics,
+            &acl,
+            &ctx,
+            &method,
+            &path,
+            &headers,
+            post_terminator,
+            &mut pending,
+            close,
+        )
+        .await?;
+
+        if close {
+            return Ok(());
+        }
+    }
+}
+
+/// Process a single parsed request: ACL check, dispatch, write
+/// response. `body_seed` is whatever came after the headers in
+/// the same read; `pending` is the bag we use to stash any
+/// over-read that's actually the START of the NEXT request.
+/// `close` controls the response's `Connection:` header.
+#[allow(clippy::too_many_arguments)]
+async fn handle_request<S>(
+    stream: &mut tokio_rustls::server::TlsStream<S>,
+    peer: SocketAddr,
+    handler: &SharedHandler,
+    metrics: &Arc<Metrics>,
+    acl: &AclSwap,
+    ctx: &CtxSwap,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body_seed: Vec<u8>,
+    pending: &mut Vec<u8>,
+    close: bool,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     if !acl.load().allows(peer.ip()) {
         metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
-        return send_simple(&mut stream, 403, "Forbidden", b"ACL\n").await;
+        send_simple(stream, 403, "Forbidden", b"ACL\n", true).await?;
+        return Err(anyhow!("ACL denied — closing"));
     }
 
     let wire = match method {
-        "GET" => match parse_get_dns_param(path) {
-            Some(b) => b,
-            None => {
-                return send_simple(
-                    &mut stream,
-                    400,
-                    "Bad Request",
-                    b"missing or malformed dns= parameter\n",
-                )
-                .await
+        "GET" => {
+            // Anything in body_seed for a GET is the start of the
+            // NEXT request — stash it back into pending for the
+            // next loop iteration to consume.
+            *pending = body_seed;
+            match parse_get_dns_param(path) {
+                Some(b) => b,
+                None => {
+                    send_simple(
+                        stream,
+                        400,
+                        "Bad Request",
+                        b"missing or malformed dns= parameter\n",
+                        true,
+                    )
+                    .await?;
+                    return Err(anyhow!("bad GET — closing"));
+                }
             }
-        },
+        }
         "POST" => {
-            if !content_type_is_dns_message(&headers) {
-                return send_simple(
-                    &mut stream,
+            if !content_type_is_dns_message(headers) {
+                send_simple(
+                    stream,
                     415,
                     "Unsupported Media Type",
                     b"expected application/dns-message\n",
+                    true,
                 )
-                .await;
+                .await?;
+                return Err(anyhow!("bad content-type — closing"));
             }
-            let content_length = content_length(&headers).ok_or_else(|| {
-                anyhow!("DoH POST missing Content-Length")
+            let content_length = content_length(headers).ok_or_else(|| {
+                anyhow!("DoH POST missing or invalid Content-Length")
             })?;
             if content_length > MAX_BODY_BYTES {
-                return send_simple(
-                    &mut stream,
+                send_simple(
+                    stream,
                     413,
                     "Payload Too Large",
                     b"DoH body cap\n",
+                    true,
                 )
-                .await;
+                .await?;
+                return Err(anyhow!("body too large — closing"));
             }
-            let mut body = body_in_buf;
-            body.reserve(content_length.saturating_sub(body.len()));
-            while body.len() < content_length {
-                let mut chunk = vec![0u8; content_length - body.len()];
-                let n = stream
-                    .read(&mut chunk)
-                    .await
-                    .context("reading POST body")?;
-                if n == 0 {
-                    return Err(anyhow!("EOF mid-POST-body"));
+            // body_seed might have all of the body, none of it, or
+            // some + start-of-next-request. Take the first
+            // content_length bytes as the body; whatever's left
+            // becomes pending for the next iteration.
+            let mut body = body_seed;
+            if body.len() >= content_length {
+                *pending = body.split_off(content_length);
+            } else {
+                *pending = Vec::new();
+                body.reserve(content_length - body.len());
+                while body.len() < content_length {
+                    let mut chunk = vec![0u8; content_length - body.len()];
+                    let n = stream
+                        .read(&mut chunk)
+                        .await
+                        .context("reading POST body")?;
+                    if n == 0 {
+                        return Err(anyhow!("EOF mid-POST-body"));
+                    }
+                    chunk.truncate(n);
+                    body.extend_from_slice(&chunk);
                 }
-                chunk.truncate(n);
-                body.extend_from_slice(&chunk);
             }
             body
         }
-        // Only GET/POST defined for /dns-query in RFC 8484.
+        // Only GET / POST defined for /dns-query in RFC 8484.
         other => {
             tracing::debug!(%peer, method = %other, "DoH: rejecting non-GET/POST");
-            return send_simple(
-                &mut stream,
-                405,
-                "Method Not Allowed",
-                b"GET or POST\n",
-            )
-            .await;
+            send_simple(stream, 405, "Method Not Allowed", b"GET or POST\n", true)
+                .await?;
+            return Err(anyhow!("bad method — closing"));
         }
     };
 
-    // Only /dns-query is defined. Anything else is 404.
     let path_only = path.split('?').next().unwrap_or("/");
     if path_only != "/dns-query" {
-        return send_simple(&mut stream, 404, "Not Found", b"\n").await;
+        send_simple(stream, 404, "Not Found", b"\n", true).await?;
+        return Err(anyhow!("bad path — closing"));
     }
 
     metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
@@ -310,7 +443,7 @@ where
     tracing::info!(
         %peer,
         method = %method,
-        path = %path.split('?').next().unwrap_or(""),
+        path = %path_only,
         wire_bytes = wire.len(),
         "DoH request",
     );
@@ -319,16 +452,12 @@ where
     let Some(response) =
         handler.handle_bytes(&wire, peer.ip(), &ctx_snap).await
     else {
-        return send_simple(
-            &mut stream,
-            400,
-            "Bad Request",
-            b"malformed DNS query\n",
-        )
-        .await;
+        send_simple(stream, 400, "Bad Request", b"malformed DNS query\n", true)
+            .await?;
+        return Err(anyhow!("malformed DNS — closing"));
     };
     let ttl = min_ttl_from_response(&response).unwrap_or(0);
-    send_dns_response(&mut stream, &response, ttl).await
+    send_dns_response(stream, &response, ttl, close).await
 }
 
 /// Drain bytes from `stream` into `buf` until the `\r\n\r\n` end-
@@ -527,17 +656,19 @@ async fn send_simple<S>(
     status: u16,
     reason: &str,
     body: &[u8],
+    close: bool,
 ) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
+    let connection = if close { "close" } else { "keep-alive" };
     let mut out = Vec::with_capacity(128 + body.len());
     out.extend_from_slice(
         format!(
             "HTTP/1.1 {status} {reason}\r\n\
              content-type: text/plain\r\n\
              content-length: {len}\r\n\
-             connection: close\r\n\
+             connection: {connection}\r\n\
              \r\n",
             len = body.len()
         )
@@ -553,6 +684,7 @@ async fn send_dns_response<S>(
     stream: &mut S,
     body: &[u8],
     ttl: u32,
+    close: bool,
 ) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -562,12 +694,13 @@ where
     } else {
         String::new()
     };
+    let connection = if close { "close" } else { "keep-alive" };
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          content-type: application/dns-message\r\n\
          content-length: {len}\r\n\
          {cache_line}\
-         connection: close\r\n\
+         connection: {connection}\r\n\
          \r\n",
         len = body.len()
     );
