@@ -52,6 +52,20 @@ impl DnsDgramSocket {
     pub async fn send_to(&self, buf: &[u8], peer: SocketAddr) -> io::Result<usize> {
         self.inner.send_to(buf, peer).await
     }
+
+    /// Mirror of the VCL backend: non-blocking single-datagram read
+    /// for the recursor's drain-greedy demux loop.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        match self.inner.try_recv_from(buf) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn wait_readable(&self) -> io::Result<()> {
+        self.inner.readable().await
+    }
 }
 
 // =============================================================================

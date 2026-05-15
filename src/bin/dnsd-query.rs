@@ -46,6 +46,17 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Rust's default startup sets SIGPIPE to SIG_IGN so that writes
+    // to a closed pipe return EPIPE rather than killing the process.
+    // For a CLI, that turns `imp-dnsd-query stats | head` into a
+    // noisy panic ("failed printing to stdout: Broken pipe") — the
+    // panic backtrace clobbers the JSON the user actually saw.
+    // Restore SIG_DFL so we exit silently on EPIPE, matching standard
+    // Unix CLI behavior.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args = Args::parse();
     let req = match args.cmd {
         Cmd::Stats => ControlRequest::Stats,

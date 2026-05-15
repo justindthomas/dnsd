@@ -306,49 +306,71 @@ async fn recv_demux_loop(
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((n, peer)) => {
-                if n < 12 {
-                    tracing::debug!(
+        // Drain greedily before yielding. The default
+        // `sock.recv_from(...).await` checkpoints on every
+        // datagram, and tokio's current_thread scheduler may
+        // interleave dozens of other tasks (DoH connections,
+        // listener accepts, etc.) between datagrams. Under load
+        // that bottlenecks the demux at ~20 datagrams/s while VPP
+        // is queuing >100/s — the RX FIFO grows, callers' 5s
+        // upstream timeouts trip on responses that are actually
+        // sitting in the FIFO unread.
+        //
+        // Pull every queued datagram in one sync-FFI tight loop
+        // first, then park on the reactor. Cap the burst so a
+        // pathological busy session can't monopolize the runtime
+        // (256 chosen as ~10ms of work at realistic line rates).
+        let mut drained = 0u32;
+        loop {
+            if drained >= 256 {
+                // Yield once so other tasks can run, then keep
+                // draining if more datagrams arrived in the
+                // meantime.
+                tokio::task::yield_now().await;
+                drained = 0;
+            }
+            match sock.try_recv_from(&mut buf) {
+                Ok(Some((n, peer))) => {
+                    drained += 1;
+                    if n < 12 {
+                        tracing::debug!(family, %peer, n, "upstream UDP: short response, dropping");
+                        continue;
+                    }
+                    let txid = u16::from_be_bytes([buf[0], buf[1]]);
+                    let key = (peer.ip(), txid);
+                    let resp = buf[..n].to_vec();
+                    let waiter = {
+                        let mut p = pending.lock().unwrap();
+                        p.remove(&key)
+                    };
+                    match waiter {
+                        Some(tx) => {
+                            let _ = tx.send((resp, peer));
+                        }
+                        None => {
+                            tracing::debug!(
+                                family,
+                                %peer,
+                                txid = format!("{:#06x}", txid),
+                                "upstream UDP: unmatched response, dropping"
+                            );
+                        }
+                    }
+                }
+                Ok(None) => break, // FIFO drained — go park
+                Err(e) => {
+                    tracing::warn!(
                         family,
-                        %peer,
-                        n,
-                        "upstream UDP: short response, dropping"
+                        "upstream UDP recv loop error: {e:?} — sleeping briefly"
                     );
-                    continue;
-                }
-                let txid = u16::from_be_bytes([buf[0], buf[1]]);
-                let key = (peer.ip(), txid);
-                let resp = buf[..n].to_vec();
-                let waiter = {
-                    let mut p = pending.lock().unwrap();
-                    p.remove(&key)
-                };
-                match waiter {
-                    Some(tx) => {
-                        let _ = tx.send((resp, peer));
-                    }
-                    None => {
-                        // Late response (caller already timed out
-                        // and dropped its entry), or unsolicited
-                        // packet, or TXID mismatch. Drop silently
-                        // at debug.
-                        tracing::debug!(
-                            family,
-                            %peer,
-                            txid = format!("{:#06x}", txid),
-                            "upstream UDP: unmatched response, dropping"
-                        );
-                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    break;
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    family,
-                    "upstream UDP recv loop error: {e:?} — sleeping briefly"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        }
+        if let Err(e) = sock.wait_readable().await {
+            tracing::warn!(family, "upstream UDP wait_readable: {e:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
