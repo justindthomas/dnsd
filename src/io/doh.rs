@@ -118,6 +118,20 @@ async fn accept_loop(
             drop(stream);
             continue;
         }
+        // Pre-ready short-circuit. If the recursor's startup prewarm
+        // hasn't succeeded, refuse all TCP-style connections at
+        // accept time — DROPPING the stream BEFORE the TLS handshake.
+        // The handshake itself is what saturates the runtime under
+        // load (each TLS read is ~1ms inside libvppcom's MQ-drain);
+        // accepting and TLS-handshaking dozens of Firefox DoH
+        // connections in parallel during startup blocks the recursor
+        // from finishing its prewarm and getting to ready=true at
+        // all. With this gate, busy clients see TCP-RST/quick-close
+        // and back off; once dnsd is ready, accepts proceed normally.
+        if !handler.is_ready() {
+            drop(stream);
+            continue;
+        }
 
         let handler = handler.clone();
         let metrics = metrics.clone();

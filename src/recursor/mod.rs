@@ -705,6 +705,10 @@ const QUERY_BUDGET: Duration = Duration::from_secs(8);
 
 #[async_trait]
 impl DnsHandler for RecursorHandler {
+    fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     async fn handle_bytes(
         &self,
         query: &[u8],

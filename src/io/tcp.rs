@@ -71,6 +71,11 @@ async fn accept_loop(
             drop(stream);
             continue;
         }
+        // Pre-ready short-circuit — see doh.rs for the rationale.
+        if !handler.is_ready() {
+            drop(stream);
+            continue;
+        }
 
         let handler = handler.clone();
         let metrics = metrics.clone();

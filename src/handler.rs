@@ -62,6 +62,26 @@ pub trait DnsHandler: Send + Sync + 'static {
         peer: IpAddr,
         ctx: &ListenerContext,
     ) -> Option<Vec<u8>>;
+
+    /// Startup readiness probe. TCP-style listeners (TCP/DoT/DoH)
+    /// MUST check this at accept time and close the connection
+    /// immediately if it returns false, before any TLS handshake or
+    /// HTTP parse. Without this gate, a busy upstream client (e.g.
+    /// Firefox DoH) can fire many parallel connections during the
+    /// pre-ready window; each accepted connection runs TLS handshake
+    /// work (rustls + libvppcom MQ-drain per read) that monopolises
+    /// the single-thread runtime, starving the recursor's own
+    /// prewarm task and preventing dnsd from ever becoming ready.
+    /// UDP listeners don't need to early-out — `handle_bytes`
+    /// returns REFUSED cheaply and a UDP recvfrom doesn't carry the
+    /// same per-connection cost.
+    ///
+    /// Default true preserves behavior for any handler that doesn't
+    /// have a meaningful readiness signal (the disabled-mode
+    /// `RefusedHandler`, tests, etc.).
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// Build a REFUSED reply mirroring the TXID + question section of
@@ -157,6 +177,10 @@ impl<T: DnsHandler> DnsHandler for LiveHandler<T> {
         // mid-call.
         let h = self.inner.load_full();
         h.handle_bytes(query, peer, ctx).await
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.load().is_ready()
     }
 }
 
