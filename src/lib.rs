@@ -15,6 +15,8 @@ pub mod handler;
 pub mod io;
 pub mod metrics;
 pub mod recursor;
+#[cfg(feature = "vcl")]
+pub mod worker;
 
 pub use config::{DnsConfig, Listener};
 pub use handler::{DnsHandler, RefusedHandler, SharedHandler};

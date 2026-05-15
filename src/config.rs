@@ -58,6 +58,17 @@ pub struct DnsConfig {
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
     pub sfw: Option<SfwHint>,
+    /// Number of TCP-listener worker threads (DoT / DoH / TCP/53).
+    /// Each worker registers as its own VCL app-worker context and
+    /// owns a dedicated `VclReactor`, so VPP's per-VPP-worker
+    /// session distribution lands on a co-located app-worker. UDP
+    /// stays on the main thread regardless — its session pool is
+    /// flat. Unset → 1 (current single-thread behavior). Set higher
+    /// to spread connection-oriented load across CPUs; values above
+    /// `available_parallelism()` waste VPP-side fifo segments without
+    /// adding parallelism.
+    #[serde(default)]
+    pub tcp_workers: Option<u32>,
     /// Per-VRF DNS instances. Each entry has its own listeners /
     /// forwarders / cache / etc. plus a `name` matching a
     /// top-level `vrfs[].name`. impd's supervisor spawns one
@@ -90,6 +101,8 @@ pub struct DnsVrfConfig {
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
     pub sfw: Option<SfwHint>,
+    #[serde(default)]
+    pub tcp_workers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -352,6 +365,7 @@ impl DnsConfig {
             tls: v.tls,
             rate_limit: v.rate_limit,
             sfw: v.sfw,
+            tcp_workers: v.tcp_workers,
             vrfs: Vec::new(),
         })
     }
