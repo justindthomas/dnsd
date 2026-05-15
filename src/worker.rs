@@ -25,14 +25,17 @@
 //! VPP-side fifo segments (128 MB each by default) for connection-
 //! oriented parallelism.
 
+use std::net::IpAddr;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 
+use crate::handler::{DnsHandler, ListenerContext, SharedHandler};
 use crate::io::transport::{self, ReactorCtx};
 
 /// Resolve the effective worker count from config, env, and CPU
@@ -53,16 +56,6 @@ use crate::io::transport::{self, ReactorCtx};
 /// the CPU count buys nothing (the workers contend on the same
 /// physical cores) and burns VPP-side fifo segments (default 128 MB
 /// each per registered VCL worker).
-///
-/// **VLS interaction**: Under VLS in single-worker (lock) mode —
-/// the default — only one underlying VPP worker exists and a second
-/// `vls_bind` on the same address fails ("ip port pair already
-/// listened on"). So `tcp_workers > 1` only works when vcl.conf has
-/// `multi-thread-workers` enabled AND libvppcom is recent enough to
-/// handle session migration without crashing. Tested on 25.10 with
-/// `multi-thread-workers` → crashes inside `vls_mt_session_migrate`
-/// when an accepted session is touched from a non-owning worker.
-/// Keep `tcp_workers = 1` until that's fixed upstream.
 pub fn effective_worker_count(cfg_value: Option<u32>) -> usize {
     let cap = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -108,6 +101,57 @@ mod tests {
         assert_eq!(effective_worker_count(Some(2)), 2usize.min(cap));
         // Above cap: clamped.
         assert_eq!(effective_worker_count(Some(9999)), cap);
+    }
+}
+
+/// `DnsHandler` wrapper that dispatches `handle_bytes` to the main
+/// tokio runtime. Used to keep upstream UDP/TCP queries on the main
+/// thread (= vcl_worker_0), since `AsyncUdpUpstream`'s sockets are
+/// bound there. Without this wrapper, a DoH/DoT request accepted by
+/// a frontend worker would call `handler.handle_bytes(...).await`
+/// in the worker's runtime, whose poll runs on the worker's OS
+/// thread — and the upstream `sendto` would then look up the
+/// upstream session in the wrong VCL worker context, returning
+/// `VPPCOM_EINVAL (-22)`. Surfaced as ~27% upstream-UDP failures
+/// when N=4 first shipped.
+///
+/// The frontend worker still does TCP accept, TLS handshake, HTTP
+/// parsing, and the final response write — only the handler call
+/// (which is mostly upstream I/O) routes through main. So
+/// connection-level parallelism is preserved; the handler is a thin
+/// dispatch shim.
+pub struct MainPinnedHandler {
+    inner: SharedHandler,
+    main_handle: Handle,
+}
+
+impl MainPinnedHandler {
+    pub fn new(inner: SharedHandler, main_handle: Handle) -> Self {
+        Self { inner, main_handle }
+    }
+}
+
+#[async_trait]
+impl DnsHandler for MainPinnedHandler {
+    async fn handle_bytes(
+        &self,
+        query: &[u8],
+        peer: IpAddr,
+        ctx: &ListenerContext,
+    ) -> Option<Vec<u8>> {
+        let inner = self.inner.clone();
+        let query = query.to_vec();
+        let ctx = ctx.clone();
+        let (tx, rx) = oneshot::channel();
+        self.main_handle.spawn(async move {
+            let resp = inner.handle_bytes(&query, peer, &ctx).await;
+            let _ = tx.send(resp);
+        });
+        // If the main runtime is shutting down, the task we spawned
+        // may be dropped before sending; surface as "no response"
+        // (the listener will drop the client connection silently,
+        // same as for a malformed query).
+        rx.await.ok().flatten()
     }
 }
 
@@ -261,14 +305,22 @@ fn worker_thread_main(
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: std_mpsc::SyncSender<Result<(Handle, ReactorCtx)>>,
 ) {
-    // Step 1: register this OS thread with VLS. Under classic
-    // libvppcom this was load-bearing per-thread (the `__vcl_worker_index`
-    // TLS pin); under VLS it's a hint — VLS auto-registers any
-    // thread on its first VLS op via `vls_mt_detect`. We still
-    // call it explicitly so the reactor's `vppcom_mq_epoll_fd()`
-    // fetch later (which DOES need TLS state) succeeds.
+    // Step 1: register this OS thread as a VCL app-worker. This is
+    // the call that pins this thread to its `__vcl_worker_index` TLS
+    // slot — every VCL session op on this thread thereafter resolves
+    // via this index. Without it, any vppcom_session_* would GP-fault
+    // on `vcm->workers[-1]`.
     vcl_rs::register_worker_thread();
-    tracing::info!(worker.id = id, "VLS worker thread registered");
+    let widx = unsafe { vcl_rs::ffi::vppcom_worker_index() };
+    if widx < 0 {
+        let _ = ready_tx.send(Err(anyhow!(
+            "worker {id}: VCL worker registration failed (rc={widx}) — \
+             likely VPP-side fifo-segment exhaustion; see /Users/.../memory \
+             project_libvppcom_threading.md"
+        )));
+        return;
+    }
+    tracing::info!(worker.id = id, vcl_worker_idx = widx, "VCL worker registered");
 
     // Step 2: current_thread tokio runtime. Single-threaded by
     // design — every task scheduled on this runtime runs on this OS
