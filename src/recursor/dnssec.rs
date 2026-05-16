@@ -586,10 +586,18 @@ impl Validator {
     /// proofs that would promote this to Bogus-on-downgrade land in
     /// a v1.x follow-up — for v1 we optimise for not-breaking
     /// legitimately-unsigned zones.
+    /// `validated_zones` is an out-parameter: every delegation step
+    /// whose DS + DNSKEY chain verified is pushed here, in chain
+    /// order, as validation proceeds. On any return path it holds
+    /// exactly the steps proven Secure so far — so even an Insecure
+    /// or Bogus overall result still reports the validated *prefix*
+    /// (e.g. `com` + a signed SLD ahead of a CNAME into an unsigned
+    /// CDN). The recursor uses it to populate the delegation cache.
     pub async fn validate_walk(
         &self,
         walk: &WalkChain,
         answer: &Message,
+        validated_zones: &mut Vec<Name>,
     ) -> ValidationStatus {
         let mut chain_keys: Vec<(Name, Vec<DNSKEY>)> = Vec::new();
 
@@ -770,6 +778,7 @@ impl Validator {
                     Some(StepDnskeyState::Cached(cached_keys)) => {
                         tracing::debug!(zone = %step.zone, "DNSKEY cache hit (positive)");
                         chain_keys.push((step.zone.clone(), cached_keys));
+                        validated_zones.push(step.zone.clone());
                         continue;
                     }
                     Some(StepDnskeyState::Insecure) => {
@@ -856,6 +865,7 @@ impl Validator {
             );
             self.cache.put_positive(zone_key, dnskeys.clone(), ttl);
             chain_keys.push((step.zone.clone(), dnskeys));
+            validated_zones.push(step.zone.clone());
         }
 
         if insecure_from.is_some() {

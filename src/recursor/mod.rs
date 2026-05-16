@@ -329,7 +329,11 @@ impl RecursorHandler {
                         match iter.resolve_with_chain(&q).await {
                             Ok((bytes, chain)) => {
                                 if let Ok(resp) = Message::from_bytes(&bytes) {
-                                    let _ = validator.validate_walk(&chain, &resp).await;
+                                    let mut validated = Vec::new();
+                                    let _ = validator
+                                        .validate_walk(&chain, &resp, &mut validated)
+                                        .await;
+                                    iter.cache_validated_delegations(&chain, &validated);
                                     successes
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::info!(
@@ -1119,7 +1123,10 @@ impl RecursorHandler {
 
         if let Some(validator) = self.validator.as_ref() {
             let val_t0 = Instant::now();
-            let status = validator.validate_walk(&walk_chain, &parsed).await;
+            let mut validated_zones: Vec<hickory_proto::rr::Name> = Vec::new();
+            let status = validator
+                .validate_walk(&walk_chain, &parsed, &mut validated_zones)
+                .await;
             let val_ms = val_t0.elapsed().as_millis() as u64;
             if walk_ms + val_ms >= 200 {
                 tracing::info!(
@@ -1131,6 +1138,15 @@ impl RecursorHandler {
                     "DIAG resolve: walk + validate",
                 );
             }
+            // Cache every delegation step that verified — regardless
+            // of the overall status. The signed prefix of an
+            // Insecure walk (TLD + signed SLD ahead of a CNAME into
+            // an unsigned CDN — the common case for real web
+            // traffic) is a valid, reusable trust path; a future
+            // walk for a sibling name can start there. `validated_
+            // zones` lists exactly the steps that verified, so a
+            // step under a Bogus point is simply absent.
+            iter.cache_validated_delegations(&walk_chain, &validated_zones);
             match status {
                 dnssec::ValidationStatus::Secure => {
                     self.metrics

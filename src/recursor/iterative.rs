@@ -118,6 +118,82 @@ impl WalkChain {
     }
 }
 
+/// Upper bound on how long a validated delegation step stays in the
+/// `DelegationCache`. DS RRsets carry day-scale TTLs, but a DNSKEY
+/// rollover republishes the child's DS; capping at an hour bounds
+/// how long a stale (zone, DS, NS-IPs) tuple can mislead a walk
+/// after a rollover, at negligible cost (a re-walk from root).
+const DELEGATION_CACHE_TTL_CAP: Duration = Duration::from_secs(3600);
+
+struct CachedDelegation {
+    step: ChainStep,
+    expiry: std::time::Instant,
+}
+
+/// Cache of validated delegation steps, keyed by delegated-to zone.
+///
+/// With DNSSEC validation on, `walk()` must normally restart from
+/// the root every query: the validator reconstructs the trust
+/// chain from the `ChainStep`s the walk records, and only records
+/// steps for referrals it actually traversed. Starting a walk at a
+/// cached intermediate zone would leave the validator without that
+/// zone's ancestors' DS/RRSIG and it couldn't build the chain.
+///
+/// This cache breaks that: once a walk's chain validates Secure,
+/// every step in it is stored here. A later walk for any name
+/// under an already-validated zone can then start at that zone and
+/// pre-fill its `WalkChain` with the cached ancestor steps — the
+/// validator sees a complete chain without the walk re-traversing
+/// root → TLD → ... Only fully-Secure walks populate the cache, so
+/// a cached step is always one that verified end-to-end.
+struct DelegationCache {
+    map: std::sync::Mutex<HashMap<Name, CachedDelegation>>,
+}
+
+impl DelegationCache {
+    fn new() -> Self {
+        Self {
+            map: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fetch a still-fresh cached step for `zone`, if any.
+    fn get(&self, zone: &Name) -> Option<ChainStep> {
+        let map = self.map.lock().unwrap();
+        map.get(&zone.to_lowercase()).and_then(|c| {
+            if c.expiry > std::time::Instant::now() {
+                Some(c.step.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Store one validated step. TTL is the min DS-record TTL,
+    /// capped by `DELEGATION_CACHE_TTL_CAP`.
+    fn insert(&self, step: ChainStep) {
+        let min_ds_ttl = step
+            .ds
+            .iter()
+            .map(|r| r.ttl as u64)
+            .min()
+            .unwrap_or(0);
+        if min_ds_ttl == 0 {
+            // No DS / zero TTL — not a cacheable secure delegation.
+            return;
+        }
+        let ttl = Duration::from_secs(min_ds_ttl).min(DELEGATION_CACHE_TTL_CAP);
+        let mut map = self.map.lock().unwrap();
+        map.insert(
+            step.zone.to_lowercase(),
+            CachedDelegation {
+                step,
+                expiry: std::time::Instant::now() + ttl,
+            },
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct IterativeResolver {
     upstream: Arc<UpstreamClient>,
@@ -143,6 +219,10 @@ pub struct IterativeResolver {
     /// recursor collects DS records seen during walks so the
     /// validator can later fetch DNSKEYs and verify the chain.
     dnssec_ok: bool,
+    /// Validated-delegation cache — lets a DNSSEC walk start at an
+    /// already-validated intermediate zone instead of the root.
+    /// Only consulted / populated when `dnssec_ok`.
+    delegation_cache: Arc<DelegationCache>,
 }
 
 impl IterativeResolver {
@@ -188,6 +268,7 @@ impl IterativeResolver {
             max_cname: max_cname.max(1).min(DEFAULT_MAX_CNAME * 2),
             ipv6_upstream,
             dnssec_ok,
+            delegation_cache: Arc::new(DelegationCache::new()),
         };
 
         // Prime the root-hint set in the background: query `./NS`
@@ -322,17 +403,23 @@ impl IterativeResolver {
         // any other .com domain in the recent past. Falls back to the
         // root when nothing's cached. Each referral replaces both.
         //
-        // When DNSSEC validation is on, we MUST always start at the
-        // root: the validator builds the trust chain from the
-        // chain.steps the walk records, and a step is recorded ONLY
-        // for referrals we actually traversed. Starting from a
-        // cached intermediate (say `.net`) means the validator
-        // never validates `.net`'s DS/DNSKEY for the current walk
-        // and so has no `.net` keys when it tries to verify the
-        // child zone's DS RRSIG. Cold-start latency hit, but
-        // correctness wins.
+        // With DNSSEC validation on, a walk can't just start at a
+        // cached NS delegation the way the plaintext path does: the
+        // validator builds the trust chain from the `ChainStep`s
+        // the walk records, and only records steps for referrals it
+        // actually traversed. Starting cold from a cached `.net`
+        // would leave the validator without `.net`'s ancestors'
+        // DS/RRSIG. The `DelegationCache` lifts that restriction —
+        // `cached_delegation_start` pre-fills `chain` with the
+        // already-validated ancestor steps, so the walk can resume
+        // mid-tree AND the validator still sees a complete chain.
+        // Falls back to root when no usable validated prefix is
+        // cached (cold start, or post-TTL).
         let (mut current_zone, mut ns_ips) = if self.dnssec_ok {
-            (Name::root(), self.roots.read().unwrap().clone())
+            self.cached_delegation_start(qname, chain)
+                .unwrap_or_else(|| {
+                    (Name::root(), self.roots.read().unwrap().clone())
+                })
         } else {
             self.closest_cached_zone(qname, qclass)
                 .await
@@ -820,6 +907,84 @@ impl IterativeResolver {
         let Ok(bytes) = msg.to_vec() else { return };
         let key = CacheKey::new(zone, RecordType::NS, DNSClass::IN);
         self.cache.put(key, &msg, bytes).await;
+    }
+
+    /// Store the validated delegation steps of a walk.
+    /// `validated_zones` is the validator's report of which steps'
+    /// DS + DNSKEY + RRSIG chains verified — only those are cached,
+    /// so a cached step is always a proven trust link even when the
+    /// walk's overall result was Insecure or Bogus (the step under
+    /// a Bogus point simply isn't in the list).
+    pub fn cache_validated_delegations(
+        &self,
+        chain: &WalkChain,
+        validated_zones: &[Name],
+    ) {
+        if !self.dnssec_ok || validated_zones.is_empty() {
+            return;
+        }
+        let mut stored: Vec<String> = Vec::new();
+        for step in &chain.steps {
+            if validated_zones.iter().any(|z| z == &step.zone) {
+                self.delegation_cache.insert(step.clone());
+                stored.push(step.zone.to_string());
+            }
+        }
+        if !stored.is_empty() {
+            tracing::info!(
+                zones = ?stored,
+                "delegation-cache: stored validated steps",
+            );
+        }
+    }
+
+    /// For a DNSSEC walk, try to start at an already-validated
+    /// intermediate zone instead of the root. Builds the longest
+    /// contiguous run of cached ancestor `ChainStep`s for `qname`,
+    /// pre-fills `chain` with them so the validator still sees a
+    /// complete trust path, and returns the `(zone, ns_ips)` the
+    /// walk should resume from. `None` → caller starts from root.
+    ///
+    /// Contiguity from the shallowest ancestor is required: the
+    /// validator promotes trust step by step, each verified under
+    /// its parent, so a gap would leave a step unvalidatable.
+    fn cached_delegation_start(
+        &self,
+        qname: &Name,
+        chain: &mut WalkChain,
+    ) -> Option<(Name, Vec<IpAddr>)> {
+        // Ancestor zones, shallowest-first: for `c.arstechnica.com`
+        // → [`com`, `arstechnica.com`]. Excludes root and qname.
+        let mut ancestors: Vec<Name> = Vec::new();
+        let mut z = qname.base_name();
+        while z.num_labels() >= 1 {
+            ancestors.push(z.clone());
+            z = z.base_name();
+        }
+        ancestors.reverse();
+
+        let mut prefix: Vec<ChainStep> = Vec::new();
+        for zone in &ancestors {
+            match self.delegation_cache.get(zone) {
+                Some(step) => prefix.push(step),
+                None => break,
+            }
+        }
+        let last = prefix.last()?;
+        let start_zone = last.zone.clone();
+        let start_ips = last.ns_ips.clone();
+        if start_ips.is_empty() {
+            return None;
+        }
+        let prefix_len = prefix.len();
+        chain.steps = prefix;
+        tracing::info!(
+            qname = %qname,
+            start_zone = %start_zone,
+            prefix_steps = prefix_len,
+            "delegation-cache: starting walk below root",
+        );
+        Some((start_zone, start_ips))
     }
 
     /// Find the closest ancestor zone of `qname` whose NS record set
