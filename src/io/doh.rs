@@ -497,7 +497,7 @@ where
     let Some(response) =
         handler.handle_bytes(&wire, peer.ip(), &ctx_snap).await
     else {
-        tracing::info!(%peer, "DIAG doh: handler returned None");
+        tracing::debug!(%peer, "doh: handler returned None");
         send_simple(stream, 400, "Bad Request", b"malformed DNS query\n", true)
             .await?;
         return Err(anyhow!("malformed DNS — closing"));
@@ -507,14 +507,14 @@ where
     let resp_len = response.len();
     match send_dns_response(stream, &response, ttl, close).await {
         Ok(()) => {
-            tracing::info!(
+            tracing::debug!(
                 %peer, resp_bytes = resp_len, handler_ms, close,
-                "DIAG doh: response sent",
+                "doh: response sent",
             );
             Ok(())
         }
         Err(e) => {
-            tracing::info!(%peer, "DIAG doh: response write failed: {e:#}");
+            tracing::debug!(%peer, "doh: response write failed: {e:#}");
             Err(e)
         }
     }

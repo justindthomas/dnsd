@@ -223,7 +223,7 @@ impl UpstreamUdpChannel {
         let timed = tokio::time::timeout(timeout, rx).await;
         let wait_ms = wait_t0.elapsed().as_millis() as u64;
         if send_ms + wait_ms >= 500 {
-            tracing::info!(
+            tracing::debug!(
                 %peer,
                 send_ms,
                 wait_ms,
@@ -232,7 +232,7 @@ impl UpstreamUdpChannel {
                     Ok(Err(_)) => "chan-closed",
                     Err(_) => "timeout",
                 },
-                "DIAG upstream-udp: slow channel query",
+                "upstream-udp: slow channel query",
             );
         }
         let (resp, from) = match timed {
@@ -499,11 +499,11 @@ async fn recv_demux_loop(
         // wakes every ~10ms (the reactor tick) draining 0-1.
         let total = drained;
         if wake_gap_ms >= 100 || total > 8 {
-            tracing::info!(
+            tracing::debug!(
                 family,
                 wake_gap_ms,
                 drained = total,
-                "DIAG demux: wake",
+                "demux: wake",
             );
         }
         if let Err(e) = sock.wait_readable().await {
@@ -836,11 +836,11 @@ impl UpstreamClient {
             // success from a slow failure.
             let tcp_t0 = std::time::Instant::now();
             let r = self.query_one_tcp(peer, &tcp_out, tcp_txid, &tcp_mask).await;
-            tracing::info!(
+            tracing::debug!(
                 %peer,
                 tcp_ms = tcp_t0.elapsed().as_millis() as u64,
                 ok = r.is_ok(),
-                "DIAG upstream-tcp: TC=1 fallback",
+                "upstream-tcp: TC=1 fallback",
             );
             r?
         } else {

@@ -906,11 +906,11 @@ impl RecursorHandler {
         let _coalesce_guard = coalesce_lock.lock().await;
         let coalesce_wait_ms = coalesce_t0.elapsed().as_millis() as u64;
         if coalesce_wait_ms >= 50 {
-            tracing::info!(
+            tracing::debug!(
                 qname = %&q.name,
                 qtype = ?q.query_type(),
                 coalesce_wait_ms,
-                "DIAG handle: waited on in_flight coalesce lock",
+                "handle: waited on in_flight coalesce lock",
             );
         }
         if let Some(cached) = self.cache.get(&key).await {
@@ -1129,13 +1129,13 @@ impl RecursorHandler {
                 .await;
             let val_ms = val_t0.elapsed().as_millis() as u64;
             if walk_ms + val_ms >= 200 {
-                tracing::info!(
+                tracing::debug!(
                     qname = %&q.name,
                     qtype = ?q.query_type(),
                     walk_ms,
                     val_ms,
                     chain_steps = walk_chain.steps.len(),
-                    "DIAG resolve: walk + validate",
+                    "resolve: walk + validate",
                 );
             }
             // Cache every delegation step that verified — regardless

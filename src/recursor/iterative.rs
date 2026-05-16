@@ -445,7 +445,7 @@ impl IterativeResolver {
             let resp = self
                 .query_ns_set(&ns_ips, qname, qtype, qclass, budget)
                 .await?;
-            tracing::info!(
+            tracing::debug!(
                 qname = %qname,
                 qtype = ?qtype,
                 zone = %current_zone,
@@ -453,7 +453,7 @@ impl IterativeResolver {
                 ns_count = ns_ips.len(),
                 stage_ms = qns_t0.elapsed().as_millis() as u64,
                 walk_ms = walk_t0.elapsed().as_millis() as u64,
-                "DIAG walk: query_ns_set done",
+                "walk: query_ns_set done",
             );
 
             match classify(&resp, qname, qtype) {
@@ -530,7 +530,7 @@ impl IterativeResolver {
                     ns_ips = self
                         .resolve_ns_ips(&ns_records, &glue, qclass, budget)
                         .await?;
-                    tracing::info!(
+                    tracing::debug!(
                         qname = %qname,
                         zone = %current_zone,
                         hop,
@@ -539,7 +539,7 @@ impl IterativeResolver {
                         ns_resolved = ns_ips.len(),
                         stage_ms = rni_t0.elapsed().as_millis() as u64,
                         walk_ms = walk_t0.elapsed().as_millis() as u64,
-                        "DIAG walk: resolve_ns_ips done",
+                        "walk: resolve_ns_ips done",
                     );
                     if ns_ips.is_empty() {
                         return Err(anyhow!(
@@ -615,11 +615,11 @@ impl IterativeResolver {
                 // TC=1; this measures the whole per-NS attempt.
                 let t0 = std::time::Instant::now();
                 let res = upstream.query(&[ip], &wire[..]).await;
-                tracing::info!(
+                tracing::debug!(
                     ns_ip = %ip,
                     ms = t0.elapsed().as_millis() as u64,
                     ok = res.is_ok(),
-                    "DIAG walk: ns query",
+                    "walk: ns query",
                 );
                 (ip, res)
             })
@@ -931,7 +931,7 @@ impl IterativeResolver {
             }
         }
         if !stored.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 zones = ?stored,
                 "delegation-cache: stored validated steps",
             );
@@ -978,7 +978,7 @@ impl IterativeResolver {
         }
         let prefix_len = prefix.len();
         chain.steps = prefix;
-        tracing::info!(
+        tracing::debug!(
             qname = %qname,
             start_zone = %start_zone,
             prefix_steps = prefix_len,
