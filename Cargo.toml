@@ -30,8 +30,13 @@ rustls-pki-types = "1"
 # same read_exact/write_all primitives DoT uses (see io/doh.rs
 # header comment). No hyper/axum here — they wedged under VCL.
 
-# ACME
-rustls-acme = { version = "0.15", features = ["ring"] }
+# ACME — pinned to the IP-address-certificate branch (rust-proxy
+# fork, PR FlorianUekermann/rustls-acme#91). Upstream 0.15 models
+# only DNS identifiers; this rev adds Identifier::Ip + the LE
+# `shortlived` profile so a cert can carry iPAddress SANs, which
+# RFC 9462 DDR verified discovery requires. Revisit once #91 merges
+# and ships in a crates.io release.
+rustls-acme = { git = "https://github.com/rust-proxy/rustls-acme", rev = "27c0b4ebfe1e0ec4711e8e63eface99b8b6bf2c8", features = ["ring"] }
 futures = "0.3"
 instant-acme = { version = "0.7", optional = true }  # only for dns-01 path
 async-trait = "0.1"
