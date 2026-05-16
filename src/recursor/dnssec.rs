@@ -1327,7 +1327,22 @@ fn validate_answer_against_chain(
 
     let mut saw_secure = false;
     for ((name, rtype, _class), rrset) in &groups {
-        let (sig, _sig_rec) = match sigs.iter().find(|(s, _)| s.input().type_covered == *rtype) {
+        // Match the RRSIG to this RRset by BOTH type_covered AND
+        // owner name. Matching on type alone is wrong for a CNAME
+        // chain: the answer carries one CNAME RRSIG per hop, each
+        // owned by a different name and signed by a different zone
+        // (g.live.com's CNAME signed by live.com, g.msn.com's by
+        // msn.com, ...). A type-only `find` grabs the first CNAME
+        // RRSIG regardless of owner, so a deeper hop's RRset gets
+        // verified under the wrong zone's keys and the whole answer
+        // is wrongly called Bogus. An RRSIG record's own owner name
+        // IS the owner name of the RRset it covers (RFC 4034 §3),
+        // so compare against `sig_rec.name`. Lowercased on both
+        // sides — 0x20 randomisation can leave mixed case here.
+        let name_lc = name.to_lowercase();
+        let (sig, _sig_rec) = match sigs.iter().find(|(s, sig_rec)| {
+            s.input().type_covered == *rtype && sig_rec.name.to_lowercase() == name_lc
+        }) {
             Some(s) => s,
             None => return ValidationStatus::Insecure, // unsigned RRset
         };
