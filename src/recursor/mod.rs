@@ -26,6 +26,7 @@ pub mod anchor;
 pub mod cache;
 pub mod cookies;
 pub mod forwarder;
+pub mod ddr;
 pub mod dns64;
 pub mod dnssec;
 pub mod ipv4only;
@@ -84,6 +85,11 @@ pub struct RecursorHandler {
     validator: Option<Arc<dnssec::Validator>>,
     rrl: Option<Arc<Rrl>>,
     iterative: Option<Arc<IterativeResolver>>,
+    /// Precomputed RFC 9462 DDR answer for `_dns.resolver.arpa` / SVCB,
+    /// built once from the DoT listener set + the TLS cert domain.
+    /// `None` disables DDR (no DoT listener, or no global-scope DoT
+    /// address to point clients at).
+    ddr_svcb: Option<hickory_proto::rr::rdata::svcb::SVCB>,
     /// Short-lived "this iterative walk just failed" cache. Without
     /// it, a name like `detectportal.firefox.com` (which Firefox
     /// retries every 1-2 s for the captive-portal probe) burns a
@@ -720,6 +726,27 @@ impl RecursorHandler {
             None
         };
 
+        // RFC 9462 DDR: precompute the `_dns.resolver.arpa` SVCB
+        // answer from the DoT listener set + the TLS cert's primary
+        // domain. `None` — DDR off — when there is no DoT listener,
+        // no cert domain, or no global-scope DoT address.
+        let ddr_svcb = {
+            let dot_addrs: Vec<std::net::IpAddr> = cfg
+                .listeners
+                .iter()
+                .filter(|l| {
+                    l.protocols.iter().any(|p| p.eq_ignore_ascii_case("dot"))
+                })
+                .map(|l| l.address)
+                .collect();
+            cfg.tls
+                .as_ref()
+                .and_then(|t| t.acme.as_ref())
+                .and_then(|a| a.domains.first())
+                .and_then(|d| hickory_proto::rr::Name::from_ascii(d).ok())
+                .and_then(|name| ddr::build_svcb(&name, &dot_addrs))
+        };
+
         Ok(Self {
             cache,
             forwarders,
@@ -730,6 +757,7 @@ impl RecursorHandler {
             validator,
             rrl,
             iterative,
+            ddr_svcb,
             neg_resolve_cache: Arc::new(NegResolveCache::new()),
             in_flight: Arc::new(InFlightMap::new()),
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -844,6 +872,15 @@ impl RecursorHandler {
         if ipv4only::is_local_question(&q.name, q.query_type()) {
             let synth = ipv4only::synth_response(&msg, self.dns64.as_deref(), ctx.dns64);
             return synth.to_vec().ok();
+        }
+
+        // (3a′) RFC 9462 DDR: answer `_dns.resolver.arpa` locally —
+        // SVCB gets the designated-resolver record, every other qtype
+        // NODATA — so the name never recurses to public resolver.arpa.
+        if let Some(svcb) = &self.ddr_svcb {
+            if ddr::is_ddr_question(&q.name) {
+                return ddr::synth_response(&msg, svcb).to_vec().ok();
+            }
         }
 
         // (3b) DNS64 PTR short-circuit: rewrite the question, send it
