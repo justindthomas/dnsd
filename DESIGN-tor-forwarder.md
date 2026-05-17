@@ -176,8 +176,40 @@ reaching tord is the routable-`socks_listen` case (tord DESIGN.md
    over the bundled webpki-roots set, ALPN `dot`, RFC 1035 length
    framing. 4 unit tests (framing + config build); the TLS handshake
    itself is covered by the phase-5 integration test.
-4. `query_one` integration + fail-closed; the `force_tcp` and DoT
-   direct paths fall out of the same branching.
+4. **(next) Forwarder query integration.** Reading the live query
+   path showed it needs more than first assumed — the refined plan:
+   - **A new `transport::connect_stream(addr, source, ctx, timeout)`
+     primitive.** The transport layer today exposes only the
+     all-in-one `query_tcp_dns_async` (connect + frame + query in one
+     vcl-rs call) — there is no way to get a *bare connected client
+     stream* to layer SOCKS + TLS onto. Add `connect_stream` to both
+     the `vcl` and `kernel-sockets` backends (vcl →
+     `VclStream::connect_async`; kernel → `tokio::net::TcpStream`).
+     Verify the pinned vcl-rs SHA exposes `connect_async`.
+   - `UpstreamClient` gains a `tor_socks: Option<SocketAddr>` field
+     (from `dns.tor_socks`) and a new `query_forwarder(&[Forwarder
+     Server], query)` that branches per server: `udp/direct` →
+     existing `query_one`; `dot/direct` → `connect_stream` +
+     `dot_client::query_dot`; `dot/tor` → `connect_stream` to
+     `tor_socks` + `socks::connect` + `dot_client::query_dot`. The
+     DoT path runs on a vcl-io worker — same dispatch as
+     `query_one_tcp`.
+   - Shared `prepare` / `finalize` helpers (TXID + 0x20 build,
+     response normalise + TXID restore) so the DoT path and
+     `query_one` cannot drift.
+   - config: add `dns.tor_socks`; rework `resolved_servers()` —
+     `via: tor` **requires `transport: dot`** (plain TCP would expose
+     the queries to the Tor exit), and a forwarder may **not mix**
+     `via: tor` and `via: direct` servers. The no-mix rule makes
+     fail-closed *structural* — with tor-only and direct-only
+     forwarders there is no code path that can fall from a tor
+     server to a direct one.
+   - recursor/mod.rs: the two sites pass `&[ForwarderServer]` to
+     `query_forwarder` (reverting phase 1's address extraction).
+
+   **Atomic:** the config relaxation and the query path must land in
+   one commit — relaxing validation without the query path honouring
+   it means a `via: tor` config silently does direct UDP (a leak).
 5. Circuit-isolation username, connection reuse, the slim suite.
 
 ## 11. Decisions & open questions
