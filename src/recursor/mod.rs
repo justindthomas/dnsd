@@ -979,7 +979,10 @@ impl RecursorHandler {
                 self.metrics
                     .forwarder_matched
                     .fetch_add(1, Ordering::Relaxed);
-                s.to_vec()
+                // Phase 1: every forwarder server is direct UDP
+                // (config validation rejects dot / tor for now), so
+                // the upstream query takes just the addresses.
+                s.iter().map(|fs| fs.address).collect::<Vec<_>>()
             }
             None => {
                 // No forwarder match — fall through to iterative
@@ -1310,7 +1313,7 @@ impl RecursorHandler {
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let servers = self.forwarders.lookup(qname)?;
-        let servers = servers.to_vec();
+        let servers: Vec<_> = servers.iter().map(|fs| fs.address).collect();
         let q_bytes = query_msg.to_vec().ok()?;
         let resp_bytes = self.upstream.query(&servers, &q_bytes).await.ok()?;
         if let Ok(parsed) = Message::from_bytes(&resp_bytes) {

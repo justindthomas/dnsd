@@ -249,10 +249,7 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 .load()
                 .snapshot()
                 .into_iter()
-                .map(|(domain, servers)| ForwarderInfo {
-                    domain,
-                    servers: servers.iter().map(|s| s.to_string()).collect(),
-                })
+                .map(|(domain, servers)| ForwarderInfo { domain, servers })
                 .collect();
             ControlResponse::Forwarders { forwarders }
         }

@@ -163,9 +163,11 @@ reaching tord is the routable-`socks_listen` case (tord DESIGN.md
 
 ## 10. Phasing
 
-1. Config schema + the `Vec<IpAddr>` → `Vec<ForwarderServer>` ripple
-   (no behaviour change for bare-IP servers). Tests for parse +
-   validation.
+1. ✅ **Done.** Config schema + the `Vec<IpAddr>` →
+   `Vec<ForwarderServer>` ripple, no behaviour change for bare-IP
+   servers; `Forwarder::resolved_servers()` validates and rejects
+   not-yet-wired combinations (tcp/dot/`via: tor`). Parse +
+   validation tests; 112 dnsd tests green.
 2. SOCKS5 client module + unit tests.
 3. DoT client module + unit tests.
 4. `query_one` integration + fail-closed; the `force_tcp` and DoT

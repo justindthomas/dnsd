@@ -133,11 +133,129 @@ fn default_port() -> u16 { 53 }
 
 pub const DEFAULT_MAX_INFLIGHT: u32 = 1024;
 
+/// Upstream transport for a forwarder server.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    /// Classic DNS over UDP, with TC→TCP fallback. The default.
+    #[default]
+    Udp,
+    /// DNS over TCP only.
+    Tcp,
+    /// DNS over TLS, RFC 7858.
+    Dot,
+}
+
+/// How a forwarder server is reached.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// Straight out the upstream path. The default.
+    #[default]
+    Direct,
+    /// Through tord's SOCKS5 endpoint — anonymised over Tor.
+    Tor,
+}
+
+/// A forwarder server in normalised form — see
+/// `Forwarder::resolved_servers`.
+#[derive(Debug, Clone)]
+pub struct ForwarderServer {
+    pub address: IpAddr,
+    pub transport: Transport,
+    /// TLS server name to verify; required when `transport` is `Dot`.
+    pub tls_name: Option<String>,
+    pub via: Via,
+}
+
+/// On-disk forwarder server: either a bare IP string (back-compat —
+/// direct UDP) or a full mapping.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ServerSpec {
+    Bare(IpAddr),
+    Full(ServerSpecFull),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerSpecFull {
+    pub address: IpAddr,
+    #[serde(default)]
+    pub transport: Transport,
+    #[serde(default)]
+    pub tls_name: Option<String>,
+    #[serde(default)]
+    pub via: Via,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Forwarder {
     pub domain: String,
     #[serde(default)]
-    pub servers: Vec<IpAddr>,
+    pub servers: Vec<ServerSpec>,
+}
+
+impl Forwarder {
+    /// Normalise the on-disk server list into `ForwarderServer`s and
+    /// validate it. A bare IP becomes a direct-UDP server (unchanged
+    /// behaviour). Combinations not yet wired into the query path are
+    /// rejected here, so a config can't promise anonymity dnsd does
+    /// not yet deliver — see DESIGN-tor-forwarder.md.
+    pub fn resolved_servers(&self) -> Result<Vec<ForwarderServer>> {
+        let mut out = Vec::with_capacity(self.servers.len());
+        for spec in &self.servers {
+            let srv = match spec {
+                ServerSpec::Bare(ip) => ForwarderServer {
+                    address: *ip,
+                    transport: Transport::Udp,
+                    tls_name: None,
+                    via: Via::Direct,
+                },
+                ServerSpec::Full(f) => ForwarderServer {
+                    address: f.address,
+                    transport: f.transport,
+                    tls_name: f.tls_name.clone(),
+                    via: f.via,
+                },
+            };
+            if srv.transport == Transport::Dot && srv.tls_name.is_none() {
+                anyhow::bail!(
+                    "forwarder {}: server {} sets transport: dot but no tls_name",
+                    self.domain,
+                    srv.address,
+                );
+            }
+            // Phase 1: only direct UDP is wired into the upstream
+            // query path. TCP / DoT / via: tor parse but are not yet
+            // implemented — reject loudly rather than silently doing
+            // the wrong (possibly de-anonymising) thing.
+            if srv.transport != Transport::Udp {
+                anyhow::bail!(
+                    "forwarder {}: transport: {} is not yet implemented \
+                     (see DESIGN-tor-forwarder.md)",
+                    self.domain,
+                    transport_name(srv.transport),
+                );
+            }
+            if srv.via != Via::Direct {
+                anyhow::bail!(
+                    "forwarder {}: via: tor is not yet implemented \
+                     (see DESIGN-tor-forwarder.md)",
+                    self.domain,
+                );
+            }
+            out.push(srv);
+        }
+        Ok(out)
+    }
+}
+
+fn transport_name(t: Transport) -> &'static str {
+    match t {
+        Transport::Udp => "udp",
+        Transport::Tcp => "tcp",
+        Transport::Dot => "dot",
+    }
 }
 
 /// Operator-facing DNSSEC mode. Maps 1:1 onto
@@ -420,6 +538,50 @@ dns:
         assert_eq!(dns.forwarders[1].servers.len(), 2);
         let rec = dns.recursion.unwrap();
         assert!(rec.enabled && rec.dnssec_validate);
+    }
+
+    #[test]
+    fn forwarder_bare_and_full_specs() {
+        let raw = r#"
+dns:
+  forwarders:
+    - domain: a.example
+      servers: [10.0.0.1, 10.0.0.2]
+    - domain: b.example
+      servers:
+        - { address: "10.0.0.3", transport: udp, via: direct }
+"#;
+        let dns = serde_yaml::from_str::<RouterYaml>(raw).unwrap().dns.unwrap();
+        // Bare IPs normalise to direct UDP.
+        let a = dns.forwarders[0].resolved_servers().unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].transport, Transport::Udp);
+        assert_eq!(a[0].via, Via::Direct);
+        // An explicit udp/direct full spec also resolves.
+        let b = dns.forwarders[1].resolved_servers().unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].address.to_string(), "10.0.0.3");
+    }
+
+    #[test]
+    fn forwarder_rejects_unimplemented_specs() {
+        // transport: dot without tls_name.
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  forwarders:\n    - domain: x\n      servers:\n        - { address: \"9.9.9.9\", transport: dot }\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
+        assert!(dns.forwarders[0].resolved_servers().is_err());
+
+        // via: tor is not yet wired into the query path (phase 1).
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  forwarders:\n    - domain: x\n      servers:\n        - { address: \"9.9.9.9\", via: tor }\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
+        assert!(dns.forwarders[0].resolved_servers().is_err());
     }
 
     fn vrf_yaml() -> &'static str {

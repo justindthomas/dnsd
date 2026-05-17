@@ -29,7 +29,7 @@ use rand::RngExt;
 use tokio::sync::oneshot;
 use crate::io::transport::{self, DnsDgramSocket, ReactorCtx};
 
-use crate::config::Forwarder as ForwarderCfg;
+use crate::config::{Forwarder as ForwarderCfg, ForwarderServer};
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
 const MAX_TCP_MESSAGE: usize = 65535;
@@ -54,17 +54,22 @@ pub struct Forwarders {
 #[derive(Clone, Debug)]
 struct ForwarderEntry {
     domain: Name,
-    servers: Vec<std::net::IpAddr>,
+    servers: Vec<ForwarderServer>,
 }
 
 impl Forwarders {
     /// Snapshot of the current forwarder table for control-socket
     /// inspection. Returns (domain, server list) in longest-suffix-
     /// first order — the same order `lookup()` walks.
-    pub fn snapshot(&self) -> Vec<(String, Vec<std::net::IpAddr>)> {
+    pub fn snapshot(&self) -> Vec<(String, Vec<String>)> {
         self.entries
             .iter()
-            .map(|e| (e.domain.to_string(), e.servers.clone()))
+            .map(|e| {
+                (
+                    e.domain.to_string(),
+                    e.servers.iter().map(|s| s.address.to_string()).collect(),
+                )
+            })
             .collect()
     }
 
@@ -80,7 +85,7 @@ impl Forwarders {
             domain.set_fqdn(true);
             entries.push(ForwarderEntry {
                 domain: domain.to_lowercase(),
-                servers: c.servers.clone(),
+                servers: c.resolved_servers()?,
             });
         }
         // Longest-suffix wins → sort by label count descending.
@@ -92,7 +97,7 @@ impl Forwarders {
     /// suffix of `qname`, preferring the most specific match. A
     /// domain of "." (the root) would match everything; operators
     /// who want a global forwarder should configure it explicitly.
-    pub fn lookup(&self, qname: &Name) -> Option<&[std::net::IpAddr]> {
+    pub fn lookup(&self, qname: &Name) -> Option<&[ForwarderServer]> {
         let lq = qname.to_lowercase();
         self.entries
             .iter()
@@ -975,8 +980,17 @@ mod tests {
     fn fwd(domain: &str, servers: &[&str]) -> ForwarderCfg {
         ForwarderCfg {
             domain: domain.into(),
-            servers: servers.iter().map(|s| s.parse().unwrap()).collect(),
+            servers: servers
+                .iter()
+                .map(|s| crate::config::ServerSpec::Bare(s.parse().unwrap()))
+                .collect(),
         }
+    }
+
+    /// Extract just the addresses from a `lookup` result for
+    /// assertions (phase 1 — every server is direct UDP).
+    fn addrs(servers: &[ForwarderServer]) -> Vec<std::net::IpAddr> {
+        servers.iter().map(|s| s.address).collect()
     }
 
     #[test]
@@ -991,12 +1005,12 @@ mod tests {
         let hit = f
             .lookup(&Name::from_ascii("foo.k8s.jdt.io.").unwrap())
             .unwrap();
-        assert_eq!(hit, &["10.42.113.4".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(addrs(hit), vec!["10.42.113.4".parse::<std::net::IpAddr>().unwrap()]);
 
         let hit2 = f.lookup(&Name::from_ascii("www.jdt.io.").unwrap()).unwrap();
         assert_eq!(
-            hit2,
-            &["10.42.128.19".parse::<std::net::IpAddr>().unwrap()]
+            addrs(hit2),
+            vec!["10.42.128.19".parse::<std::net::IpAddr>().unwrap()]
         );
 
         let hit3 = f
@@ -1021,6 +1035,6 @@ mod tests {
         let hit = f
             .lookup(&Name::from_ascii("www.iana.org.").unwrap())
             .unwrap();
-        assert_eq!(hit, &["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(addrs(hit), vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]);
     }
 }
