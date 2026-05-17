@@ -569,6 +569,7 @@ dependencies = [
  "data-encoding",
  "futures",
  "governor",
+ "h2",
  "hickory-proto",
  "hickory-resolver",
  "http",

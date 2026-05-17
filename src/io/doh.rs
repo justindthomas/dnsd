@@ -20,11 +20,13 @@
 //! Response content-type is always `application/dns-message`; the
 //! upstream cache's TTL feeds into `Cache-Control: max-age=<ttl>`.
 //!
-//! ALPN advertises `h2` and `http/1.1`. We only serve HTTP/1.1
-//! today — if a client negotiates h2 we close the connection
-//! cleanly (clients fall back to h1 on the next attempt). HTTP/2
-//! support is a follow-up; it'd require a frame-level parser of
-//! similar shape.
+//! Both HTTP/1.1 and HTTP/2 are served. ALPN advertises `h2` and
+//! `http/1.1`; rustls negotiates by server preference. h2 is
+//! handled by `serve_h2` using the `h2` framing crate — a pure
+//! frame codec over the same `TlsStream` the HTTP/1.1 path uses,
+//! NOT hyper (hyper wedges on VCL; see above and CLAUDE.md). h2
+//! matters because Windows's system DoH client offers only the
+//! `h2` ALPN and will not fall back to HTTP/1.1.
 //!
 //! `acl` / `ctx` are `ArcSwap`-backed for hot-config reload (see
 //! tcp.rs and udp.rs for the pattern). The ACL is checked once at
@@ -87,6 +89,11 @@ const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// open a fresh connection well before hitting this; an adversarial
 /// pipeliner is denied the privilege of indefinite pinning.
 const MAX_REQS_PER_CONN: u32 = 1000;
+/// Cap on concurrent HTTP/2 streams per connection. Browsers and
+/// the Windows resolver multiplex a handful of in-flight DNS
+/// lookups; 100 is generous headroom while denying an adversarial
+/// client unbounded stream allocation.
+const MAX_H2_CONCURRENT_STREAMS: u32 = 100;
 
 pub struct DohListener;
 
@@ -171,29 +178,18 @@ async fn accept_loop(
             let stream = BufStream::with_capacity(TLS_BUF_BYTES, TLS_BUF_BYTES, stream);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    // Read the TLS-negotiated ALPN. Three early-exit
-                    // paths here:
+                    // Read the TLS-negotiated ALPN. Three paths:
                     //   - `acme-tls/1`: the tls-alpn-01 challenge.
                     //     rustls-acme's resolver already served the
                     //     challenge cert during the handshake; the
                     //     handshake completion IS the challenge
                     //     response. Close the connection — no
-                    //     application data follows. Without this
-                    //     branch our HTTP/1.1 parser would try to
-                    //     read a request, time out, and the LE
-                    //     validator would see a quirky log line.
-                    //   - `h2`: defensive branch only — we no longer
-                    //     advertise h2 in `acme::*::alpn_protocols`,
-                    //     so this is unreachable from a well-behaved
-                    //     client. If somehow a client gets here
-                    //     (e.g. they upgraded the ALPN out-of-band),
-                    //     close cleanly. Browsers and curl do NOT
-                    //     retry with h1.1 when the server speaks h2
-                    //     then closes — Firefox TRR marks the
-                    //     resolver broken, curl errors with HTTP/2
-                    //     framing layer. Hence the ALPN omission.
+                    //     application data follows.
+                    //   - `h2`: HTTP/2 — hand off to `serve_h2`,
+                    //     which runs the `h2` framing crate over
+                    //     this stream.
                     //   - Anything else: HTTP/1.1 (or absent ALPN,
-                    //     treated as h1.1).
+                    //     treated as h1.1) — `serve_one`.
                     let alpn = tls_stream
                         .get_ref()
                         .1
@@ -207,10 +203,13 @@ async fn accept_loop(
                         return;
                     }
                     if alpn.as_deref() == Some(b"h2") {
-                        tracing::debug!(
-                            %peer,
-                            "DoH: h2 ALPN selected but server only speaks h1.1; closing",
-                        );
+                        if let Err(e) = serve_h2(
+                            tls_stream, peer, handler, metrics, acl, ctx,
+                        )
+                        .await
+                        {
+                            tracing::debug!(%peer, "DoH/h2: {e:#}");
+                        }
                         return;
                     }
                     if let Err(e) = serve_one(
@@ -680,7 +679,14 @@ fn validate_framing(headers: &[(String, String)]) -> Result<()> {
 }
 
 fn parse_get_dns_param(path: &str) -> Option<Vec<u8>> {
-    let qs = path.split_once('?')?.1;
+    dns_param_from_query(path.split_once('?')?.1)
+}
+
+/// Decode the `dns=<base64url-wire>` parameter out of a raw query
+/// string (no leading `?`). Shared by the HTTP/1.1 path (which
+/// splits the query off the request-target itself) and the h2 path
+/// (where `http::Uri` already exposes the query separately).
+fn dns_param_from_query(qs: &str) -> Option<Vec<u8>> {
     for kv in qs.split('&') {
         if let Some(val) = kv.strip_prefix("dns=") {
             return BASE64_URL_SAFE_NO_PAD.decode(val.as_bytes()).ok();
@@ -784,6 +790,207 @@ fn min_ttl_from_response(bytes: &[u8]) -> Option<u32> {
     msg.answers.iter().map(|r| r.ttl).min()
 }
 
+/// Serve an HTTP/2 connection (RFC 9113) for a client that
+/// negotiated the `h2` ALPN. dnsd's h2 support is a thin layer
+/// over the `h2` framing crate — NOT hyper, which wedges on the
+/// VCL transport (see the module header and CLAUDE.md). `h2` is a
+/// pure frame codec; it runs over the exact same `TlsStream` the
+/// HTTP/1.1 path uses.
+///
+/// Each h2 stream carries one DoH request. Browsers and the
+/// Windows system resolver multiplex many DNS lookups as
+/// concurrent streams on a single connection, so we spawn one task
+/// per stream — a slow query can't head-of-line-block its
+/// siblings. The accept loop keeps polling the `Connection`, which
+/// is what drives every in-flight stream's frames forward.
+async fn serve_h2<S>(
+    tls_stream: tokio_rustls::server::TlsStream<S>,
+    peer: SocketAddr,
+    handler: SharedHandler,
+    metrics: Arc<Metrics>,
+    acl: AclSwap,
+    ctx: CtxSwap,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut conn = tokio::time::timeout(
+        REQUEST_READ_TIMEOUT,
+        h2::server::Builder::new()
+            .max_concurrent_streams(MAX_H2_CONCURRENT_STREAMS)
+            .handshake::<_, bytes::Bytes>(tls_stream),
+    )
+    .await
+    .map_err(|_| anyhow!("h2 handshake timeout"))?
+    .context("h2 handshake")?;
+
+    while let Some(accepted) = conn.accept().await {
+        let (request, respond) = match accepted {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(%peer, "DoH/h2: connection error: {e}");
+                break;
+            }
+        };
+        let handler = handler.clone();
+        let metrics = metrics.clone();
+        let acl = acl.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_h2_request(
+                request, respond, peer, handler, metrics, acl, ctx,
+            )
+            .await
+            {
+                tracing::debug!(%peer, "DoH/h2 request: {e:#}");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Process one HTTP/2 stream: ACL check, dispatch, write response.
+/// Mirrors `handle_request` (the HTTP/1.1 path) — same RFC 8484
+/// shape (`GET /dns-query?dns=...` or `POST /dns-query` with an
+/// `application/dns-message` body), same metrics, same logging.
+async fn handle_h2_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<bytes::Bytes>,
+    peer: SocketAddr,
+    handler: SharedHandler,
+    metrics: Arc<Metrics>,
+    acl: AclSwap,
+    ctx: CtxSwap,
+) -> Result<()> {
+    // ACL is re-checked per stream (not just per connection) so a
+    // SIGHUP that drops a CIDR takes effect on the next request,
+    // matching the HTTP/1.1 path's hot-reload behaviour.
+    if !acl.load().allows(peer.ip()) {
+        metrics.acl_denied.fetch_add(1, Ordering::Relaxed);
+        h2_send_status(&mut respond, 403, b"ACL\n")?;
+        return Err(anyhow!("ACL denied"));
+    }
+
+    let (parts, mut body) = request.into_parts();
+    let method = parts.method;
+    let path = parts.uri.path().to_string();
+
+    let wire = if method == http::Method::GET {
+        match parts.uri.query().and_then(dns_param_from_query) {
+            Some(b) => b,
+            None => {
+                h2_send_status(
+                    &mut respond,
+                    400,
+                    b"missing or malformed dns= parameter\n",
+                )?;
+                return Err(anyhow!("bad GET"));
+            }
+        }
+    } else if method == http::Method::POST {
+        let ct = parts.headers.get(http::header::CONTENT_TYPE);
+        if ct.map(|v| v.as_bytes()) != Some(b"application/dns-message") {
+            h2_send_status(
+                &mut respond,
+                415,
+                b"expected application/dns-message\n",
+            )?;
+            return Err(anyhow!("bad content-type"));
+        }
+        read_h2_body(&mut body).await?
+    } else {
+        tracing::debug!(%peer, method = %method, "DoH/h2: rejecting non-GET/POST");
+        h2_send_status(&mut respond, 405, b"GET or POST\n")?;
+        return Err(anyhow!("bad method"));
+    };
+
+    if path != "/dns-query" {
+        h2_send_status(&mut respond, 404, b"\n")?;
+        return Err(anyhow!("bad path"));
+    }
+
+    metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        %peer,
+        method = %method,
+        path = %path,
+        proto = "h2",
+        wire_bytes = wire.len(),
+        "DoH request",
+    );
+
+    let ctx_snap = ctx.load_full();
+    let t0 = std::time::Instant::now();
+    let Some(response) =
+        handler.handle_bytes(&wire, peer.ip(), &ctx_snap).await
+    else {
+        h2_send_status(&mut respond, 400, b"malformed DNS query\n")?;
+        return Err(anyhow!("malformed DNS"));
+    };
+    let handler_ms = t0.elapsed().as_millis() as u64;
+    let ttl = min_ttl_from_response(&response).unwrap_or(0);
+    let resp_len = response.len();
+
+    let mut builder = http::Response::builder()
+        .status(200)
+        .header(http::header::CONTENT_TYPE, "application/dns-message");
+    if ttl > 0 {
+        builder = builder
+            .header(http::header::CACHE_CONTROL, format!("max-age={ttl}"));
+    }
+    let http_resp = builder.body(()).context("building h2 response")?;
+    let mut send = respond
+        .send_response(http_resp, false)
+        .context("h2 send_response")?;
+    send.send_data(bytes::Bytes::from(response), true)
+        .context("h2 send_data")?;
+    tracing::debug!(
+        %peer, resp_bytes = resp_len, handler_ms,
+        "doh/h2: response sent",
+    );
+    Ok(())
+}
+
+/// Drain an h2 request body into a `Vec`, releasing flow-control
+/// capacity as chunks arrive so the client may keep sending.
+/// Capped at `MAX_BODY_BYTES` (parity with the HTTP/1.1 path).
+async fn read_h2_body(body: &mut h2::RecvStream) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.context("reading h2 request body")?;
+        if buf.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(anyhow!(
+                "DoH/h2 body exceeds {MAX_BODY_BYTES} bytes"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+        body.flow_control()
+            .release_capacity(chunk.len())
+            .context("h2 flow-control release")?;
+    }
+    Ok(buf)
+}
+
+/// Send a small text/plain error response on an h2 stream and end
+/// it. Mirrors `send_simple` on the HTTP/1.1 path.
+fn h2_send_status(
+    respond: &mut h2::server::SendResponse<bytes::Bytes>,
+    status: u16,
+    body: &[u8],
+) -> Result<()> {
+    let resp = http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "text/plain")
+        .body(())
+        .context("building h2 error response")?;
+    let mut send = respond
+        .send_response(resp, false)
+        .context("h2 error send_response")?;
+    send.send_data(bytes::Bytes::copy_from_slice(body), true)
+        .context("h2 error send_data")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +1026,18 @@ mod tests {
     fn parse_dns_param_missing_returns_none() {
         assert!(parse_get_dns_param("/dns-query").is_none());
         assert!(parse_get_dns_param("/dns-query?other=1").is_none());
+    }
+
+    #[test]
+    fn dns_param_from_bare_query() {
+        // The h2 path passes `http::Uri::query()` — a raw query
+        // string with no leading `?`.
+        let qs = "dns=q80BAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE";
+        let wire = dns_param_from_query(qs).expect("decoded");
+        assert_eq!(wire[0], 0xab);
+        assert_eq!(wire[1], 0xcd);
+        assert!(dns_param_from_query("other=1").is_none());
+        assert!(dns_param_from_query("").is_none());
     }
 
     #[test]
