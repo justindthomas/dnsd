@@ -595,6 +595,7 @@ dependencies = [
  "tracing-subscriber",
  "vcl-rs",
  "vpp-api",
+ "webpki-roots 1.0.7",
  "x509-parser",
 ]
 

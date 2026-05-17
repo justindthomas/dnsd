@@ -172,7 +172,10 @@ reaching tord is the routable-`socks_listen` case (tord DESIGN.md
    `CONNECT`, NO-AUTH + RFC 1929 username/password, generic over any
    tokio stream. 3 unit tests over an in-memory duplex. Standalone
    until phase 4 wires it.
-3. DoT client module + unit tests.
+3. ✅ **Done.** DoT client (`recursor/dot_client.rs`) — rustls client
+   over the bundled webpki-roots set, ALPN `dot`, RFC 1035 length
+   framing. 4 unit tests (framing + config build); the TLS handshake
+   itself is covered by the phase-5 integration test.
 4. `query_one` integration + fail-closed; the `force_tcp` and DoT
    direct paths fall out of the same branching.
 5. Circuit-isolation username, connection reuse, the slim suite.

@@ -28,6 +28,7 @@ pub mod cookies;
 pub mod forwarder;
 pub mod ddr;
 pub mod dns64;
+pub mod dot_client;
 pub mod dnssec;
 pub mod ipv4only;
 pub mod iterative;
