@@ -10,17 +10,40 @@ written against the same `read_exact`/`write_all` primitives that DoT
 uses — DoT works fine on the same substrate, so mirroring its shape
 sidesteps whatever wakeup quirk hyper hits.
 
-Constraints baked in by this design:
-
-- One request per connection (no keep-alive). Real DoH clients open
-  a fresh connection per query in practice.
-- HTTP/1.1 only. ALPN advertises `h2` for forward-compatibility but
-  we close cleanly if a client actually negotiates h2 — they fall
-  back to h1.1 on retry. Adding h2 means a frame-level parser; not
-  yet done.
-- `MAX_HEADER_BYTES = 8192`, `MAX_BODY_BYTES = 65535` (parity with
-  DoT's `MAX_TCP_MESSAGE`).
-
 If a future change reaches for axum / hyper to "simplify" DoH:
 **don't**. The hand-roll exists because the framework path wedges on
 the production transport.
+
+Constraints baked in by this design:
+
+- HTTP/1.1 with keep-alive (`feabec9`).
+- `MAX_HEADER_BYTES = 8192`, `MAX_BODY_BYTES = 65535` (parity with
+  DoT's `MAX_TCP_MESSAGE`).
+- ALPN advertises `dot` and `http/1.1` only — **not** `h2`
+  (`a02bad9` dropped it: clients that negotiate h2 and then see the
+  server speak HTTP/1.1 treat the resolver as broken instead of
+  retrying).
+
+## HTTP/2 for DoH is deferred by choice, not difficulty
+
+dnsd does not implement HTTP/2. That is a deliberate scoping
+decision — no consumer has needed it yet, so the work was not
+justified — **not** a judgement that it is too hard. Whenever a
+concrete need appears, h2 should be implemented: it would be a
+frame-level h2 layer over the existing `read_exact`/`write_all`
+stream primitives, *not* a return to hyper (which wedges — see
+above).
+
+Known trigger to revisit: a DoH-only client that will not fall back
+to HTTP/1.1. The concrete case is RFC 9463 DNR for Windows —
+Windows's system encrypted DNS is DoH-only, so reaching it via the
+DNR option needs dnsd to speak h2. If that path (or any other)
+becomes worth unblocking, h2 is firmly on the table.
+
+## Encrypted-DNS discovery (RFC 9462 DDR)
+
+`src/recursor/ddr.rs` answers `_dns.resolver.arpa` SVCB locally —
+the in-band path Apple platforms use to discover an encrypted
+resolver. The matching out-of-band advertisement (RFC 9463 DNR) is
+emitted by sibling daemons: the IPv6 RA option by the `sfw` VPP
+plugin, the DHCPv4 option (162) by `dhcpd`.
