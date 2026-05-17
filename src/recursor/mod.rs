@@ -85,11 +85,12 @@ pub struct RecursorHandler {
     validator: Option<Arc<dnssec::Validator>>,
     rrl: Option<Arc<Rrl>>,
     iterative: Option<Arc<IterativeResolver>>,
-    /// Precomputed RFC 9462 DDR answer for `_dns.resolver.arpa` / SVCB,
-    /// built once from the DoT listener set + the TLS cert domain.
-    /// `None` disables DDR (no DoT listener, or no global-scope DoT
-    /// address to point clients at).
-    ddr_svcb: Option<hickory_proto::rr::rdata::svcb::SVCB>,
+    /// Precomputed RFC 9462 DDR answer records for
+    /// `_dns.resolver.arpa` / SVCB, built once from the DoT + DoH
+    /// listener sets and the TLS cert domain — one record per
+    /// encrypted transport. Empty disables DDR (no encrypted
+    /// listener, or no global-scope address to point clients at).
+    ddr_svcb: Vec<hickory_proto::rr::rdata::svcb::SVCB>,
     /// Short-lived "this iterative walk just failed" cache. Without
     /// it, a name like `detectportal.firefox.com` (which Firefox
     /// retries every 1-2 s for the captive-portal probe) burns a
@@ -727,24 +728,35 @@ impl RecursorHandler {
         };
 
         // RFC 9462 DDR: precompute the `_dns.resolver.arpa` SVCB
-        // answer from the DoT listener set + the TLS cert's primary
-        // domain. `None` — DDR off — when there is no DoT listener,
-        // no cert domain, or no global-scope DoT address.
+        // answers from the DoT + DoH listener sets and the TLS
+        // cert's primary domain — one record per transport. Empty
+        // — DDR off — when there is no encrypted listener, no cert
+        // domain, or no global-scope address.
         let ddr_svcb = {
-            let dot_addrs: Vec<std::net::IpAddr> = cfg
-                .listeners
-                .iter()
-                .filter(|l| {
-                    l.protocols.iter().any(|p| p.eq_ignore_ascii_case("dot"))
-                })
-                .map(|l| l.address)
-                .collect();
+            let proto_addrs = |proto: &str| -> Vec<std::net::IpAddr> {
+                cfg.listeners
+                    .iter()
+                    .filter(|l| {
+                        l.protocols
+                            .iter()
+                            .any(|p| p.eq_ignore_ascii_case(proto))
+                    })
+                    .map(|l| l.address)
+                    .collect()
+            };
             cfg.tls
                 .as_ref()
                 .and_then(|t| t.acme.as_ref())
                 .and_then(|a| a.domains.first())
                 .and_then(|d| hickory_proto::rr::Name::from_ascii(d).ok())
-                .and_then(|name| ddr::build_svcb(&name, &dot_addrs))
+                .map(|name| {
+                    ddr::build_ddr_records(
+                        &name,
+                        &proto_addrs("dot"),
+                        &proto_addrs("doh"),
+                    )
+                })
+                .unwrap_or_default()
         };
 
         Ok(Self {
@@ -877,10 +889,8 @@ impl RecursorHandler {
         // (3a′) RFC 9462 DDR: answer `_dns.resolver.arpa` locally —
         // SVCB gets the designated-resolver record, every other qtype
         // NODATA — so the name never recurses to public resolver.arpa.
-        if let Some(svcb) = &self.ddr_svcb {
-            if ddr::is_ddr_question(&q.name) {
-                return ddr::synth_response(&msg, svcb).to_vec().ok();
-            }
+        if !self.ddr_svcb.is_empty() && ddr::is_ddr_question(&q.name) {
+            return ddr::synth_response(&msg, &self.ddr_svcb).to_vec().ok();
         }
 
         // (3b) DNS64 PTR short-circuit: rewrite the question, send it
