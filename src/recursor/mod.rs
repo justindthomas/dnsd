@@ -34,6 +34,7 @@ pub mod iterative;
 pub mod local_zones;
 pub mod normalize;
 pub mod rrl;
+pub mod socks;
 pub mod zeroxtwenty;
 
 use std::collections::HashMap;

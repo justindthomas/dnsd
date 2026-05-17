@@ -168,7 +168,10 @@ reaching tord is the routable-`socks_listen` case (tord DESIGN.md
    servers; `Forwarder::resolved_servers()` validates and rejects
    not-yet-wired combinations (tcp/dot/`via: tor`). Parse +
    validation tests; 112 dnsd tests green.
-2. SOCKS5 client module + unit tests.
+2. ✅ **Done.** SOCKS5 client module (`recursor/socks.rs`) — RFC 1928
+   `CONNECT`, NO-AUTH + RFC 1929 username/password, generic over any
+   tokio stream. 3 unit tests over an in-memory duplex. Standalone
+   until phase 4 wires it.
 3. DoT client module + unit tests.
 4. `query_one` integration + fail-closed; the `force_tcp` and DoT
    direct paths fall out of the same branching.
