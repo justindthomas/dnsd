@@ -182,7 +182,7 @@ pub enum Transport {
 }
 
 /// How a forwarder server is reached.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Via {
     /// Straight out the upstream path. The default.

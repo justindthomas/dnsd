@@ -74,16 +74,59 @@ async fn query_dot_inner<S>(stream: S, tls_name: &str, query: &[u8]) -> Result<V
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let server_name = ServerName::try_from(tls_name.to_owned())
-        .with_context(|| format!("DoT: invalid TLS server name {tls_name:?}"))?;
-    let mut tls = TlsConnector::from(client_config())
-        .connect(server_name, stream)
+    let mut tls = tls_handshake(stream, tls_name)
         .await
         .with_context(|| format!("DoT: TLS handshake to {tls_name}"))?;
     write_message(&mut tls, query)
         .await
         .context("DoT: send query")?;
     read_message(&mut tls).await.context("DoT: read response")
+}
+
+/// Run only the TLS handshake against `tls_name` and hand back the
+/// established TLS stream. This is the connection-reuse split-out of
+/// `query_dot_inner`: the DoT pool (`dot_pool.rs`) keeps the returned
+/// stream alive and runs many `exchange_dot`s over it. The framing /
+/// trust setup is byte-identical to `query_dot` — only the lifetime
+/// of the stream differs.
+pub async fn tls_handshake<S>(
+    stream: S,
+    tls_name: &str,
+) -> Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let server_name = ServerName::try_from(tls_name.to_owned())
+        .with_context(|| format!("DoT: invalid TLS server name {tls_name:?}"))?;
+    TlsConnector::from(client_config())
+        .connect(server_name, stream)
+        .await
+        .with_context(|| format!("DoT: TLS handshake to {tls_name}"))
+}
+
+/// One length-prefixed DNS exchange over an already-handshaken DoT
+/// stream — write the query, read the response. Used by the DoT
+/// connection pool to reuse a stream across queries. A `timeout` of
+/// `None` runs the exchange uncapped (the pool wraps the whole
+/// acquire+exchange in a single timeout).
+pub async fn exchange_dot<S>(
+    tls: &mut S,
+    query: &[u8],
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let fut = async {
+        write_message(tls, query).await.context("DoT: send query")?;
+        read_message(tls).await.context("DoT: read response")
+    };
+    match timeout {
+        Some(t) => tokio::time::timeout(t, fut)
+            .await
+            .map_err(|_| anyhow!("DoT exchange timed out"))?,
+        None => fut.await,
+    }
 }
 
 /// Write a DNS message with the RFC 1035 §4.2.2 2-byte length prefix.

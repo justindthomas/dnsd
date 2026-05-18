@@ -29,6 +29,7 @@ pub mod forwarder;
 pub mod ddr;
 pub mod dns64;
 pub mod dot_client;
+pub mod dot_pool;
 pub mod dnssec;
 pub mod ipv4only;
 pub mod iterative;
@@ -980,15 +981,17 @@ impl RecursorHandler {
             return Some(servfail(&msg));
         }
 
-        let servers = match self.forwarders.lookup(&q.name) {
-            Some(s) => {
+        let (forwarder_domain, servers) = match self.forwarders.lookup_with_domain(&q.name) {
+            Some((domain, s)) => {
                 self.metrics
                     .forwarder_matched
                     .fetch_add(1, Ordering::Relaxed);
                 // Pass the full ForwarderServer specs through to
                 // `query_forwarder` — it branches per server on
                 // transport/via (udp/direct, dot/direct, dot/tor).
-                s.to_vec()
+                // The domain is the SOCKS isolation username for the
+                // `via: tor` path.
+                (domain.to_string(), s.to_vec())
             }
             None => {
                 // No forwarder match — fall through to iterative
@@ -1058,7 +1061,11 @@ impl RecursorHandler {
             }
         };
 
-        let resp_bytes = match self.upstream.query_forwarder(&servers, query).await {
+        let resp_bytes = match self
+            .upstream
+            .query_forwarder(&servers, &forwarder_domain, query)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(qname = %&q.name, "forwarder failed: {e}");
@@ -1089,7 +1096,11 @@ impl RecursorHandler {
                     // Fall through to the original AAAA response.
                     return Some(respond_with_policy(&mut resp, &self.dnssec));
                 };
-                match self.upstream.query_forwarder(&servers, &a_query_bytes).await {
+                match self
+                    .upstream
+                    .query_forwarder(&servers, &forwarder_domain, &a_query_bytes)
+                    .await
+                {
                     Ok(a_bytes) => {
                         if let Ok(a_resp) = Message::from_bytes(&a_bytes) {
                             if !a_resp.answers.is_empty() {
@@ -1318,11 +1329,13 @@ impl RecursorHandler {
         }
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        let servers = self.forwarders.lookup(qname)?.to_vec();
+        let (forwarder_domain, servers) = self.forwarders.lookup_with_domain(qname)?;
+        let forwarder_domain = forwarder_domain.to_string();
+        let servers = servers.to_vec();
         let q_bytes = query_msg.to_vec().ok()?;
         let resp_bytes = self
             .upstream
-            .query_forwarder(&servers, &q_bytes)
+            .query_forwarder(&servers, &forwarder_domain, &q_bytes)
             .await
             .ok()?;
         if let Ok(parsed) = Message::from_bytes(&resp_bytes) {

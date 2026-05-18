@@ -30,11 +30,32 @@ use tokio::sync::oneshot;
 use crate::io::transport::{self, DnsDgramSocket, ReactorCtx};
 
 use crate::config::{Forwarder as ForwarderCfg, ForwarderServer, Transport, Via};
+use crate::recursor::dot_pool::{exchange_pooled, DotConnKey, DotPool};
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
+/// `via: tor` queries legitimately take longer than a direct upstream
+/// — Tor adds 100 ms–1 s+ of circuit/relay latency, and a *fresh*
+/// circuit (the cold-pool case) is at the high end. The 2.5 s direct
+/// timeout would trip on those, so the DoT/tor path gets a longer
+/// budget. `dot/direct` keeps the normal timeout. Connection reuse
+/// (the pool) removes most of this cost in the steady state; the
+/// longer timeout covers the cold connection and circuit-aging cases.
+const DEFAULT_TOR_UPSTREAM_TIMEOUT_MS: u64 = 8000;
 const MAX_TCP_MESSAGE: usize = 65535;
 /// RFC 7858 DoT port — the upstream port for `transport: dot` servers.
 const DOT_PORT: u16 = 853;
+
+/// The TLS stream type a pooled DoT connection wraps: a rustls client
+/// session layered on the backend's bare client stream (a VPP session
+/// under `vcl`, a `tokio::net::TcpStream` under `kernel-sockets`).
+type DotTlsStream = tokio_rustls::client::TlsStream<transport::ClientStream>;
+
+/// Per-worker DoT connection pool. `UpstreamClient` holds one behind
+/// an `Arc` per vcl-io worker so the dispatched `dot_exchange` task
+/// (which moves into a `'static` future) can reach it; the pool's
+/// connections are still only ever driven on the worker that owns
+/// them — see `dot_pool.rs`.
+type SharedDotPool = Arc<DotPool<DotTlsStream>>;
 
 // Both UDP and TCP upstream paths run async on the main Tokio
 // thread — no worker pool, no spawn_blocking. The thread is VCL
@@ -106,7 +127,33 @@ fn finalize(resp: &[u8], client_txid: u16) -> Result<Vec<u8>> {
         .context("re-encode normalised forwarder response")
 }
 
-/// One DoT exchange — the `dot/direct` and `dot/tor` upstream legs.
+/// Verify an upstream DoT response: minimum length, TXID match,
+/// 0x20-case match. Defence in depth even over a verified TLS
+/// channel (see DESIGN-tor-forwarder.md §8).
+///
+/// Run for *every* response — including responses read off a reused
+/// pooled connection. On a reused connection a failure here also
+/// doubles as stale-connection detection: a TXID mismatch can mean
+/// the stream still held a previous query's late response, so the
+/// pool treats an exchange error as "rebuild and retry once".
+fn verify_dot_response(resp: &[u8], prepared: &Prepared) -> Result<()> {
+    if resp.len() < 12 {
+        return Err(anyhow!("short upstream DoT response ({} bytes)", resp.len()));
+    }
+    let rx_txid = u16::from_be_bytes([resp[0], resp[1]]);
+    if rx_txid != prepared.upstream_txid {
+        return Err(anyhow!(
+            "upstream DoT TXID mismatch: got {rx_txid:#06x} expected {:#06x}",
+            prepared.upstream_txid
+        ));
+    }
+    super::zeroxtwenty::verify(resp, &prepared.qname_mask)
+        .context("upstream DoT 0x20 mismatch")?;
+    Ok(())
+}
+
+/// One DoT exchange — the `dot/direct` and `dot/tor` upstream legs,
+/// over a *pooled* connection.
 ///
 /// `connect_target` is where the first TCP stream goes: tord's SOCKS5
 /// endpoint for `via: tor`, or the resolver itself for `via: direct`.
@@ -114,58 +161,95 @@ fn finalize(resp: &[u8], client_txid: u16) -> Result<Vec<u8>> {
 /// target on the tor path, and (identically) `connect_target` on the
 /// direct path.
 ///
-/// Fail-closed: every step (connect, SOCKS handshake, TLS handshake,
-/// query) returns `Err` on failure. There is deliberately no direct-
-/// connection fallback for the tor path — a `via: tor` server that
-/// can't reach tord fails the query rather than leaking.
+/// `iso_user` is the matched forwarder domain — on the `via: tor`
+/// path it is sent as the SOCKS5 username so tord isolates each
+/// forwarder onto its own Tor circuit family (`PerUpstream`). It is
+/// `None` for `via: direct` (no circuit to isolate).
+///
+/// Fail-closed: the connection *builder* below runs `connect_stream →
+/// SOCKS5 CONNECT → TLS handshake` for a `via: tor` key and never a
+/// direct connect. The pool key includes `via` + `tor_socks` +
+/// `iso_user`, so a tor query can only ever reuse a tor connection
+/// built for the *same* forwarder; the one rebuild retry re-runs the
+/// *same* builder, so a rebuilt tor connection is still a tor
+/// connection. There is no direct fallback anywhere on this path.
 ///
 /// Runs on a registered VCL worker thread under the `vcl` backend
 /// (the caller dispatches it onto a vcl-io worker), inline otherwise.
 #[allow(clippy::too_many_arguments)]
 async fn dot_exchange(
+    pool: &DotPool<DotTlsStream>,
     connect_target: SocketAddr,
     resolver: SocketAddr,
     source: Option<IpAddr>,
     via: Via,
     tls_name: &str,
+    tor_socks: Option<SocketAddr>,
+    iso_user: Option<String>,
     prepared: &Prepared,
     ctx: ReactorCtx,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let stream = transport::connect_stream(connect_target, source, ctx, timeout)
-        .await
-        .with_context(|| format!("connect_stream to {connect_target}"))?;
-
-    let dot_bytes = if via == Via::Tor {
-        // SOCKS5 CONNECT to the resolver, then DoT inside the tunnel.
-        // A SOCKS or TLS failure here returns Err — no direct
-        // fallback (fail-closed).
-        let mut stream = stream;
-        super::socks::connect(&mut stream, resolver, None)
-            .await
-            .with_context(|| format!("SOCKS5 CONNECT to {resolver} via tord"))?;
-        super::dot_client::query_dot(stream, tls_name, &prepared.wire, timeout).await?
-    } else {
-        super::dot_client::query_dot(stream, tls_name, &prepared.wire, timeout).await?
+    let key = DotConnKey {
+        resolver,
+        tls_name: tls_name.to_string(),
+        via,
+        tor_socks,
+        iso_user: iso_user.clone(),
     };
 
-    // TXID + 0x20 verification — defence in depth even over a
-    // verified TLS channel (see DESIGN-tor-forwarder.md §8).
-    if dot_bytes.len() < 12 {
-        return Err(anyhow!(
-            "short upstream DoT response ({} bytes)",
-            dot_bytes.len()
-        ));
-    }
-    let rx_txid = u16::from_be_bytes([dot_bytes[0], dot_bytes[1]]);
-    if rx_txid != prepared.upstream_txid {
-        return Err(anyhow!(
-            "upstream DoT TXID mismatch: got {rx_txid:#06x} expected {:#06x}",
-            prepared.upstream_txid
-        ));
-    }
-    super::zeroxtwenty::verify(&dot_bytes, &prepared.qname_mask)
-        .context("upstream DoT 0x20 mismatch")?;
+    // Connection factory: connect → (SOCKS for tor) → TLS handshake.
+    // The pool calls this on a miss and again for the one rebuild
+    // retry. It honours `via` exactly — fail-closed by construction.
+    //
+    // `ctx.clone()` is a real `VclReactor` clone under the `vcl`
+    // backend; under `kernel-sockets` `ReactorCtx` is `()`, so the
+    // `unit_arg` / `clone_on_copy` lints fire on a no-op exactly as
+    // they do for the existing `query_one_tcp` kernel path — the
+    // builder is shared across backends, so the allow lives here.
+    #[allow(clippy::unit_arg, clippy::clone_on_copy)]
+    let build = || async {
+        let stream = transport::connect_stream(connect_target, source, ctx.clone(), timeout)
+            .await
+            .with_context(|| format!("connect_stream to {connect_target}"))?;
+        let tls = if via == Via::Tor {
+            // SOCKS5 CONNECT to the resolver, then TLS inside the
+            // tunnel. A SOCKS or TLS failure returns Err — there is
+            // no direct fallback (fail-closed).
+            let mut stream = stream;
+            // The forwarder domain is the SOCKS isolation username:
+            // tord maps it to a Tor circuit family (its `PerUpstream`
+            // mode), so each forwarded zone gets its own circuits.
+            super::socks::connect(&mut stream, resolver, iso_user.as_deref())
+                .await
+                .with_context(|| format!("SOCKS5 CONNECT to {resolver} via tord"))?;
+            super::dot_client::tls_handshake(stream, tls_name).await?
+        } else {
+            super::dot_client::tls_handshake(stream, tls_name).await?
+        };
+        Ok::<DotTlsStream, anyhow::Error>(tls)
+    };
+
+    // The DoT exchange itself: unchanged phase-4 length-prefixed
+    // framing, plus TXID/0x20 verification on the response. The
+    // closure takes the TLS stream by value and hands it back (per
+    // `exchange_pooled`'s contract) so a healthy stream can be
+    // re-pooled. A framing error OR a verification failure surfaces
+    // as `Err`, which the pool treats as a stale-connection signal
+    // on a reused connection (rebuild + retry once) and as a hard
+    // error on a freshly-built one.
+    let exchange = |mut tls: DotTlsStream| async move {
+        let r = async {
+            let resp =
+                super::dot_client::exchange_dot(&mut tls, &prepared.wire, Some(timeout)).await?;
+            verify_dot_response(&resp, prepared)?;
+            Ok::<Vec<u8>, anyhow::Error>(resp)
+        }
+        .await;
+        (tls, r)
+    };
+
+    let dot_bytes = exchange_pooled(pool, &key, build, exchange).await?;
     finalize(&dot_bytes, prepared.client_txid)
 }
 
@@ -180,6 +264,11 @@ pub struct Forwarders {
 #[derive(Clone, Debug)]
 struct ForwarderEntry {
     domain: Name,
+    /// `domain` rendered to a string, computed once at load time.
+    /// Used as the SOCKS5 isolation username on the `via: tor`
+    /// path; `Name` exposes no borrowed-`&str` accessor, so the
+    /// rendered form is stashed here.
+    domain_str: String,
     servers: Vec<ForwarderServer>,
 }
 
@@ -209,8 +298,10 @@ impl Forwarders {
             let mut domain = Name::from_ascii(&c.domain)
                 .with_context(|| format!("bad forwarder domain {:?}", c.domain))?;
             domain.set_fqdn(true);
+            let domain = domain.to_lowercase();
             entries.push(ForwarderEntry {
-                domain: domain.to_lowercase(),
+                domain_str: domain.to_string(),
+                domain,
                 servers: c.resolved_servers()?,
             });
         }
@@ -224,11 +315,29 @@ impl Forwarders {
     /// domain of "." (the root) would match everything; operators
     /// who want a global forwarder should configure it explicitly.
     pub fn lookup(&self, qname: &Name) -> Option<&[ForwarderServer]> {
+        self.lookup_with_domain(qname).map(|(_, s)| s)
+    }
+
+    /// Like [`Self::lookup`], but also returns the matched
+    /// forwarder's configured domain. The domain is used as the
+    /// SOCKS5 isolation username on the `via: tor` path, so each
+    /// forwarded zone gets its own Tor circuit family under tord's
+    /// `PerUpstream` isolation — traffic for different forwarded
+    /// domains can't be trivially correlated on one circuit.
+    pub fn lookup_with_domain(&self, qname: &Name) -> Option<(&str, &[ForwarderServer])> {
         let lq = qname.to_lowercase();
         self.entries
             .iter()
             .find(|e| is_suffix(&lq, &e.domain))
-            .map(|e| e.servers.as_slice())
+            .map(|e| (e.domain_str(), e.servers.as_slice()))
+    }
+}
+
+impl ForwarderEntry {
+    /// The configured domain as a string — the isolation username
+    /// for the `via: tor` SOCKS path.
+    fn domain_str(&self) -> &str {
+        &self.domain_str
     }
 }
 
@@ -683,6 +792,17 @@ pub struct UpstreamClient {
     /// fails the query — never a fallback to direct (see
     /// `query_forwarder`).
     tor_socks: Option<SocketAddr>,
+    /// Longer per-query timeout for the DoT/`via: tor` path. A fresh
+    /// Tor circuit costs ~1 s+, well past the 2.5 s direct timeout;
+    /// `dot/direct` keeps `timeout`, `dot/tor` uses this.
+    tor_timeout: Duration,
+    /// Per-worker pools of reusable DoT connections — one per vcl-io
+    /// worker, indexed the same way `query_one_dot` round-robins
+    /// (`tcp_next`). A `VclStream` is thread-owned, so each pool's
+    /// connections only ever live on the worker that built them;
+    /// `dot_exchange` dispatched onto worker *i* touches pool *i*.
+    /// Under `kernel-sockets` this is a single-entry vec.
+    dot_pools: Vec<SharedDotPool>,
 }
 
 
@@ -864,6 +984,21 @@ impl UpstreamClient {
         let timeout = Duration::from_millis(
             timeout_ms.map(|t| t as u64).unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         );
+        // The DoT/tor path gets a longer budget. If the operator set
+        // an explicit `upstream_timeout_ms` that is already larger
+        // than the tor default, honour it (they widened it on
+        // purpose); otherwise lift the tor path to its own default.
+        let tor_timeout = timeout.max(Duration::from_millis(DEFAULT_TOR_UPSTREAM_TIMEOUT_MS));
+
+        // One DoT connection pool per vcl-io worker (per the
+        // thread-ownership constraint); a single pool under the
+        // kernel backend. Sized to match the worker count so the
+        // `tcp_next` round-robin indexes pools and workers in step.
+        #[cfg(feature = "vcl")]
+        let dot_pools: Vec<SharedDotPool> =
+            workers.iter().map(|_| Arc::new(DotPool::new())).collect();
+        #[cfg(not(feature = "vcl"))]
+        let dot_pools: Vec<SharedDotPool> = vec![Arc::new(DotPool::new())];
 
         // Only warn under VCL — that backend NEEDS an explicit source
         // because of VPP's TCP/UDP session-lookup quirk. Kernel
@@ -907,6 +1042,8 @@ impl UpstreamClient {
             #[cfg(not(feature = "vcl"))]
             reactor,
             tor_socks,
+            tor_timeout,
+            dot_pools,
         })
     }
 
@@ -1007,6 +1144,7 @@ impl UpstreamClient {
     async fn query_one_dot(
         &self,
         srv: &ForwarderServer,
+        forwarder_domain: &str,
         orig_query: &[u8],
     ) -> Result<Vec<u8>> {
         let tls_name = srv
@@ -1029,9 +1167,26 @@ impl UpstreamClient {
             None
         };
 
+        // On the `via: tor` path the forwarder domain is the SOCKS5
+        // isolation username — tord gives each distinct username its
+        // own Tor circuit family (`PerUpstream`), so traffic for one
+        // forwarded zone can't be correlated with another's on a
+        // shared circuit. `via: direct` has no circuit, so no user.
+        let iso_user = if srv.via == Via::Tor {
+            Some(forwarder_domain.to_string())
+        } else {
+            None
+        };
+
         let resolver = SocketAddr::new(srv.address, DOT_PORT);
         let prepared = Prepared::build(orig_query).context("prepare DoT query")?;
-        let timeout = self.timeout;
+        // `dot/tor` gets the longer budget (fresh-circuit latency);
+        // `dot/direct` keeps the normal upstream timeout.
+        let timeout = if srv.via == Via::Tor {
+            self.tor_timeout
+        } else {
+            self.timeout
+        };
 
         // The first TCP leg goes to tord (for `via: tor`) or straight
         // to the resolver (for `via: direct`).
@@ -1047,21 +1202,29 @@ impl UpstreamClient {
         {
             // Same worker-dispatch pattern as `query_one_tcp`: VCL
             // session ops are valid only on a registered VCL worker
-            // thread, so round-robin onto a vcl-io worker. `tls_name`
-            // and `prepared` move into the spawned task ('static).
+            // thread, so round-robin onto a vcl-io worker. The DoT
+            // pool is indexed by the *same* `tcp_next` tick, so the
+            // pooled connections a query reuses live on exactly the
+            // worker it is dispatched onto (thread-ownership). The
+            // `Arc<DotPool>` clone moves into the spawned task; the
+            // pool's connections never leave this worker.
             let i = self
                 .tcp_next
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % self.workers.len();
             let (vcl_io, reactor) = self.workers[i].clone();
+            let pool = self.dot_pools[i].clone();
             let (tx, rx) = oneshot::channel();
             vcl_io.spawn(async move {
                 let r = dot_exchange(
+                    &pool,
                     connect_target,
                     resolver,
                     source,
                     via,
                     &tls_name,
+                    tor_socks,
+                    iso_user,
                     &prepared,
                     reactor,
                     timeout,
@@ -1077,13 +1240,17 @@ impl UpstreamClient {
             // `self.reactor` is `()` on the kernel backend — the
             // `unit_arg` lint fires on passing it as `ReactorCtx`,
             // exactly as it does for the existing `query_one_tcp`.
+            // Single pool under kernel-sockets.
             #[allow(clippy::unit_arg)]
             dot_exchange(
+                &self.dot_pools[0],
                 connect_target,
                 resolver,
                 source,
                 via,
                 &tls_name,
+                tor_socks,
+                iso_user,
                 &prepared,
                 self.reactor,
                 timeout,
@@ -1109,9 +1276,14 @@ impl UpstreamClient {
     /// server whose SOCKS / TLS handshake fails just contributes an
     /// `Err` like any other; with an all-tor forwarder every server
     /// is tor, so the worst case is SERVFAIL — never a direct leak.
+    /// `forwarder_domain` is the matched forwarder's configured
+    /// domain (from [`Forwarders::lookup_with_domain`]). On the
+    /// `via: tor` DoT path it becomes the SOCKS5 isolation username,
+    /// so each forwarded zone rides its own Tor circuit family.
     pub async fn query_forwarder(
         &self,
         servers: &[ForwarderServer],
+        forwarder_domain: &str,
         query: &[u8],
     ) -> Result<Vec<u8>> {
         if servers.is_empty() {
@@ -1125,7 +1297,9 @@ impl UpstreamClient {
                     let peer = SocketAddr::new(srv.address, 53);
                     self.query_one(peer, query).await
                 }
-                (Transport::Dot, _) => self.query_one_dot(srv, query).await,
+                (Transport::Dot, _) => {
+                    self.query_one_dot(srv, forwarder_domain, query).await
+                }
                 // `resolved_servers` rejects every other combination
                 // (tcp, udp+tor) at load time — this arm is
                 // unreachable for a validly-loaded config. Treat it
@@ -1389,7 +1563,10 @@ mod tests {
     #[tokio::test]
     async fn query_forwarder_rejects_empty_server_list() {
         let client = test_upstream_client(None).await;
-        let err = client.query_forwarder(&[], b"\0\0").await.unwrap_err();
+        let err = client
+            .query_forwarder(&[], "example.com", b"\0\0")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("no upstream servers"),
             "got: {err}"
@@ -1414,7 +1591,7 @@ mod tests {
             via: Via::Tor,
         };
         let err = client
-            .query_forwarder(std::slice::from_ref(&srv), &minimal_query())
+            .query_forwarder(std::slice::from_ref(&srv), "example.com", &minimal_query())
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
