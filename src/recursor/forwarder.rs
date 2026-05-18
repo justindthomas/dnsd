@@ -29,10 +29,12 @@ use rand::RngExt;
 use tokio::sync::oneshot;
 use crate::io::transport::{self, DnsDgramSocket, ReactorCtx};
 
-use crate::config::{Forwarder as ForwarderCfg, ForwarderServer};
+use crate::config::{Forwarder as ForwarderCfg, ForwarderServer, Transport, Via};
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 2500;
 const MAX_TCP_MESSAGE: usize = 65535;
+/// RFC 7858 DoT port — the upstream port for `transport: dot` servers.
+const DOT_PORT: u16 = 853;
 
 // Both UDP and TCP upstream paths run async on the main Tokio
 // thread — no worker pool, no spawn_blocking. The thread is VCL
@@ -42,6 +44,130 @@ const MAX_TCP_MESSAGE: usize = 65535;
 // (`AsyncUdpUpstream`); TCP uses VclStream::connect_async +
 // query_tcp_dns_async with non-blocking sessions and the reactor
 // for connect/read/write completion notifications.
+
+/// A client query rewritten for one upstream hop: fresh TXID, 0x20-
+/// randomised question name, plus the bookkeeping needed to verify
+/// and un-rewrite the response.
+///
+/// Building this is the shared `prepare` step — every upstream
+/// transport (UDP, TCP fallback, DoT, DoT-over-Tor) goes through
+/// `Prepared::build` so the TXID-rewrite + 0x20-encode logic exists
+/// in exactly one place and the transports cannot drift.
+struct Prepared {
+    /// The wire bytes to send upstream.
+    wire: Vec<u8>,
+    /// Fresh upstream TXID — verified against the response.
+    upstream_txid: u16,
+    /// 0x20-encoded question-name bytes — verified against the
+    /// response by `zeroxtwenty::verify`.
+    qname_mask: Vec<u8>,
+    /// The client's original TXID — restored onto the response by
+    /// `finalize` so the client sees its own ID back.
+    client_txid: u16,
+}
+
+impl Prepared {
+    /// Rewrite `orig_query` for one upstream hop. The body is
+    /// otherwise byte-identical to what the client sent.
+    fn build(orig_query: &[u8]) -> Result<Self> {
+        let orig_msg =
+            Message::from_bytes(orig_query).context("parse client query")?;
+        let client_txid = orig_msg.metadata.id;
+        let upstream_txid: u16 = rand::rng().random();
+
+        let mut wire = orig_query.to_vec();
+        wire[0..2].copy_from_slice(&upstream_txid.to_be_bytes());
+        let qname_mask = super::zeroxtwenty::encode(&mut wire)
+            .context("0x20 encode upstream query")?;
+
+        Ok(Self {
+            wire,
+            upstream_txid,
+            qname_mask,
+            client_txid,
+        })
+    }
+}
+
+/// The shared `finalize` step: parse an upstream response, lowercase
+/// every owner name (kills the 0x20-randomised case leak from
+/// upstream into the client response — matches BIND/Unbound; see
+/// `normalize`), restore the client's original TXID, re-serialise.
+///
+/// Shared by `query_one` (UDP / TCP) and `query_one_dot` so the two
+/// paths cannot drift on response handling.
+fn finalize(resp: &[u8], client_txid: u16) -> Result<Vec<u8>> {
+    let mut parsed = Message::from_bytes(resp)
+        .context("parse upstream response for normalisation")?;
+    super::normalize::lowercase_response_names(&mut parsed);
+    parsed.metadata.id = client_txid;
+    parsed
+        .to_vec()
+        .context("re-encode normalised forwarder response")
+}
+
+/// One DoT exchange — the `dot/direct` and `dot/tor` upstream legs.
+///
+/// `connect_target` is where the first TCP stream goes: tord's SOCKS5
+/// endpoint for `via: tor`, or the resolver itself for `via: direct`.
+/// `resolver` is the resolver's `address:853` — the SOCKS `CONNECT`
+/// target on the tor path, and (identically) `connect_target` on the
+/// direct path.
+///
+/// Fail-closed: every step (connect, SOCKS handshake, TLS handshake,
+/// query) returns `Err` on failure. There is deliberately no direct-
+/// connection fallback for the tor path — a `via: tor` server that
+/// can't reach tord fails the query rather than leaking.
+///
+/// Runs on a registered VCL worker thread under the `vcl` backend
+/// (the caller dispatches it onto a vcl-io worker), inline otherwise.
+#[allow(clippy::too_many_arguments)]
+async fn dot_exchange(
+    connect_target: SocketAddr,
+    resolver: SocketAddr,
+    source: Option<IpAddr>,
+    via: Via,
+    tls_name: &str,
+    prepared: &Prepared,
+    ctx: ReactorCtx,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let stream = transport::connect_stream(connect_target, source, ctx, timeout)
+        .await
+        .with_context(|| format!("connect_stream to {connect_target}"))?;
+
+    let dot_bytes = if via == Via::Tor {
+        // SOCKS5 CONNECT to the resolver, then DoT inside the tunnel.
+        // A SOCKS or TLS failure here returns Err — no direct
+        // fallback (fail-closed).
+        let mut stream = stream;
+        super::socks::connect(&mut stream, resolver, None)
+            .await
+            .with_context(|| format!("SOCKS5 CONNECT to {resolver} via tord"))?;
+        super::dot_client::query_dot(stream, tls_name, &prepared.wire, timeout).await?
+    } else {
+        super::dot_client::query_dot(stream, tls_name, &prepared.wire, timeout).await?
+    };
+
+    // TXID + 0x20 verification — defence in depth even over a
+    // verified TLS channel (see DESIGN-tor-forwarder.md §8).
+    if dot_bytes.len() < 12 {
+        return Err(anyhow!(
+            "short upstream DoT response ({} bytes)",
+            dot_bytes.len()
+        ));
+    }
+    let rx_txid = u16::from_be_bytes([dot_bytes[0], dot_bytes[1]]);
+    if rx_txid != prepared.upstream_txid {
+        return Err(anyhow!(
+            "upstream DoT TXID mismatch: got {rx_txid:#06x} expected {:#06x}",
+            prepared.upstream_txid
+        ));
+    }
+    super::zeroxtwenty::verify(&dot_bytes, &prepared.qname_mask)
+        .context("upstream DoT 0x20 mismatch")?;
+    finalize(&dot_bytes, prepared.client_txid)
+}
 
 #[derive(Clone)]
 pub struct Forwarders {
@@ -549,6 +675,14 @@ pub struct UpstreamClient {
     /// Kernel-sockets backend: a single reactor, no worker pool.
     #[cfg(not(feature = "vcl"))]
     reactor: ReactorCtx,
+    /// tord's SOCKS5 endpoint — the target `via: tor` forwarder
+    /// servers open their first TCP leg to. `Some` when `dns.tor_socks`
+    /// is configured (it always is — the config layer defaults it to
+    /// `127.0.0.1:9050`); `None` only via the test/`new` paths that
+    /// don't wire a tor address. A `via: tor` server with `None` here
+    /// fails the query — never a fallback to direct (see
+    /// `query_forwarder`).
+    tor_socks: Option<SocketAddr>,
 }
 
 
@@ -718,11 +852,13 @@ fn is_globally_routable_v6(v6: &std::net::Ipv6Addr) -> bool {
 }
 
 impl UpstreamClient {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         #[cfg(not(feature = "vcl"))] reactor: ReactorCtx,
         timeout_ms: Option<u32>,
         source_v4: Option<std::net::Ipv4Addr>,
         source_v6: Option<std::net::Ipv6Addr>,
+        tor_socks: Option<SocketAddr>,
         #[cfg(feature = "vcl")] workers: Vec<(tokio::runtime::Handle, ReactorCtx)>,
     ) -> Result<Self> {
         let timeout = Duration::from_millis(
@@ -770,6 +906,7 @@ impl UpstreamClient {
             tcp_next: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(not(feature = "vcl"))]
             reactor,
+            tor_socks,
         })
     }
 
@@ -780,10 +917,18 @@ impl UpstreamClient {
         }
     }
 
-    /// Send `query` to the first server that answers (round-robin
-    /// through the list, one timeout per server). `query` is the
-    /// wire-format request from the client; we rewrite the TXID and
-    /// forward, then rewrite the response TXID back on the way out.
+    /// Send `query` to the first IP that answers over classic
+    /// UDP-first DNS (TC→TCP fallback) — one timeout per server.
+    ///
+    /// This is the direct-UDP-by-IP path used by the iterative
+    /// recursor, the DNSSEC validator, and the anchor-refresh task
+    /// (all of which query NS / DNSKEY IPs that are always direct).
+    /// The per-domain *forwarder* path — which may carry DoT and
+    /// `via: tor` servers — is `query_forwarder`.
+    ///
+    /// `query` is the wire-format request from the client; we rewrite
+    /// the TXID and forward, then rewrite the response TXID back on
+    /// the way out.
     pub async fn query(
         &self,
         servers: &[std::net::IpAddr],
@@ -808,21 +953,14 @@ impl UpstreamClient {
     }
 
     async fn query_one(&self, peer: SocketAddr, orig_query: &[u8]) -> Result<Vec<u8>> {
-        let orig_msg = Message::from_bytes(orig_query).context("parse client query")?;
-        let client_txid = orig_msg.metadata.id;
-        let upstream_txid: u16 = rand::rng().random();
-
-        // Build the upstream wire. Fresh TXID + 0x20-randomised
-        // question name; the body is otherwise byte-identical to
-        // what the client sent us.
-        let mut out = orig_query.to_vec();
-        out[0..2].copy_from_slice(&upstream_txid.to_be_bytes());
-        let expected_qname = super::zeroxtwenty::encode(&mut out)
-            .context("0x20 encode upstream query")?;
+        // Build the upstream wire: fresh TXID + 0x20-randomised
+        // question name. `prepare` is shared with the DoT path so the
+        // two cannot drift.
+        let prepared = Prepared::build(orig_query).context("prepare upstream query")?;
 
         // UDP first.
         let udp_resp = self
-            .query_one_udp(peer, &out, upstream_txid, &expected_qname)
+            .query_one_udp(peer, &prepared.wire, prepared.upstream_txid, &prepared.qname_mask)
             .await?;
         let parsed = Message::from_bytes(&udp_resp).context("parse UDP response")?;
 
@@ -830,17 +968,21 @@ impl UpstreamClient {
         // Fresh TXID + fresh 0x20 mask for the TCP hop.
         let final_resp = if parsed.metadata.truncation {
             tracing::debug!(%peer, "TC=1 on UDP; retrying over TCP");
-            let tcp_txid: u16 = rand::rng().random();
-            let mut tcp_out = orig_query.to_vec();
-            tcp_out[0..2].copy_from_slice(&tcp_txid.to_be_bytes());
-            let tcp_mask = super::zeroxtwenty::encode(&mut tcp_out)
-                .context("0x20 encode TCP retry")?;
+            let tcp_prepared =
+                Prepared::build(orig_query).context("prepare TCP retry")?;
             // DIAG: time the TCP fallback. DNSKEY responses are
             // large and almost always TC=1, so this path dominates
             // DNSSEC-validation latency. `ok` distinguishes a slow
             // success from a slow failure.
             let tcp_t0 = std::time::Instant::now();
-            let r = self.query_one_tcp(peer, &tcp_out, tcp_txid, &tcp_mask).await;
+            let r = self
+                .query_one_tcp(
+                    peer,
+                    &tcp_prepared.wire,
+                    tcp_prepared.upstream_txid,
+                    &tcp_prepared.qname_mask,
+                )
+                .await;
             tracing::debug!(
                 %peer,
                 tcp_ms = tcp_t0.elapsed().as_millis() as u64,
@@ -852,18 +994,162 @@ impl UpstreamClient {
             udp_resp
         };
 
-        // Parse, lowercase every owner name (kills the 0x20-randomised
-        // case leak from upstream into the client response), restore
-        // the client's TXID, re-serialise. The case-leak fix matches
-        // BIND/Unbound; see `normalize` for the rationale.
-        let mut parsed = Message::from_bytes(&final_resp)
-            .context("parse upstream response for normalisation")?;
-        super::normalize::lowercase_response_names(&mut parsed);
-        parsed.metadata.id = client_txid;
-        let resp = parsed
-            .to_vec()
-            .context("re-encode normalised forwarder response")?;
-        Ok(resp)
+        // Normalise + restore the client's TXID. Shared with the DoT
+        // path via `finalize`.
+        finalize(&final_resp, prepared.client_txid)
+    }
+
+    /// Query one DoT server, optionally tunnelled through tord. This
+    /// is the `dot/direct` and `dot/tor` path. Like `query_one_tcp`,
+    /// every step is a libvppcom session op under the `vcl` backend,
+    /// so the whole exchange is dispatched onto a round-robin-picked
+    /// vcl-io worker. Under `kernel-sockets` it runs inline.
+    async fn query_one_dot(
+        &self,
+        srv: &ForwarderServer,
+        orig_query: &[u8],
+    ) -> Result<Vec<u8>> {
+        let tls_name = srv
+            .tls_name
+            .clone()
+            .ok_or_else(|| anyhow!("dot server {} has no tls_name", srv.address))?;
+
+        // `via: tor` MUST have a SOCKS endpoint. If it's missing the
+        // query fails — it never silently degrades to a direct
+        // connection (that would be a de-anonymisation bug).
+        let tor_socks = if srv.via == Via::Tor {
+            Some(self.tor_socks.ok_or_else(|| {
+                anyhow!(
+                    "via: tor server {} but no dns.tor_socks configured \
+                     — failing closed (no direct fallback)",
+                    srv.address
+                )
+            })?)
+        } else {
+            None
+        };
+
+        let resolver = SocketAddr::new(srv.address, DOT_PORT);
+        let prepared = Prepared::build(orig_query).context("prepare DoT query")?;
+        let timeout = self.timeout;
+
+        // The first TCP leg goes to tord (for `via: tor`) or straight
+        // to the resolver (for `via: direct`).
+        let connect_target = tor_socks.unwrap_or(resolver);
+        // Source IP for the first TCP leg: for `via: tor` the target
+        // is tord (typically loopback) so source selection is moot;
+        // for `via: direct` use the resolver's family source.
+        let source = self.source_for(connect_target);
+
+        let via = srv.via;
+
+        #[cfg(feature = "vcl")]
+        {
+            // Same worker-dispatch pattern as `query_one_tcp`: VCL
+            // session ops are valid only on a registered VCL worker
+            // thread, so round-robin onto a vcl-io worker. `tls_name`
+            // and `prepared` move into the spawned task ('static).
+            let i = self
+                .tcp_next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.workers.len();
+            let (vcl_io, reactor) = self.workers[i].clone();
+            let (tx, rx) = oneshot::channel();
+            vcl_io.spawn(async move {
+                let r = dot_exchange(
+                    connect_target,
+                    resolver,
+                    source,
+                    via,
+                    &tls_name,
+                    &prepared,
+                    reactor,
+                    timeout,
+                )
+                .await;
+                let _ = tx.send(r);
+            });
+            rx.await
+                .map_err(|_| anyhow!("vcl-io DoT dispatch dropped"))?
+        }
+        #[cfg(not(feature = "vcl"))]
+        {
+            // `self.reactor` is `()` on the kernel backend — the
+            // `unit_arg` lint fires on passing it as `ReactorCtx`,
+            // exactly as it does for the existing `query_one_tcp`.
+            #[allow(clippy::unit_arg)]
+            dot_exchange(
+                connect_target,
+                resolver,
+                source,
+                via,
+                &tls_name,
+                &prepared,
+                self.reactor,
+                timeout,
+            )
+            .await
+        }
+    }
+
+    /// Query a forwarder's server list. Each server is tried in
+    /// configured order with a per-server timeout; the first success
+    /// wins. Branches per server's transport/via:
+    ///
+    /// * `udp` + `direct` — the classic UDP-first path (`query_one`).
+    /// * `dot` + `direct` — TLS straight to the resolver:853.
+    /// * `dot` + `tor`    — TLS to the resolver:853 inside a SOCKS5
+    ///   tunnel through tord.
+    ///
+    /// **Fail-closed.** The config layer guarantees a forwarder is
+    /// either all-tor or all-direct (`Forwarder::resolved_servers`
+    /// rejects a mix), so this loop can never fall from a `via: tor`
+    /// server to a leaking `via: direct` sibling — fail-closed is
+    /// *structural*, not enforced by branch logic here. A `via: tor`
+    /// server whose SOCKS / TLS handshake fails just contributes an
+    /// `Err` like any other; with an all-tor forwarder every server
+    /// is tor, so the worst case is SERVFAIL — never a direct leak.
+    pub async fn query_forwarder(
+        &self,
+        servers: &[ForwarderServer],
+        query: &[u8],
+    ) -> Result<Vec<u8>> {
+        if servers.is_empty() {
+            return Err(anyhow!("forwarder has no upstream servers"));
+        }
+
+        let mut last_err = None;
+        for srv in servers {
+            let result = match (srv.transport, srv.via) {
+                (Transport::Udp, Via::Direct) => {
+                    let peer = SocketAddr::new(srv.address, 53);
+                    self.query_one(peer, query).await
+                }
+                (Transport::Dot, _) => self.query_one_dot(srv, query).await,
+                // `resolved_servers` rejects every other combination
+                // (tcp, udp+tor) at load time — this arm is
+                // unreachable for a validly-loaded config. Treat it
+                // as a hard error rather than silently doing UDP.
+                (t, v) => Err(anyhow!(
+                    "forwarder server {}: unsupported transport/via \
+                     combination ({t:?}/{v:?}) reached query path",
+                    srv.address
+                )),
+            };
+            match result {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    tracing::debug!(
+                        server = %srv.address,
+                        transport = ?srv.transport,
+                        via = ?srv.via,
+                        "upstream forwarder query failed: {e}"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no forwarder server responded")))
     }
 
     async fn query_one_udp(
@@ -1036,5 +1322,137 @@ mod tests {
             .lookup(&Name::from_ascii("www.iana.org.").unwrap())
             .unwrap();
         assert_eq!(addrs(hit), vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    /// Build a forwarder config from explicit full server specs.
+    fn fwd_full(domain: &str, servers: Vec<crate::config::ServerSpecFull>) -> ForwarderCfg {
+        ForwarderCfg {
+            domain: domain.into(),
+            servers: servers
+                .into_iter()
+                .map(crate::config::ServerSpec::Full)
+                .collect(),
+        }
+    }
+
+    fn dot_server(addr: &str, tls_name: &str, via: Via) -> crate::config::ServerSpecFull {
+        crate::config::ServerSpecFull {
+            address: addr.parse().unwrap(),
+            transport: Transport::Dot,
+            tls_name: Some(tls_name.into()),
+            via,
+        }
+    }
+
+    #[test]
+    fn forwarders_carry_dot_tor_specs_through_lookup() {
+        // A `dot/tor` forwarder survives `Forwarders::new` with its
+        // transport/via intact — the query path sees the full spec.
+        let f = Forwarders::new(&[fwd_full(
+            ".",
+            vec![dot_server("9.9.9.9", "dns.quad9.net", Via::Tor)],
+        )])
+        .unwrap();
+        let hit = f.lookup(&Name::from_ascii("example.com.").unwrap()).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].transport, Transport::Dot);
+        assert_eq!(hit[0].via, Via::Tor);
+    }
+
+    #[test]
+    fn forwarders_reject_mixed_tor_and_direct() {
+        // The no-mix rule is enforced at construction — a forwarder
+        // that mixes tor and direct never makes it into the table.
+        // This is the structural guarantee behind fail-closed: a
+        // server list reaching `query_forwarder` is all-tor or
+        // all-direct, so no tor query can fall to a direct sibling.
+        let result = Forwarders::new(&[fwd_full(
+            ".",
+            vec![
+                dot_server("9.9.9.9", "dns.quad9.net", Via::Tor),
+                dot_server("1.1.1.1", "cloudflare-dns.com", Via::Direct),
+            ],
+        )]);
+        let err = match result {
+            Ok(_) => panic!("mixed tor/direct forwarder must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("mixes via: tor and via: direct"),
+            "got: {err:#}"
+        );
+    }
+
+    /// A `query_forwarder` on an empty server list is a hard error,
+    /// not a panic or a silent success.
+    #[cfg(not(feature = "vcl"))]
+    #[tokio::test]
+    async fn query_forwarder_rejects_empty_server_list() {
+        let client = test_upstream_client(None).await;
+        let err = client.query_forwarder(&[], b"\0\0").await.unwrap_err();
+        assert!(
+            err.to_string().contains("no upstream servers"),
+            "got: {err}"
+        );
+    }
+
+    /// A `via: tor` server with no `tor_socks` configured fails the
+    /// query — it does NOT silently connect direct. This is the
+    /// fail-closed contract: missing tord ⇒ SERVFAIL, never a leak.
+    #[cfg(not(feature = "vcl"))]
+    #[tokio::test]
+    async fn via_tor_without_tor_socks_fails_closed() {
+        // tor_socks = None simulates an instance that never wired a
+        // SOCKS endpoint. The forwarder is all-tor (the no-mix rule
+        // guarantees that), so the only outcome is the error below —
+        // there is no direct sibling to fall to.
+        let client = test_upstream_client(None).await;
+        let srv = ForwarderServer {
+            address: "9.9.9.9".parse().unwrap(),
+            transport: Transport::Dot,
+            tls_name: Some("dns.quad9.net".into()),
+            via: Via::Tor,
+        };
+        let err = client
+            .query_forwarder(std::slice::from_ref(&srv), &minimal_query())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no dns.tor_socks configured")
+                && msg.contains("failing closed"),
+            "expected fail-closed error, got: {msg}"
+        );
+    }
+
+    /// Build a minimal valid DNS query (header + one A question for
+    /// `example.com.`) so `Prepared::build` can parse it.
+    #[cfg(not(feature = "vcl"))]
+    fn minimal_query() -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        let mut m = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        m.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        m.to_vec().unwrap()
+    }
+
+    /// Construct an `UpstreamClient` for tests. Binds a real ephemeral
+    /// loopback upstream socket via the kernel backend; `tor_socks`
+    /// lets a test pin (or omit) the SOCKS endpoint.
+    #[cfg(not(feature = "vcl"))]
+    async fn test_upstream_client(tor_socks: Option<SocketAddr>) -> UpstreamClient {
+        let reactor = crate::io::transport::new_reactor().unwrap();
+        UpstreamClient::new(
+            reactor,
+            Some(500),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            None,
+            tor_socks,
+        )
+        .await
+        .expect("build test UpstreamClient")
     }
 }

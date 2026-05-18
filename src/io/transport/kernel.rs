@@ -133,6 +133,47 @@ impl AsyncWrite for DnsTcpStream {
 }
 
 // =============================================================================
+// Bare connected client stream (for the DoT / via: tor forwarder path)
+// =============================================================================
+
+/// A bare connected client stream — the primitive the `via: tor` /
+/// DoT forwarder path layers SOCKS5 + TLS onto. On the kernel
+/// backend this is a plain `tokio::net::TcpStream`, which already
+/// implements `AsyncRead + AsyncWrite + Unpin + Send`.
+pub type ClientStream = tokio::net::TcpStream;
+
+/// Open a bare TCP stream to `peer` and hand it back unframed — no
+/// DNS framing, no TLS, just a connected socket. The forwarder's
+/// DoT / `via: tor` path layers SOCKS5 + rustls onto the returned
+/// stream itself; `query_tcp_dns_async` (connect + frame + query in
+/// one call) can't be split that way, hence this primitive.
+pub async fn connect_stream(
+    peer: SocketAddr,
+    source: Option<IpAddr>,
+    _ctx: ReactorCtx,
+    timeout: Duration,
+) -> anyhow::Result<ClientStream> {
+    use tokio::time::timeout as tk_timeout;
+    let connect_fut = async {
+        if let Some(src_ip) = source {
+            // Explicit source bind, mirroring `query_tcp_dns_async`.
+            let socket = if src_ip.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            socket.bind(SocketAddr::new(src_ip, 0))?;
+            Ok::<_, anyhow::Error>(socket.connect(peer).await?)
+        } else {
+            Ok(tokio::net::TcpStream::connect(peer).await?)
+        }
+    };
+    tk_timeout(timeout, connect_fut)
+        .await
+        .map_err(|_| anyhow!("connect timeout to {peer}"))?
+}
+
+// =============================================================================
 // One-shot TCP DNS query
 // =============================================================================
 

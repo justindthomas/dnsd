@@ -5,7 +5,7 @@
 //! additions is automatic — we only need to add fields here when we
 //! start honouring them.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -38,7 +38,7 @@ pub struct VrfYaml {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DnsConfig {
     pub enabled: bool,
@@ -69,6 +69,13 @@ pub struct DnsConfig {
     /// adding parallelism.
     #[serde(default)]
     pub tcp_workers: Option<u32>,
+    /// tord's SOCKS5 endpoint, used by `via: tor` forwarder servers.
+    /// A `dns:`-level field (not under the router-wide `tor:` block)
+    /// because dnsd parses only `dns:` and needs its own pointer at
+    /// tord. Default `127.0.0.1:9050` — the co-located cut-through
+    /// case where dnsd reaches tord over a VPP loopback session.
+    #[serde(default = "default_tor_socks")]
+    pub tor_socks: SocketAddr,
     /// Per-VRF DNS instances. Each entry has its own listeners /
     /// forwarders / cache / etc. plus a `name` matching a
     /// top-level `vrfs[].name`. impd's supervisor spawns one
@@ -76,6 +83,34 @@ pub struct DnsConfig {
     /// flat top-level fields above.
     #[serde(default)]
     pub vrfs: Vec<DnsVrfConfig>,
+}
+
+/// Default SOCKS5 endpoint for `via: tor` forwarders — tord's
+/// loopback listener.
+fn default_tor_socks() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 9050))
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        // Hand-written because `SocketAddr` has no `Default` impl, so
+        // the derive can't cover `tor_socks`. Every other field is
+        // its type's natural default.
+        Self {
+            enabled: false,
+            listeners: Vec::new(),
+            forwarders: Vec::new(),
+            recursion: None,
+            cache: None,
+            dns64: None,
+            tls: None,
+            rate_limit: None,
+            sfw: None,
+            tcp_workers: None,
+            tor_socks: default_tor_socks(),
+            vrfs: Vec::new(),
+        }
+    }
 }
 
 /// One per-VRF DNS instance. Same shape as `DnsConfig` minus
@@ -198,9 +233,18 @@ pub struct Forwarder {
 impl Forwarder {
     /// Normalise the on-disk server list into `ForwarderServer`s and
     /// validate it. A bare IP becomes a direct-UDP server (unchanged
-    /// behaviour). Combinations not yet wired into the query path are
-    /// rejected here, so a config can't promise anonymity dnsd does
-    /// not yet deliver — see DESIGN-tor-forwarder.md.
+    /// behaviour).
+    ///
+    /// Wired into the query path (phase 4): `udp/direct`,
+    /// `dot/direct`, `dot/tor`. Combinations not yet implemented are
+    /// rejected here, so a config can never promise a property dnsd
+    /// does not deliver — see DESIGN-tor-forwarder.md §10.4.
+    ///
+    /// Fail-closed is *structural*: a forwarder may not mix `via: tor`
+    /// and `via: direct` servers, so no query-path code can ever fall
+    /// from a tor server to a direct sibling. `via: tor` additionally
+    /// requires `transport: dot` — plain TCP would expose the queries
+    /// to the Tor exit node.
     pub fn resolved_servers(&self) -> Result<Vec<ForwarderServer>> {
         let mut out = Vec::with_capacity(self.servers.len());
         for spec in &self.servers {
@@ -225,26 +269,49 @@ impl Forwarder {
                     srv.address,
                 );
             }
-            // Phase 1: only direct UDP is wired into the upstream
-            // query path. TCP / DoT / via: tor parse but are not yet
-            // implemented — reject loudly rather than silently doing
-            // the wrong (possibly de-anonymising) thing.
-            if srv.transport != Transport::Udp {
+            // Plain TCP is not yet wired into the upstream query path
+            // (the forwarder path is UDP / DoT only). Reject loudly
+            // rather than silently doing UDP.
+            if srv.transport == Transport::Tcp {
                 anyhow::bail!(
-                    "forwarder {}: transport: {} is not yet implemented \
+                    "forwarder {}: server {}: transport: tcp is not yet wired \
                      (see DESIGN-tor-forwarder.md)",
                     self.domain,
+                    srv.address,
+                );
+            }
+            // `via: tor` requires DoT. Plain DNS over a Tor circuit
+            // would let the exit node read every query — defeating
+            // the entire point. UDP-over-Tor is impossible anyway
+            // (Tor is TCP-only); spell both out.
+            if srv.via == Via::Tor && srv.transport != Transport::Dot {
+                anyhow::bail!(
+                    "forwarder {}: server {}: via: tor requires transport: dot \
+                     (plain {} would expose queries to the Tor exit; \
+                     see DESIGN-tor-forwarder.md)",
+                    self.domain,
+                    srv.address,
                     transport_name(srv.transport),
                 );
             }
-            if srv.via != Via::Direct {
-                anyhow::bail!(
-                    "forwarder {}: via: tor is not yet implemented \
-                     (see DESIGN-tor-forwarder.md)",
-                    self.domain,
-                );
-            }
             out.push(srv);
+        }
+        // No-mix rule: a forwarder is either all-tor or all-direct.
+        // This is what makes fail-closed structural — with no mixed
+        // forwarder there is no code path that can fall from a tor
+        // server to a direct sibling and leak. Enforced here so a
+        // single mistyped `via: direct` line can't quietly create a
+        // de-anonymisation hole.
+        let any_tor = out.iter().any(|s| s.via == Via::Tor);
+        let any_direct = out.iter().any(|s| s.via == Via::Direct);
+        if any_tor && any_direct {
+            anyhow::bail!(
+                "forwarder {}: mixes via: tor and via: direct servers — \
+                 a forwarder must be all-tor or all-direct so a tor query \
+                 can never fall back to a leaking direct sibling \
+                 (see DESIGN-tor-forwarder.md §10.4)",
+                self.domain,
+            );
         }
         Ok(out)
     }
@@ -465,6 +532,11 @@ impl DnsConfig {
             ));
         }
         let dns = doc.dns.unwrap_or_default();
+        // tord is a router-wide service; per-VRF DNS instances inherit
+        // the top-level `dns.tor_socks` pointer rather than declaring
+        // their own (per-VRF SOCKS endpoints are the deferred routable
+        // case — see DESIGN-tor-forwarder.md §7).
+        let tor_socks = dns.tor_socks;
         let v = dns
             .vrfs
             .into_iter()
@@ -484,6 +556,7 @@ impl DnsConfig {
             rate_limit: v.rate_limit,
             sfw: v.sfw,
             tcp_workers: v.tcp_workers,
+            tor_socks,
             vrfs: Vec::new(),
         })
     }
@@ -564,7 +637,7 @@ dns:
     }
 
     #[test]
-    fn forwarder_rejects_unimplemented_specs() {
+    fn forwarder_rejects_dot_without_tls_name() {
         // transport: dot without tls_name.
         let dns = serde_yaml::from_str::<RouterYaml>(
             "dns:\n  forwarders:\n    - domain: x\n      servers:\n        - { address: \"9.9.9.9\", transport: dot }\n",
@@ -572,16 +645,110 @@ dns:
         .unwrap()
         .dns
         .unwrap();
-        assert!(dns.forwarders[0].resolved_servers().is_err());
+        let err = dns.forwarders[0].resolved_servers().unwrap_err();
+        assert!(
+            err.to_string().contains("tls_name"),
+            "got: {err}"
+        );
+    }
 
-        // via: tor is not yet wired into the query path (phase 1).
+    #[test]
+    fn forwarder_rejects_via_tor_without_dot() {
+        // via: tor with the default (udp) transport — must be DoT.
         let dns = serde_yaml::from_str::<RouterYaml>(
             "dns:\n  forwarders:\n    - domain: x\n      servers:\n        - { address: \"9.9.9.9\", via: tor }\n",
         )
         .unwrap()
         .dns
         .unwrap();
+        let err = dns.forwarders[0].resolved_servers().unwrap_err();
+        assert!(
+            err.to_string().contains("via: tor requires transport: dot"),
+            "got: {err}"
+        );
+
+        // via: tor + explicit tcp — also rejected (TCP is rejected
+        // outright before the tor check, but either way it errors).
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  forwarders:\n    - domain: x\n      servers:\n        - { address: \"9.9.9.9\", transport: tcp, via: tor }\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
         assert!(dns.forwarders[0].resolved_servers().is_err());
+    }
+
+    #[test]
+    fn forwarder_rejects_mixed_tor_and_direct() {
+        // A forwarder may not mix via: tor and via: direct servers —
+        // the no-mix rule is what makes fail-closed structural.
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  forwarders:\n    - domain: x\n      servers:\n        \
+             - { address: \"9.9.9.9\", transport: dot, tls_name: dns.quad9.net, via: tor }\n        \
+             - { address: \"1.1.1.1\", transport: dot, tls_name: cloudflare-dns.com, via: direct }\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
+        let err = dns.forwarders[0].resolved_servers().unwrap_err();
+        assert!(
+            err.to_string().contains("mixes via: tor and via: direct"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn forwarder_accepts_dot_direct_and_dot_tor() {
+        // dot/direct.
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  forwarders:\n    - domain: x\n      servers:\n        \
+             - { address: \"9.9.9.9\", transport: dot, tls_name: dns.quad9.net }\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
+        let srv = dns.forwarders[0].resolved_servers().unwrap();
+        assert_eq!(srv.len(), 1);
+        assert_eq!(srv[0].transport, Transport::Dot);
+        assert_eq!(srv[0].via, Via::Direct);
+        assert_eq!(srv[0].tls_name.as_deref(), Some("dns.quad9.net"));
+
+        // dot/tor — an all-tor forwarder.
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  forwarders:\n    - domain: .\n      servers:\n        \
+             - { address: \"9.9.9.9\", transport: dot, tls_name: dns.quad9.net, via: tor }\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
+        let srv = dns.forwarders[0].resolved_servers().unwrap();
+        assert_eq!(srv.len(), 1);
+        assert_eq!(srv[0].transport, Transport::Dot);
+        assert_eq!(srv[0].via, Via::Tor);
+    }
+
+    #[test]
+    fn tor_socks_default_and_override() {
+        // Default when unset.
+        let dns = serde_yaml::from_str::<RouterYaml>("dns:\n  enabled: true\n")
+            .unwrap()
+            .dns
+            .unwrap();
+        assert_eq!(
+            dns.tor_socks,
+            "127.0.0.1:9050".parse::<SocketAddr>().unwrap()
+        );
+        // Operator override round-trips.
+        let dns = serde_yaml::from_str::<RouterYaml>(
+            "dns:\n  enabled: true\n  tor_socks: \"10.0.0.1:9150\"\n",
+        )
+        .unwrap()
+        .dns
+        .unwrap();
+        assert_eq!(
+            dns.tor_socks,
+            "10.0.0.1:9150".parse::<SocketAddr>().unwrap()
+        );
     }
 
     fn vrf_yaml() -> &'static str {

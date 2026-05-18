@@ -515,6 +515,10 @@ impl RecursorHandler {
                 upstream_timeout_ms,
                 source_v4,
                 source_v6,
+                // tord's SOCKS5 endpoint for `via: tor` forwarders.
+                // The config layer always defaults this (127.0.0.1:9050),
+                // so it's always Some for a real config.
+                Some(cfg.tor_socks),
                 #[cfg(feature = "vcl")]
                 workers,
             )
@@ -981,10 +985,10 @@ impl RecursorHandler {
                 self.metrics
                     .forwarder_matched
                     .fetch_add(1, Ordering::Relaxed);
-                // Phase 1: every forwarder server is direct UDP
-                // (config validation rejects dot / tor for now), so
-                // the upstream query takes just the addresses.
-                s.iter().map(|fs| fs.address).collect::<Vec<_>>()
+                // Pass the full ForwarderServer specs through to
+                // `query_forwarder` — it branches per server on
+                // transport/via (udp/direct, dot/direct, dot/tor).
+                s.to_vec()
             }
             None => {
                 // No forwarder match — fall through to iterative
@@ -1054,7 +1058,7 @@ impl RecursorHandler {
             }
         };
 
-        let resp_bytes = match self.upstream.query(&servers, query).await {
+        let resp_bytes = match self.upstream.query_forwarder(&servers, query).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(qname = %&q.name, "forwarder failed: {e}");
@@ -1085,7 +1089,7 @@ impl RecursorHandler {
                     // Fall through to the original AAAA response.
                     return Some(respond_with_policy(&mut resp, &self.dnssec));
                 };
-                match self.upstream.query(&servers, &a_query_bytes).await {
+                match self.upstream.query_forwarder(&servers, &a_query_bytes).await {
                     Ok(a_bytes) => {
                         if let Ok(a_resp) = Message::from_bytes(&a_bytes) {
                             if !a_resp.answers.is_empty() {
@@ -1314,10 +1318,13 @@ impl RecursorHandler {
         }
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        let servers = self.forwarders.lookup(qname)?;
-        let servers: Vec<_> = servers.iter().map(|fs| fs.address).collect();
+        let servers = self.forwarders.lookup(qname)?.to_vec();
         let q_bytes = query_msg.to_vec().ok()?;
-        let resp_bytes = self.upstream.query(&servers, &q_bytes).await.ok()?;
+        let resp_bytes = self
+            .upstream
+            .query_forwarder(&servers, &q_bytes)
+            .await
+            .ok()?;
         if let Ok(parsed) = Message::from_bytes(&resp_bytes) {
             self.cache.put(key, &parsed, resp_bytes.clone()).await;
         }
