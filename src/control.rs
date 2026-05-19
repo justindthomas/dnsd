@@ -130,7 +130,7 @@ pub struct TlsInfo {
 /// `main.rs`. The forwarders pointer is wrapped in `ArcSwap` so a
 /// SIGHUP-triggered reload can publish a fresh forwarder table
 /// without coordinating with the control server thread — every
-/// `dnsd-query forwarders` snapshot reads the current Arc.
+/// `dnsd query forwarders` snapshot reads the current Arc.
 #[derive(Clone)]
 pub struct ControlState {
     pub metrics: Arc<Metrics>,
@@ -283,7 +283,7 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
     }
 }
 
-/// Thin client used by the `imp-dnsd-query` binary.
+/// Thin client used by the `dnsd query` subcommand.
 pub async fn send_request(socket: &Path, req: &ControlRequest) -> Result<ControlResponse> {
     let stream = UnixStream::connect(socket).await?;
     let (rx, mut tx) = stream.into_split();
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn listeners_request_round_trips() {
         // The new {"command":"listeners"} shape must serde
-        // cleanly — clients (imp-dnsd-query, impd's
+        // cleanly — clients (`dnsd query`, impd's
         // query_imp_dnsd) build this by hand.
         let req: ControlRequest =
             serde_json::from_str(r#"{"command":"listeners"}"#).unwrap();

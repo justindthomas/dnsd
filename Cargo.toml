@@ -123,10 +123,6 @@ path = "src/lib.rs"
 name = "dnsd"
 path = "src/main.rs"
 
-[[bin]]
-name = "dnsd-query"
-path = "src/bin/dnsd-query.rs"
-
 # Local development overrides — mirrors the bgpd / dhcpd pattern.
 # When `../vcl-rs` exists alongside the dnsd checkout, prefer the
 # local copy (needed during vcl-rs UDP development).

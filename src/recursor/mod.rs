@@ -312,7 +312,7 @@ impl RecursorHandler {
             // glitch during dnsd start pins us in REFUSED-mode
             // forever; with it, we self-heal once connectivity
             // returns. No upper bound on retries: an operator
-            // looking at `imp-dnsd-query stats` will see
+            // looking at `imp-dnsd query stats` will see
             // `ready=false` and can escalate; rather that than
             // dnsd silently starting to answer queries it can't
             // actually resolve.

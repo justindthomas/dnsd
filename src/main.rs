@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinHandle;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -25,7 +25,10 @@ use tracing_subscriber::{fmt, EnvFilter};
 use dnsd::acl::ClientAcl;
 use dnsd::acme;
 use dnsd::config::{DnsConfig, Listener as ListenerCfg, DEFAULT_MAX_INFLIGHT};
-use dnsd::control::{ControlServer, ControlState, ListenerInfo, TlsInfo, DEFAULT_SOCKET};
+use dnsd::control::{
+    send_request, ControlRequest, ControlServer, ControlState, ListenerInfo, TlsInfo,
+    DEFAULT_SOCKET,
+};
 use dnsd::handler::{AclSwap, CtxSwap, ListenerContext, LiveHandler, SharedHandler};
 use dnsd::io::{doh::DohListener, dot::DotListener, tcp::TcpListener, udp::UdpListener};
 use dnsd::metrics::Metrics;
@@ -97,8 +100,15 @@ fn make_ctx_swap(lc: &ListenerCfg) -> CtxSwap {
 #[derive(Parser, Debug)]
 #[command(name = "dnsd", about = "DNS caching resolver + forwarder")]
 struct Args {
+    /// Subcommand. Absent → run the daemon. `query` → a one-shot
+    /// control-socket round-trip (replaces the former standalone
+    /// query binary), matching the `tord query` / `imp-bgpd query`
+    /// pattern.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to router.yaml.
-    #[arg(long, default_value = "/persistent/config/router.yaml")]
+    #[arg(long, default_value = "/persistent/config/router.yaml", global = true)]
     config: PathBuf,
 
     /// Directory for persistent daemon state (root-hints cache,
@@ -106,11 +116,11 @@ struct Args {
     /// missing. Kept separate from `--config` because on imp this
     /// lives under `/persistent/data` while config lives under
     /// `/persistent/config`.
-    #[arg(long, default_value = "/persistent/data/dnsd")]
+    #[arg(long, default_value = "/persistent/data/dnsd", global = true)]
     data_dir: PathBuf,
 
     /// Control socket path.
-    #[arg(long, default_value = DEFAULT_SOCKET)]
+    #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
     control_socket: PathBuf,
 
     /// Per-VRF instance name. When set, dnsd reads only the
@@ -118,11 +128,89 @@ struct Args {
     /// it the daemon falls back to the legacy single-tenant
     /// top-level `dns:` block. impd's supervisor passes this for
     /// every non-default-VRF child it spawns (`imp-dnsd@<vrf>`).
-    #[arg(long)]
+    #[arg(long, global = true)]
     vrf: Option<String>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Query the running dnsd daemon over its control socket and
+    /// print the JSON reply.
+    Query {
+        #[command(subcommand)]
+        cmd: QueryCmd,
+    },
+}
+
+/// Operator query subjects — the control-socket protocol surface.
+/// Mirrors `dnsd::control::ControlRequest`.
+#[derive(Subcommand, Debug)]
+enum QueryCmd {
+    /// Counter snapshot.
+    Stats,
+    /// Configured forwarders + live RTT.
+    Forwarders,
+    /// Currently-bound listeners (post-reload diff).
+    Listeners,
+    /// TLS materials in effect for DoT/DoH (cert source, subject,
+    /// not-after, SAN, ALPN).
+    Tls,
+    /// SIGHUP-equivalent reconfigure.
+    Reload,
+    /// Cache stats / flush / dump.
+    Cache {
+        #[arg(long)]
+        op: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        rrtype: Option<String>,
+    },
+    /// Trace the resolver's path for a name.
+    Upstream { name: String },
+}
+
+/// `dnsd query …` — a synchronous control-socket round-trip. No
+/// tracing subscriber, no config load, no VCL: just connect, send
+/// one request, print the JSON reply.
+fn run_query(socket: &std::path::Path, cmd: &QueryCmd) -> Result<()> {
+    // Restore SIGPIPE to SIG_DFL so `dnsd query stats | head` exits
+    // silently on EPIPE instead of panicking on a broken-pipe write
+    // (Rust's default sets SIG_IGN).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    let req = match cmd {
+        QueryCmd::Stats => ControlRequest::Stats,
+        QueryCmd::Forwarders => ControlRequest::Forwarders,
+        QueryCmd::Listeners => ControlRequest::Listeners,
+        QueryCmd::Tls => ControlRequest::Tls,
+        QueryCmd::Reload => ControlRequest::Reload,
+        QueryCmd::Cache { op, name, rrtype } => ControlRequest::Cache {
+            op: op.clone(),
+            name: name.clone(),
+            rrtype: rrtype.clone(),
+        },
+        QueryCmd::Upstream { name } => ControlRequest::Upstream { name: name.clone() },
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime (query)")?;
+    let resp = rt.block_on(send_request(socket, &req))?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // `dnsd query …` returns here — a control-socket round-trip with
+    // no daemon setup (no tracing subscriber, no config load, no VCL).
+    if let Some(Command::Query { cmd }) = &args.command {
+        return run_query(&args.control_socket, cmd);
+    }
+
     // Honour NO_COLOR — keeps ANSI escapes out of impd-captured
     // stderr → journald.
     //
@@ -149,8 +237,6 @@ fn main() -> Result<()> {
         // second "INFO").
         builder.without_time().with_level(false).init();
     }
-
-    let args = Args::parse();
 
     let cfg = match &args.vrf {
         None => DnsConfig::load(&args.config)
@@ -356,7 +442,7 @@ async fn async_main(
 
     // Build cache + forwarders up front. Neither needs VCL/VPP, and
     // sharing them with both the RecursorHandler and the control
-    // socket means `dnsd-query cache dump` sees live state from
+    // socket means `dnsd query cache dump` sees live state from
     // the same instance the handler is populating.
     let cache = RecursorHandler::build_cache_from_config(&cfg);
     let forwarders_initial =
@@ -550,7 +636,7 @@ async fn async_main(
 
 /// Render the live listener map into the shape consumed by the
 /// control socket. Called after every bind/diff so
-/// `imp-dnsd-query listeners` always reflects the current state.
+/// `imp-dnsd query listeners` always reflects the current state.
 fn snapshot_listeners(listeners: &LiveListeners) -> Vec<ListenerInfo> {
     let mut out: Vec<ListenerInfo> = listeners
         .iter()
@@ -849,11 +935,11 @@ struct WaitArgs {
     live: Arc<LiveHandler<RecursorHandler>>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     /// Same ArcSwap the control socket holds — reload publishes the
-    /// fresh Forwarders here so `dnsd-query forwarders` sees the
+    /// fresh Forwarders here so `dnsd query forwarders` sees the
     /// new table immediately.
     forwarders_swap: Arc<arc_swap::ArcSwap<Forwarders>>,
     /// Listener bind snapshot published after every diff — drives
-    /// `imp-dnsd-query listeners`.
+    /// `imp-dnsd query listeners`.
     listeners_swap: Arc<arc_swap::ArcSwap<Vec<ListenerInfo>>>,
     /// TLS materials snapshot published when `dns.tls:` is built.
     /// Rebuilt on SIGHUP so an operator who rotated certs (or
@@ -906,7 +992,7 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
 
     // Publish the new forwarder table to the control socket's
     // shared view BEFORE swapping the recursor — that way
-    // `dnsd-query forwarders` won't briefly disagree with the
+    // `dnsd query forwarders` won't briefly disagree with the
     // recursor's actual lookup behaviour.
     args.forwarders_swap.store(new_forwarders.clone());
 

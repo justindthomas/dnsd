@@ -45,7 +45,7 @@ const DEFAULT_ACME_CACHE: &str = "/persistent/data/dnsd/acme";
 /// listeners accept into; when ACME is active, the driver task
 /// handle is kept so the caller can abort on shutdown. `info`
 /// summarises the cert source for the control socket — operators
-/// query it via `imp-dnsd-query tls`.
+/// query it via `imp-dnsd query tls`.
 pub struct TlsSetup {
     pub server_config: Arc<ServerConfig>,
     #[allow(dead_code)]

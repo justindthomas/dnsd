@@ -28,7 +28,8 @@ transport backends.
   on SIGHUP without rebinding sockets.
 * Per-client RRL, EDNS0 cookies (RFC 7873), 0x20 case randomisation
   on outbound queries.
-* Operator CLI `imp-dnsd-query` over a Unix control socket: live
+* Operator CLI `dnsd query` (a subcommand of the daemon binary)
+  over a Unix control socket: live
   stats, cache inspection, cache flush, forwarder list, SIGHUP-
   equivalent reload.
 
@@ -112,7 +113,7 @@ service or losing connectivity is non-fatal.
 |---|---|---|
 | `--config` | `/persistent/config/router.yaml` | Path to the YAML config. |
 | `--data-dir` | `/persistent/data/dnsd` | Persistent state (root hints, anchor dir, ACME certs). Created on first boot. |
-| `--control-socket` | `/run/dnsd.sock` | Unix socket for `imp-dnsd-query`. |
+| `--control-socket` | `/run/dnsd.sock` | Unix socket for `dnsd query`. |
 
 `SIGHUP` reloads config in place — listeners that didn't change
 keep their existing sockets, recursor state (cache, neg-resolve,
@@ -200,15 +201,15 @@ dns:
 
 ## Operator CLI
 
-`imp-dnsd-query` connects to the control socket. Same flag for the
-socket path as the daemon (`--socket`).
+`dnsd query` is a subcommand of the daemon binary — it connects to
+the control socket. Same `--control-socket` flag as the daemon.
 
 ```bash
-imp-dnsd-query stats           # counter snapshot
-imp-dnsd-query forwarders      # configured forwarder table
-imp-dnsd-query cache --op stats
-imp-dnsd-query cache --op flush
-imp-dnsd-query reload          # SIGHUP-equivalent
+dnsd query stats           # counter snapshot
+dnsd query forwarders      # configured forwarder table
+dnsd query cache --op stats
+dnsd query cache --op flush
+dnsd query reload          # SIGHUP-equivalent
 ```
 
 ## DNSSEC: zero-config
@@ -265,7 +266,7 @@ Transport: 1035, 7766 (TCP), 7858 (DoT), 8484 (DoH), 8482 (ANY/HINFO),
 src/
   config.rs              # YAML schema + load/validate
   handler.rs             # SharedHandler + ArcSwap reload glue
-  control.rs             # Unix-socket protocol with imp-dnsd-query
+  control.rs             # Unix-socket protocol for `dnsd query`
   io/
     transport/{vcl,kernel}.rs   # backend-selected socket types
     udp.rs / tcp.rs / dot.rs / doh.rs   # listener loops
