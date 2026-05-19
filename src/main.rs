@@ -90,7 +90,7 @@ fn make_acl_swap(lc: &ListenerCfg) -> AclSwap {
 
 fn make_ctx_swap(lc: &ListenerCfg) -> CtxSwap {
     Arc::new(arc_swap::ArcSwap::from_pointee(ListenerContext::new(
-        &lc.name, lc.dns64,
+        &lc.name, lc.dns64, lc.auth_token.clone(),
     )))
 }
 
@@ -1020,7 +1020,9 @@ async fn reload(args: &WaitArgs, listeners: &mut LiveListeners) {
     for (key, lc) in &desired {
         if let Some(live) = listeners.get_mut(key) {
             let new_acl = Arc::new(ClientAcl::new(lc.allow_from.clone()));
-            let new_ctx = Arc::new(ListenerContext::new(&lc.name, lc.dns64));
+            let new_ctx = Arc::new(ListenerContext::new(
+                &lc.name, lc.dns64, lc.auth_token.clone(),
+            ));
             live.acl.store(new_acl);
             live.ctx.store(new_ctx);
             // Cached name is what we use in the abort log line; keep

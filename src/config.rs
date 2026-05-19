@@ -162,6 +162,14 @@ pub struct Listener {
     /// Unset → 1024.
     #[serde(default)]
     pub max_inflight: Option<u32>,
+    /// DoH bearer token. When set, this listener serves DoH only at
+    /// the path `/dns-query/<auth_token>`; a request to bare
+    /// `/dns-query` (or with the wrong token) gets 404. Closes the
+    /// open-resolver gap on internet-facing listeners — the WAN
+    /// listeners have `allow_from: ::/0`, so without this any host
+    /// can use the resolver. Ignored by non-DoH protocols.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 fn default_port() -> u16 { 53 }

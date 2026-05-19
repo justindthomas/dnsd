@@ -36,17 +36,26 @@ pub type CtxSwap = Arc<arc_swap::ArcSwap<ListenerContext>>;
 
 /// Per-listener policy carried alongside every query so the shared
 /// handler can vary behaviour based on which listener accepted the
-/// request. Today we only need to know whether DNS64 is on; adds
-/// (per-listener RRL thresholds, forwarder subset, etc.) go here.
+/// request. Adds (per-listener RRL thresholds, forwarder subset,
+/// etc.) go here.
 #[derive(Clone, Debug, Default)]
 pub struct ListenerContext {
     pub name: String,
     pub dns64: bool,
+    /// DoH bearer token for this listener. `Some` → the DoH handler
+    /// requires the request path `/dns-query/<token>`; `None` → bare
+    /// `/dns-query`. Carried in the hot-swappable context so a
+    /// SIGHUP token change takes effect on the next request.
+    pub doh_auth_token: Option<String>,
 }
 
 impl ListenerContext {
-    pub fn new(name: impl Into<String>, dns64: bool) -> Self {
-        Self { name: name.into(), dns64 }
+    pub fn new(
+        name: impl Into<String>,
+        dns64: bool,
+        doh_auth_token: Option<String>,
+    ) -> Self {
+        Self { name: name.into(), dns64, doh_auth_token }
     }
 }
 

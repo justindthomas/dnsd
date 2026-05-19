@@ -740,28 +740,34 @@ impl RecursorHandler {
         // — DDR off — when there is no encrypted listener, no cert
         // domain, or no global-scope address.
         let ddr_svcb = {
-            let proto_addrs = |proto: &str| -> Vec<std::net::IpAddr> {
-                cfg.listeners
-                    .iter()
-                    .filter(|l| {
-                        l.protocols
-                            .iter()
-                            .any(|p| p.eq_ignore_ascii_case(proto))
-                    })
-                    .map(|l| l.address)
-                    .collect()
-            };
+            let dot_addrs: Vec<std::net::IpAddr> = cfg
+                .listeners
+                .iter()
+                .filter(|l| {
+                    l.protocols.iter().any(|p| p.eq_ignore_ascii_case("dot"))
+                })
+                .map(|l| l.address)
+                .collect();
+            // DDR only advertises DoH endpoints a discovery client
+            // can reach WITHOUT a token: the dohpath we advertise
+            // carries no token, so a token-gated listener (the WAN
+            // DoH endpoints) would break discovery. Drop them here.
+            let doh_addrs: Vec<std::net::IpAddr> = cfg
+                .listeners
+                .iter()
+                .filter(|l| {
+                    l.protocols.iter().any(|p| p.eq_ignore_ascii_case("doh"))
+                })
+                .filter(|l| l.auth_token.is_none())
+                .map(|l| l.address)
+                .collect();
             cfg.tls
                 .as_ref()
                 .and_then(|t| t.acme.as_ref())
                 .and_then(|a| a.domains.first())
                 .and_then(|d| hickory_proto::rr::Name::from_ascii(d).ok())
                 .map(|name| {
-                    ddr::build_ddr_records(
-                        &name,
-                        &proto_addrs("dot"),
-                        &proto_addrs("doh"),
-                    )
+                    ddr::build_ddr_records(&name, &dot_addrs, &doh_addrs)
                 })
                 .unwrap_or_default()
         };

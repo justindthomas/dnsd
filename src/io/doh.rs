@@ -391,6 +391,17 @@ where
         return Err(anyhow!("ACL denied — closing"));
     }
 
+    // Path + DoH-token gate, checked before any request work. With a
+    // token configured the path must be `/dns-query/<token>`;
+    // without one, bare `/dns-query`. A mismatch gets a flat 404 —
+    // identical to any unknown path, so a scanner can't tell a
+    // token-protected endpoint apart from a non-existent one.
+    let path_only = path.split('?').next().unwrap_or("/");
+    if !doh_path_authorized(path_only, ctx.load().doh_auth_token.as_deref()) {
+        send_simple(stream, 404, "Not Found", b"\n", true).await?;
+        return Err(anyhow!("unauthorized DoH path — closing"));
+    }
+
     let wire = match method {
         "GET" => {
             // Anything in body_seed for a GET is the start of the
@@ -472,21 +483,17 @@ where
         }
     };
 
-    let path_only = path.split('?').next().unwrap_or("/");
-    if path_only != "/dns-query" {
-        send_simple(stream, 404, "Not Found", b"\n", true).await?;
-        return Err(anyhow!("bad path — closing"));
-    }
-
     metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
 
     // One info log per served DoH request so the journal shows
     // per-query traffic for operators tracking which clients are
-    // actually using the resolver (and which aren't).
+    // actually using the resolver (and which aren't). The path is
+    // logged as the fixed endpoint, never the raw request-target —
+    // a token-auth path carries the secret token.
     tracing::info!(
         %peer,
         method = %method,
-        path = %path_only,
+        path = "/dns-query",
         wire_bytes = wire.len(),
         "DoH request",
     );
@@ -695,6 +702,43 @@ fn dns_param_from_query(qs: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Decide whether a DoH request path is authorized for this
+/// listener. `path` is the request-target with any query string
+/// already stripped.
+///
+/// - No `auth_token` configured → only the bare `/dns-query`
+///   endpoint is served (the historical behaviour).
+/// - `auth_token` configured → the path must be exactly
+///   `/dns-query/<token>`; the token component is compared in
+///   constant time so a wrong token can't be recovered byte-by-byte
+///   from response timing. The bare `/dns-query` path is rejected,
+///   which is what closes the open-resolver gap on a `::/0`
+///   listener.
+fn doh_path_authorized(path: &str, auth_token: Option<&str>) -> bool {
+    match auth_token {
+        None => path == "/dns-query",
+        Some(token) => match path.strip_prefix("/dns-query/") {
+            Some(got) => constant_time_eq(got.as_bytes(), token.as_bytes()),
+            None => false,
+        },
+    }
+}
+
+/// Length-independent constant-time byte-slice equality. The early
+/// length check leaks only the token *length* (not its content),
+/// which is an accepted trade-off — padding to hide length buys
+/// nothing here.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Strict Content-Length lookup. Returns None for missing OR
 /// malformed values; the caller treats "no CL" the same as "bad
 /// CL" since POSTs without a usable CL are rejected.
@@ -875,6 +919,12 @@ async fn handle_h2_request(
     let method = parts.method;
     let path = parts.uri.path().to_string();
 
+    // Path + DoH-token gate (see handle_request for the rationale).
+    if !doh_path_authorized(&path, ctx.load().doh_auth_token.as_deref()) {
+        h2_send_status(&mut respond, 404, b"\n")?;
+        return Err(anyhow!("unauthorized DoH path"));
+    }
+
     let wire = if method == http::Method::GET {
         match parts.uri.query().and_then(dns_param_from_query) {
             Some(b) => b,
@@ -904,16 +954,13 @@ async fn handle_h2_request(
         return Err(anyhow!("bad method"));
     };
 
-    if path != "/dns-query" {
-        h2_send_status(&mut respond, 404, b"\n")?;
-        return Err(anyhow!("bad path"));
-    }
-
     metrics.queries_doh.fetch_add(1, Ordering::Relaxed);
+    // Path logged as the fixed endpoint — a token-auth path carries
+    // the secret token, which must not reach the journal.
     tracing::info!(
         %peer,
         method = %method,
-        path = %path,
+        path = "/dns-query",
         proto = "h2",
         wire_bytes = wire.len(),
         "DoH request",
@@ -1038,6 +1085,40 @@ mod tests {
         assert_eq!(wire[1], 0xcd);
         assert!(dns_param_from_query("other=1").is_none());
         assert!(dns_param_from_query("").is_none());
+    }
+
+    #[test]
+    fn doh_path_auth_without_token() {
+        // No token: only the bare endpoint, nothing else.
+        assert!(doh_path_authorized("/dns-query", None));
+        assert!(!doh_path_authorized("/dns-query/", None));
+        assert!(!doh_path_authorized("/dns-query/anything", None));
+        assert!(!doh_path_authorized("/", None));
+        assert!(!doh_path_authorized("/resolve", None));
+    }
+
+    #[test]
+    fn doh_path_auth_with_token() {
+        let tok = Some("s3cr3t-t0ken");
+        assert!(doh_path_authorized("/dns-query/s3cr3t-t0ken", tok));
+        // bare endpoint is rejected once a token is required
+        assert!(!doh_path_authorized("/dns-query", tok));
+        // wrong / partial / empty token
+        assert!(!doh_path_authorized("/dns-query/wrong", tok));
+        assert!(!doh_path_authorized("/dns-query/s3cr3t", tok));
+        assert!(!doh_path_authorized("/dns-query/s3cr3t-t0ken-extra", tok));
+        assert!(!doh_path_authorized("/dns-query/", tok));
+        // token must be a path segment, not a prefix match
+        assert!(!doh_path_authorized("/dns-querys3cr3t-t0ken", tok));
+    }
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"abc", b""));
     }
 
     #[test]
